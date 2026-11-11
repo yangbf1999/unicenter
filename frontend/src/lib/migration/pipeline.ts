@@ -1,0 +1,3090 @@
+/**
+ * ESXi → eSage UniSphere migration pipeline
+ *
+ * Flow:
+ * 1. Pre-flight checks (ESXi reachable, UNISPHERE reachable, VM config, disk space)
+ * 2. Retrieve full VM config from ESXi via SOAP
+ * 3. Create empty VM shell on eSage via API
+ * 4. For each disk:
+ *    - Block storage (LVM, ZFS, RBD): unispheresm alloc → stream raw data directly to device (no temp files)
+ *    - File-based storage (dir, NFS, CIFS): download to storage path → convert →
+ *      rename into the storage (adopt), with qm disk import as fallback (#292)
+ * 5. Attach disks, configure boot order
+ * 6. Optionally start the VM
+ *
+ * Data flows ESXi → eSage directly (not through UniCenter).
+ * UniCenter orchestrates via SSH commands + UNISPHERE API.
+ */
+
+import { getTenantPrisma } from "@/lib/tenant"
+import { decryptSecret } from "@/lib/crypto/secret"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { unisphereFetch } from "@/lib/esage/client"
+import { isFileBasedStorage } from "@/lib/esage/storage"
+import { executeSSH, shellEscape } from "@/lib/ssh/exec"
+import { soapLogin, soapLogout, soapGetVmConfig, parseVmConfig, buildVmdkDownloadUrl, buildVmdkDescriptorUrl, extractProp, soapCreateSnapshot, soapRemoveAllSnapshots, soapPowerOffVm, soapExportVm, soapWaitForNfcLease, soapNfcLeaseProgress, soapNfcLeaseComplete, soapNfcLeaseAbort, SNAPSHOT_REMOVE_TERMINAL_TIMEOUT_MS } from "@/lib/vmware/soap"
+import { mapEsxiToUnisphereConfig, isWindowsVm } from "./configMapper"
+import type { SoapSession, EsxiVmConfig, EsxiDiskInfo, NfcLeaseDeviceUrl } from "@/lib/vmware/soap"
+import {
+  allocateAndMapBlockVolume, nextFreeDiskName, volumesToFree,
+  UNISPHERESM_FREE_TIMEOUT_MS, type AllocatedVolume,
+} from "./unispheresm-alloc"
+import { adoptImportAndAttachFileVolume } from "./adopt-file-volume"
+import { unisphereSetVmConfig, destroyUnisphereVm } from "./unisphere-vm-config"
+import { waitForUnisphereTask, getNodeIpForMigration } from "./unisphere-tasks"
+import { convertDisksToQcow2 } from "./qcow2-convert"
+import { startJobHeartbeat } from "./job-heartbeat"
+import { capturePipelineStatus, writePipelineExit } from "./pipe-exit"
+import { interpretPollExit, MAX_CONSECUTIVE_POLL_FAILURES } from "./poll-exit"
+
+type MigrationStatus = "pending" | "preflight" | "creating_vm" | "transferring" | "configuring" | "converting_disks" | "completed" | "failed" | "cancelled"
+
+interface MigrationConfig {
+  sourceConnectionId: string
+  sourceVmId: string
+  targetConnectionId: string
+  targetNode: string
+  targetStorage: string
+  networkBridge: string
+  /**
+   * Optional 802.1Q VLAN tag (1-4094) appended to net0 as `tag=N`. Empty/undefined
+   * means access port on the bridge's native VLAN. ESXi portgroup VLAN is not
+   * imported automatically — the user picks the tag in the migration dialog.
+   */
+  vlanTag?: number
+  startAfterMigration: boolean
+  /**
+   * Convert the migrated data disks to qcow2 after the migration (one `move_disk`
+   * per disk on the same storage), so they can take eSage snapshots on a
+   * snapshot-as-volume-chain LVM storage (#595). Opt-in, default false; the
+   * conversion can never fail the migration.
+   */
+  convertDisksToQcow2?: boolean
+  migrationType?: "cold" | "live" | "sshfs_boot"
+  transferMode?: "https" | "sshfs" | "auto"
+  // User-selected temp directory on the UNISPHERE node for large intermediate files
+  // (SSHFS mount root, VMDK dumps, vmkfstools clone targets). Defaults to /tmp
+  // when unset, but /tmp is typically a tiny tmpfs on UNISPHERE so the user should
+  // pick a real filesystem with enough free space.
+  tempStorage?: string
+  // User-supplied target VMID. When set, used directly instead of
+  // `/cluster/nextid`; UNISPHERE rejects the create call if it's already taken,
+  // and we surface that error instead of silently falling back.
+  targetVmid?: number
+}
+
+interface LogEntry {
+  ts: string
+  msg: string
+  level: "info" | "success" | "warn" | "error"
+}
+
+let cancelledJobs = new Set<string>()
+
+export function cancelMigrationJob(jobId: string) {
+  cancelledJobs.add(jobId)
+}
+
+// Per-job tenant-scoped prisma instances (set at pipeline start, used by helpers)
+const jobPrisma = new Map<string, any>()
+
+function getPrismaForJob(jobId: string) {
+  return jobPrisma.get(jobId)
+}
+
+async function updateJob(id: string, status: MigrationStatus, extra: Record<string, any> = {}) {
+  const prisma = getPrismaForJob(id)
+  const data: any = {
+    status,
+    currentStep: status,
+    ...(status === "completed" ? { completedAt: new Date() } : {}),
+    ...extra,
+  }
+  await prisma.migrationJob.update({ where: { id }, data })
+}
+
+async function appendLog(id: string, msg: string, level: LogEntry["level"] = "info") {
+  const prisma = getPrismaForJob(id)
+  const job = await prisma.migrationJob.findUnique({ where: { id }, select: { logs: true, progress: true } })
+  const logs: LogEntry[] = (job?.logs as LogEntry[] | null) ?? []
+  logs.push({ ts: new Date().toISOString(), msg, level, progress: job?.progress ?? 0 } as any)
+  await prisma.migrationJob.update({ where: { id }, data: { logs } })
+}
+
+function isCancelled(jobId: string): boolean {
+  return cancelledJobs.has(jobId)
+}
+
+
+/** Power off VM with fallback to manual power off for free ESXi license */
+async function powerOffSourceVm(jobId: string, session: SoapSession, vmid: string): Promise<void> {
+  try {
+    await soapPowerOffVm(session, vmid)
+    await appendLog(jobId, "Source VM powered off", "success")
+  } catch (e: any) {
+    const msg = e?.message || String(e)
+    if (msg.includes("InvalidPowerState") || msg.includes("poweredOff")) {
+      await appendLog(jobId, "VM was already powered off", "info")
+    } else if (msg.includes("license") || msg.includes("prohibits")) {
+      await appendLog(jobId, "Cannot power off via API (ESXi license restriction). Please power off the VM manually now.", "warn")
+      let powered = true
+      for (let attempt = 0; attempt < 24; attempt++) {
+        await new Promise(r => setTimeout(r, 5000))
+        const xml = await soapGetVmConfig(session, vmid)
+        if (extractProp(xml, "runtime.powerState") === "poweredOff") { powered = false; break }
+      }
+      if (powered) {
+        await appendLog(jobId, "VM still running after 120s — proceeding anyway (disk image may be crash-consistent)", "warn")
+      } else {
+        await appendLog(jobId, "VM powered off manually", "success")
+      }
+    } else {
+      throw e
+    }
+  }
+}
+
+/**
+ * Main migration pipeline — runs async after HTTP response
+ */
+export async function runMigrationPipeline(jobId: string, config: MigrationConfig, tenantId = 'default'): Promise<void> {
+  // Register tenant-scoped prisma for this job
+  const prisma = getTenantPrisma(tenantId)
+  jobPrisma.set(jobId, prisma)
+
+  let soapSession: SoapSession | null = null
+  let targetVmid: number | null = null
+  /**
+   * True only once UNISPHERE accepted the create call. `targetVmid` is set earlier
+   * (reserved via /cluster/nextid, or taken from the user's pick), so gating the
+   * cleanup on it alone could destroy a VM this job never created: with a
+   * user-supplied VMID that is already taken, the create fails with "already
+   * exists" and the cleanup would then purge the pre-existing VM holding that id
+   * (#738, same class as the misleading "failed to destroy partial VM" warning).
+   */
+  let vmCreated = false
+  let storageTempDir = ''
+  // Block volumes unispheresm-alloc'd during the run. Lifted to function scope
+  // (was previously declared inside the main try) so the catch block can
+  // free orphan LVM/RBD allocations when streaming fails before attach
+  // (issue #312). unispheresm-alloc.ts:18 documents this cleanup contract.
+  // `attached` is set by attachBlockDisk() after a successful UNISPHERE config
+  // update so the cleanup only frees true orphans, never volumes the VM
+  // already references (the VM-level DELETE handles those).
+  const allocatedVolumes: AllocatedVolume[] = []
+  // File volumes turned into UNISPHERE volumes by rename during this run (#292).
+  // Name reservation only, so two disks never claim the same vm-<vmid>-disk-<N>.
+  // Deliberately NOT in allocatedVolumes: that registry drives volumesToFree(),
+  // which unispheresm-frees non-attached volumes on failure — and the pre-#292
+  // behaviour on a late failure was to leave an unused disk behind, never to
+  // delete the converted image. Keep it that way.
+  const adoptedVolumes: AllocatedVolume[] = []
+  // Base directory for large intermediate files on the UNISPHERE node (SSHFS mount, VMDK dumps,
+  // vmkfstools clone targets). User-selectable; falls back to /tmp for backwards compat.
+  // /tmp is often a tiny tmpfs on eSage — a multi-GB disk transfer will saturate it.
+  const tempBase = (config.tempStorage && config.tempStorage.trim()) ? config.tempStorage.trim().replace(/\/+$/, '') : '/tmp'
+
+  // Liveness signal for the orphan sweep (#608): bump updatedAt while the job
+  // runs so a long silent step (#606) is never mistaken for a dead process.
+  const stopHeartbeat = startJobHeartbeat({ jobId, prisma })
+
+  try {
+    // ── STEP 0: Pre-flight ──
+    await updateJob(jobId, "preflight")
+    await appendLog(jobId, "Starting pre-flight checks...")
+
+    // Get ESXi connection (include SSH fields for live migration via dd)
+    const esxiConn = await prisma.connection.findUnique({
+      where: { id: config.sourceConnectionId },
+      select: {
+        id: true, name: true, baseUrl: true, apiTokenEnc: true, insecureTLS: true, type: true,
+        sshEnabled: true, sshPort: true, sshUser: true, sshAuthMethod: true, sshKeyEnc: true, sshPassEnc: true,
+      },
+    })
+    if (!esxiConn || esxiConn.type !== "vmware") {
+      throw new Error("ESXi connection not found")
+    }
+
+    const creds = decryptSecret(esxiConn.apiTokenEnc)
+    const colonIdx = creds.indexOf(":")
+    const username = colonIdx > 0 ? creds.substring(0, colonIdx) : "root"
+    const password = colonIdx > 0 ? creds.substring(colonIdx + 1) : creds
+    const esxiUrl = esxiConn.baseUrl.replace(/\/$/, "")
+
+    // Get UNISPHERE connection
+    const unisphereConn = await getConnectionById(config.targetConnectionId)
+    await appendLog(jobId, `Connecting to ESXi host ${esxiUrl}...`)
+
+    // SOAP login
+    soapSession = await soapLogin(esxiUrl, username, password, esxiConn.insecureTLS)
+    await appendLog(jobId, `Authenticated as ${username}`, "success")
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 1: Get VM config from ESXi ──
+    await appendLog(jobId, `Retrieving VM configuration for "${config.sourceVmId}"...`)
+    const vmXml = await soapGetVmConfig(soapSession, config.sourceVmId)
+    const vmConfig = parseVmConfig(vmXml)
+
+    await appendLog(
+      jobId,
+      `VM config: ${vmConfig.numCPU} vCPU, ${(vmConfig.memoryMB / 1024).toFixed(1)} GB RAM, ${vmConfig.disks.length} disk(s), firmware=${vmConfig.firmware}`,
+      "success"
+    )
+
+    await updateJob(jobId, "preflight", {
+      sourceVmName: vmConfig.name,
+      totalDisks: vmConfig.disks.length,
+      totalBytes: BigInt(vmConfig.disks.reduce((sum, d) => sum + d.capacityBytes, 0)),
+    })
+
+    // Handle VM power state based on migration type
+    const isLive = config.migrationType === "live"
+    const isSshfsBoot = config.migrationType === "sshfs_boot"
+
+    // Check if ESXi SSH is available (used as fallback if HTTPS download fails)
+    const esxiSshAvailable = esxiConn.sshEnabled && (esxiConn.sshKeyEnc || esxiConn.sshPassEnc)
+
+    if (isSshfsBoot && !esxiSshAvailable) {
+      throw new Error("SSHFS Boot migration requires SSH to be configured on the ESXi connection.")
+    }
+
+    if (vmConfig.powerState === "poweredOn") {
+      if (isLive) {
+        await appendLog(jobId, "VM is running - live migration will clone disks on ESXi via vmkfstools, then transfer (minimal downtime)", "info")
+      } else if (isSshfsBoot) {
+        await appendLog(jobId, "VM is powered on - powering off for SSHFS Boot migration (VM will boot on eSage from remote disks within seconds)...", "warn")
+        await powerOffSourceVm(jobId, soapSession!, config.sourceVmId)
+      } else {
+        // Cold migration: VM must be off
+        await appendLog(jobId, "VM is powered on - powering off for offline migration...", "warn")
+        await powerOffSourceVm(jobId, soapSession!, config.sourceVmId)
+      }
+    }
+
+    // Check snapshots (in live mode, existing snapshots are handled later - we remove them before creating ours)
+    if (vmConfig.snapshotCount > 0 && !isLive) {
+      await appendLog(jobId, `Warning: VM has ${vmConfig.snapshotCount} snapshot(s). Disk data will be from current state.`, "warn")
+    }
+
+    // Check disks have datastore info
+    for (const disk of vmConfig.disks) {
+      if (!disk.datastoreName || !disk.relativePath) {
+        throw new Error(`Disk "${disk.label}" has no datastore path: ${disk.fileName}`)
+      }
+    }
+
+    // Check for vSAN datastores. This pipeline is the direct-ESXi path (vCenter sources
+    // route through v2v-pipeline which uses NFC leases and handles vSAN natively). On vSAN:
+    //   - `vmkfstools -i` clone fails ("Function not implemented") — blocks Live mode
+    //   - `-flat.vmdk` does not exist as a POSIX file, only the descriptor which references
+    //     `vsan://` URIs that neither qemu-img nor HTTP /folder/ can resolve — blocks Cold mode
+    // Both failures are about reading vSAN as FILES, which is what this pipeline does. The
+    // warm path does not: it reads through VDDK, the disk API, and copies vSAN-backed disks
+    // over this very same direct ESXi connection (verified 2026-08-15 against a vsanDatastore
+    // source, full copy + delta passes + verify, no vCenter in the picture). So the error
+    // offers warm first and vCenter second, instead of claiming vSAN needs vCenter at all.
+    const vsanDisks = vmConfig.disks.filter(d => d.datastoreName.toLowerCase().includes('vsan'))
+    if (vsanDisks.length > 0) {
+      const dsNames = [...new Set(vsanDisks.map(d => d.datastoreName))].join(', ')
+      throw new Error(
+        `Source VM has disks on vSAN (${dsNames}). A cold migration cannot read them through a direct ESXi connection: ` +
+        `vSAN keeps no -flat.vmdk file, and the descriptor points at vsan:// URIs that neither qemu-img nor the HTTPS ` +
+        `datastore endpoint can resolve. Two ways forward: run a warm migration, which reads through VDDK and handles ` +
+        `vSAN on this same ESXi connection, or add a vCenter connection that manages this host and migrate from there.`
+      )
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // Verify UNISPHERE SSH connectivity
+    const nodeIp = await getNodeIpForMigration(prisma, config.targetConnectionId, config.targetNode, unisphereConn.baseUrl)
+    await appendLog(jobId, `Testing SSH to eSage node ${config.targetNode} (${nodeIp})...`)
+    const sshTest = await executeSSH(config.targetConnectionId, nodeIp, "echo ok")
+    if (!sshTest.success) {
+      throw new Error(`SSH to eSage node failed: ${sshTest.error}`)
+    }
+    await appendLog(jobId, "SSH connectivity OK", "success")
+
+    // Ensure the temp base dir exists on the UNISPHERE node. When the user picked a custom
+    // Temporary Storage path (tempStorage), this also validates it's writable before we
+    // start the migration and start writing multi-GB files into it.
+    if (tempBase !== '/tmp') {
+      const mkdirResult = await executeSSH(config.targetConnectionId, nodeIp,
+        `mkdir -p "${tempBase}" && test -w "${tempBase}" && echo OK || echo FAIL`)
+      if (!mkdirResult.output?.includes("OK")) {
+        throw new Error(`Temp storage "${tempBase}" is not writable on the target eSage node. Pick a different path or ensure the directory is writable by the SSH user.`)
+      }
+    }
+
+    // Check sshpass on UNISPHERE node (needed when ESXi auth is password-based, for nested SSH)
+    const esxiUsesPassword = esxiConn.sshAuthMethod !== "key" && esxiConn.sshPassEnc && !esxiConn.sshKeyEnc
+    if (esxiSshAvailable && esxiUsesPassword) {
+      const sshpassCheck = await executeSSH(config.targetConnectionId, nodeIp, "which sshpass")
+      if (!sshpassCheck.success || !sshpassCheck.output?.trim()) {
+        throw new Error("sshpass is not installed on the eSage node. Install it with: apt install sshpass")
+      }
+      await appendLog(jobId, "sshpass available on UNISPHERE node", "success")
+    }
+
+    // Determine effective transfer mode
+    // "sshfs" requires ESXi SSH and sshfs on UNISPHERE node
+    // "sshfs_boot" always uses SSHFS
+    // "https" uses VMware API (no SSHFS needed)
+    // "auto" uses SSHFS when available (required for vSAN — HTTPS can't serve vSAN objects)
+    const requestedTransferMode = config.transferMode || "sshfs"
+    const hasVsanDisks = vmConfig.disks.some(d => d.datastoreName.toLowerCase().includes('vsan'))
+    let useSSHFS = false
+    if (isSshfsBoot || requestedTransferMode === "sshfs" || (requestedTransferMode === "auto" && esxiSshAvailable)) {
+      if (!esxiSshAvailable) {
+        throw new Error("SSHFS transfer mode requires SSH to be configured on the ESXi connection. Please enable SSH in the connection settings.")
+      }
+      useSSHFS = true
+    }
+    // vSAN requires SSHFS — HTTPS /folder/ endpoint can't serve vSAN object-backed disks reliably
+    if (hasVsanDisks && !useSSHFS) {
+      throw new Error(
+        `vSAN datastores require SSHFS transfer mode but SSH is not available. ` +
+        `Please enable SSH on the ESXi connection and select "SSHFS" or "Auto" transfer mode.`
+      )
+    }
+
+    // Check sshfs binary on UNISPHERE node when SSHFS mode is active
+    let sshfsMountPath = ''
+    if (useSSHFS) {
+      const sshfsCheck = await executeSSH(config.targetConnectionId, nodeIp, "which sshfs")
+      if (!sshfsCheck.success || !sshfsCheck.output?.trim()) {
+        throw new Error("sshfs is not installed on the eSage node. Install it with: apt install sshfs")
+      }
+      sshfsMountPath = `${tempBase}/unicenter-sshfs-${jobId}`
+      await appendLog(jobId, `Transfer mode: SSHFS (mount ESXi datastore on UNISPHERE node)`, "success")
+      if (tempBase === '/tmp') {
+        await appendLog(jobId, "Using /tmp as temp base — on most eSage hosts this is a small tmpfs. If the VM disk is large, pick a custom Temporary Storage in the dialog to avoid filling /tmp.", "warn")
+      }
+    }
+    if (!useSSHFS) {
+      await appendLog(jobId, `Transfer mode: HTTPS (download via ESXi API)`, "info")
+    }
+
+    // Check target storage
+    const storageStatus = await unisphereFetch<any>(
+      unisphereConn,
+      `/nodes/${encodeURIComponent(config.targetNode)}/storage/${encodeURIComponent(config.targetStorage)}/status`
+    )
+    const freeBytes = (storageStatus?.avail || 0)
+    const neededBytes = vmConfig.disks.reduce((sum, d) => sum + d.capacityBytes, 0)
+    await appendLog(jobId, `Target storage "${config.targetStorage}": ${(freeBytes / 1073741824).toFixed(1)} GB free, need ${(neededBytes / 1073741824).toFixed(1)} GB`)
+    if (freeBytes < neededBytes * 1.1) {
+      throw new Error(`Insufficient disk space on "${config.targetStorage}": ${(freeBytes / 1073741824).toFixed(1)} GB free, need ${(neededBytes / 1073741824).toFixed(1)} GB`)
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 2: Allocate VMID & Create VM shell on eSage ──
+    await updateJob(jobId, "creating_vm")
+    if (config.targetVmid !== undefined) {
+      targetVmid = config.targetVmid
+      await appendLog(jobId, `Using user-specified VMID ${targetVmid}`)
+    } else {
+      await appendLog(jobId, "Allocating VMID on eSage cluster...")
+      targetVmid = Number(await unisphereFetch<number | string>(unisphereConn, "/cluster/nextid"))
+      await appendLog(jobId, `Allocated VMID ${targetVmid}`)
+    }
+    await updateJob(jobId, "creating_vm", { targetVmid })
+
+    const unisphereParams = mapEsxiToUnisphereConfig(vmConfig, targetVmid, config.targetStorage, config.networkBridge, config.vlanTag)
+    await appendLog(jobId, `Creating VM: ${unisphereParams.name} (${unisphereParams.ostype}, ${unisphereParams.bios}, ${unisphereParams.scsihw})...`)
+
+    // Build URLSearchParams for VM creation (without disks — we import them separately)
+    const createBody = new URLSearchParams({
+      vmid: String(unisphereParams.vmid),
+      name: unisphereParams.name,
+      ostype: unisphereParams.ostype,
+      cores: String(unisphereParams.cores),
+      sockets: String(unisphereParams.sockets),
+      memory: String(unisphereParams.memory),
+      cpu: unisphereParams.cpu,
+      scsihw: unisphereParams.scsihw,
+      bios: unisphereParams.bios,
+      machine: unisphereParams.machine,
+      net0: unisphereParams.net0,
+      agent: unisphereParams.agent,
+      serial0: "socket",
+    })
+    if (unisphereParams.efidisk0) {
+      createBody.set("efidisk0", unisphereParams.efidisk0)
+    }
+
+    const createResult = await unisphereFetch<any>(
+      unisphereConn,
+      `/nodes/${encodeURIComponent(config.targetNode)}/qemu`,
+      { method: "POST", body: createBody }
+    )
+    // Set before waiting on the task: UNISPHERE accepted the create, so a config may
+    // already exist and the cleanup path must know about it even if the task fails.
+    vmCreated = true
+    if (createResult) {
+      await waitForUnisphereTask(unisphereConn, config.targetNode, String(createResult))
+    }
+    await appendLog(jobId, `VM ${targetVmid} created on ${config.targetNode}`, "success")
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 3: Transfer & import disks ──
+    await updateJob(jobId, "transferring", { progress: 0 })
+
+    // Determine storage type for import strategy
+    const storageConfig = await unisphereFetch<any>(unisphereConn, `/storage/${encodeURIComponent(config.targetStorage)}`)
+    const storageType = storageConfig?.type || "dir"
+    const isFileBased = isFileBasedStorage(storageType)
+    const importFormat = isFileBased ? "qcow2" : "raw"
+
+    // Resolve temp directory: use target storage path instead of /tmp
+    // For file-based storage, temp files go on the storage itself (plenty of space)
+    // For block storage, we stream directly to the device (no temp files needed)
+    if (isFileBased) {
+      const storagePath = storageConfig?.path || '/var/lib/vz'
+      storageTempDir = `${storagePath}/images/${targetVmid}`
+      await executeSSH(config.targetConnectionId, nodeIp, `mkdir -p "${storageTempDir}"`)
+      await appendLog(jobId, `Temp directory: ${storageTempDir} (on target storage)`)
+    }
+
+    // Allocate a raw volume on block storage and return the device path
+    async function allocateBlockVolume(sizeBytes: number): Promise<{ volumeId: string, devicePath: string }> {
+      const vmConf = await unisphereFetch<Record<string, any>>(unisphereConn, `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/config`)
+      const volName = nextFreeDiskName(vmConf, allocatedVolumes, targetVmid)
+      // Raw allocation, Ceph mapping and cleanup registration all live in
+      // allocateAndMapBlockVolume — see it for why the format and the registration
+      // order matter (#587).
+      return allocateAndMapBlockVolume({
+        connectionId: config.targetConnectionId, nodeIp, targetStorage: config.targetStorage,
+        targetVmid, volName, sizeKB: Math.ceil(sizeBytes / 1024), allocatedVolumes,
+        onLog: (message) => appendLog(jobId, message),
+      })
+    }
+
+    // Attach a pre-allocated block volume to a SCSI slot
+    async function attachBlockDisk(i: number, volumeId: string) {
+      // Boot disk slot comes from the mapper (sata0 for OVMF and Windows guests,
+      // #653). Data disks stay on SCSI.
+      const scsiSlot = i === 0 ? unisphereParams.bootDiskSlot : `scsi${i}`
+      const attachBody = new URLSearchParams({ [scsiSlot]: volumeId })
+      try {
+        await unisphereSetVmConfig(unisphereConn, config.targetNode, targetVmid!, attachBody)
+        // Record the attachment so the failure-path cleanup in
+        // runMigrationPipeline does NOT unispheresm-free this volume: it is
+        // now referenced by the VM config and the VM-level DELETE
+        // (destroy-unreferenced-disks=1) is the right tool for it.
+        const entry = allocatedVolumes.find(v => v.volumeId === volumeId)
+        if (entry) entry.attached = true
+        await appendLog(jobId, `Disk ${i + 1} attached as ${scsiSlot} (${volumeId})`, "success")
+      } catch (attachErr: any) {
+        await appendLog(jobId, `Warning: Could not auto-attach ${scsiSlot}: ${attachErr.message}`, "warn")
+      }
+    }
+
+    // Helper: stream a disk from ESXi to a pre-allocated block device via HTTPS
+    async function streamDiskToBlock(i: number, disk: EsxiDiskInfo, devicePath: string, overrideUrl?: string) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Streaming "${disk.label}" to block device (${diskSizeGB} GB)...`)
+
+      const soapCookie = soapSession!.cookie
+      const safeCookie = soapCookie.replaceAll('"', '')
+      const vmdkUrl = overrideUrl || buildVmdkDownloadUrl(esxiUrl, disk)
+      await appendLog(jobId, `Download URL: ${vmdkUrl.replace(/\?.*/, '?...')}${overrideUrl ? ' (NFC lease)' : ''}`, "info")
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `streaming_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      const ctrlPrefix = `/tmp/unicenter-mig-${jobId}-ctrl${i}`
+      const pidFile = `${ctrlPrefix}.pid`
+      const dlScript = `${ctrlPrefix}.dl.sh`
+      const progressFile = `${ctrlPrefix}.progress`
+      // curl stderr was previously sent to /dev/null, which left every
+      // "Streaming failed: curl/dd exit code N" without the underlying
+      // cause (issue #312). Capture it so the failure thrown below can
+      // include the real curl message (HTTP code, TLS error, NFC lease
+      // expired, RST, ...).
+      const stderrFile = `${ctrlPrefix}.stderr`
+
+      // Build streaming script: curl pipes directly to dd on block device
+      // status=progress makes dd write periodic progress to stderr
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${dlScript}" << 'DLEOF'\ncurl -sk --fail -b '${safeCookie}' '${vmdkUrl}' 2>"${stderrFile}" | dd of="${devicePath}" bs=4M status=progress 2>"${progressFile}"\n${capturePipelineStatus()}\n${writePipelineExit(pidFile + ".exit")}\nDLEOF`
+      )
+
+      const startDl = await executeSSH(config.targetConnectionId, nodeIp,
+        `nohup bash "${dlScript}" > /dev/null 2>&1 & echo $!`)
+      if (!startDl.success || !startDl.output?.trim()) {
+        throw new Error(`Failed to start streaming: ${startDl.error}`)
+      }
+      const pid = startDl.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${pid} > "${pidFile}"`)
+
+      const totalBytes = disk.capacityBytes
+      let transferredBytes = 0
+      let transferSpeed = ""
+      const startTime = Date.now()
+
+      let pollFailures = 0
+      while (true) {
+        if (isCancelled(jobId)) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${stderrFile}"`)
+          throw new Error("Migration cancelled")
+        }
+        await new Promise(r => setTimeout(r, 3000))
+
+        const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${pidFile}.exit" 2>/dev/null || echo RUNNING`)
+        const poll = interpretPollExit(exitCheck)
+        if (poll.state === "unknown") {
+          pollFailures++
+          if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${stderrFile}"`)
+            throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+          }
+          await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+          continue
+        }
+        pollFailures = 0
+        const isRunning = poll.state === "running"
+
+        // Parse dd progress output: "123456789 bytes (123 MB, ...) copied, ..."
+        const progressResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `tail -c 200 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -oP '^\\d+' | tail -1 || echo 0`)
+        transferredBytes = Number.parseInt(progressResult.output?.trim() || "0", 10) || 0
+
+        const elapsed = (Date.now() - startTime) / 1000
+        const speedBps = elapsed > 0 ? transferredBytes / elapsed : 0
+        transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+        const diskProgress = totalBytes > 0 ? Math.min(Math.round((transferredBytes / totalBytes) * 100), 99) : 0
+        const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+        await updateJob(jobId, "transferring", {
+          bytesTransferred: BigInt(transferredBytes),
+          transferSpeed,
+          progress: isLive ? Math.round(overallProgress * 0.7) : overallProgress,
+        })
+
+        if (!isRunning) {
+          const exitCode = poll.state === "exited" ? poll.exitCode : 0
+          // Read curl + dd diagnostic files BEFORE removing them so a
+          // failure message can quote the actual upstream error. The
+          // outer catch in runMigrationPipeline still receives the
+          // thrown Error verbatim, so users see the curl/dd reason.
+          let curlStderr = ""
+          let ddTail = ""
+          if (exitCode !== 0) {
+            const errCap = await executeSSH(config.targetConnectionId, nodeIp, `cat "${stderrFile}" 2>/dev/null | tr -d '\\000' | tail -c 500`).catch(() => ({ output: "" }))
+            curlStderr = (errCap.output || "").trim()
+            const ddCap = await executeSSH(config.targetConnectionId, nodeIp, `tail -c 500 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | tail -n 3`).catch(() => ({ output: "" }))
+            ddTail = (ddCap.output || "").trim()
+          }
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${stderrFile}"`)
+          if (exitCode !== 0) {
+            const detail = [
+              curlStderr ? `curl: ${curlStderr.replaceAll("\n", " ")}` : "",
+              ddTail ? `dd: ${ddTail.replaceAll("\n", " ")}` : "",
+            ].filter(Boolean).join(" | ")
+            throw new Error(
+              `Streaming failed: curl/dd exit code ${exitCode}${detail ? ` (${detail})` : ""}`,
+            )
+          }
+          break
+        }
+      }
+
+      const elapsed = (Date.now() - startTime) / 1000
+      await updateJob(jobId, "transferring", { bytesTransferred: BigInt(transferredBytes), transferSpeed })
+      await appendLog(jobId, `Streaming complete: ${(transferredBytes / 1073741824).toFixed(1)} GB in ${elapsed.toFixed(0)}s (${transferSpeed})`, "success")
+
+      // Unmap RBD device if we mapped it
+      const allocVol = allocatedVolumes.find(v => v.devicePath === devicePath)
+      if (allocVol?.rbdMapped) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${devicePath}" 2>/dev/null`).catch(() => {})
+      }
+    }
+
+    // Helper: stream a disk from ESXi to a pre-allocated block device via SSH dd pipe
+    async function streamDiskViaSshToBlock(i: number, disk: EsxiDiskInfo, devicePath: string, needsClone = false) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      const ctrlPrefix = `/tmp/unicenter-mig-${jobId}-ctrl${i}`
+      const { esxiHost, esxiSshPort, esxiSshUser, setupCmd, sshPrefix, cleanupCmd } = buildEsxiSshPrefix(ctrlPrefix)
+
+      const flatPath = disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+      const vmfsPath = `/vmfs/volumes/${disk.datastoreName}/${flatPath}`
+      const cloneName = `.unicenter-clone-${jobId}-disk${i}`
+      const cloneVmdkPath = `/vmfs/volumes/${disk.datastoreName}/${cloneName}.vmdk`
+      const cloneFlatPath = `/vmfs/volumes/${disk.datastoreName}/${cloneName}-flat.vmdk`
+
+      let downloadPath = vmfsPath
+      let cloneCreated = false
+
+      if (needsClone) {
+        // Clone VMDK on ESXi using vmkfstools (works on locked/running VMDKs after snapshot)
+        await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Cloning "${disk.label}" on ESXi via vmkfstools (${diskSizeGB} GB)...`)
+        await updateJob(jobId, "transferring", {
+          currentStep: `cloning_disk_${i + 1}`,
+          currentDisk: i,
+          bytesTransferred: BigInt(0),
+          totalBytes: BigInt(disk.capacityBytes),
+        })
+
+        try {
+          const descriptorPath = `/vmfs/volumes/${disk.datastoreName}/${disk.relativePath}`
+          const cloneTmpPrefix = `/tmp/unicenter-mig-${jobId}-clone${i}`
+          const { esxiHost: clHost, esxiSshPort: clPort, esxiSshUser: clUser, setupCmd: clSetup, sshPrefix: clSshPrefix, cleanupCmd: clCleanup } = buildEsxiSshPrefix(cloneTmpPrefix)
+          const cloneScript = `${cloneTmpPrefix}.sh`
+          const cloneExitFile = `${cloneTmpPrefix}.exit`
+          const cloneErrFile = `${cloneTmpPrefix}.stderr`
+          const cloneOutFile = `${cloneTmpPrefix}.out`
+
+          const cloneSshCmd = `${clSshPrefix} -p ${clPort} ${clUser}@${clHost} "vmkfstools -i '${descriptorPath}' '${cloneVmdkPath}' -d thin" >"${cloneOutFile}" 2>"${cloneErrFile}"`
+
+          await executeSSH(config.targetConnectionId, nodeIp,
+            `cat > "${cloneScript}" << 'CLEOF'\n${clSetup}\n${cloneSshCmd}\nEXIT_CODE=$?\n${clCleanup}\necho $EXIT_CODE > "${cloneExitFile}"\nCLEOF`
+          )
+
+          const startClone = await executeSSH(config.targetConnectionId, nodeIp,
+            `nohup bash "${cloneScript}" > /dev/null 2>&1 & echo $!`)
+          if (!startClone.success || !startClone.output?.trim()) {
+            throw new Error(`Failed to start vmkfstools: ${startClone.error}`)
+          }
+
+          const cloneStartTime = Date.now()
+          let pollFailures = 0
+          while (true) {
+            if (isCancelled(jobId)) throw new Error("Migration cancelled")
+            if (Date.now() - cloneStartTime > 3600000) throw new Error("vmkfstools clone timed out (1h)")
+            await new Promise(r => setTimeout(r, 5000))
+
+            try {
+              const sizeCheck = await executeSSH(config.targetConnectionId, nodeIp,
+                `${clSetup} && ${clSshPrefix} -p ${clPort} ${clUser}@${clHost} "stat -c %s '${cloneFlatPath}' 2>/dev/null || echo 0" 2>/dev/null`)
+              const clonedBytes = Number.parseInt(sizeCheck.output?.trim() || "0", 10) || 0
+              if (clonedBytes > 0) {
+                const cloneProgress = Math.min(Math.round((clonedBytes / disk.capacityBytes) * 100), 99)
+                const elapsed = (Date.now() - cloneStartTime) / 1000
+                const speed = elapsed > 0 ? clonedBytes / elapsed : 0
+                const speedStr = speed > 1048576 ? `${(speed / 1048576).toFixed(1)} MB/s` : `${(speed / 1024).toFixed(0)} KB/s`
+                await updateJob(jobId, "transferring", {
+                  currentStep: `cloning_disk_${i + 1}`,
+                  bytesTransferred: BigInt(clonedBytes),
+                  totalBytes: BigInt(disk.capacityBytes),
+                  transferSpeed: `Cloning: ${speedStr}`,
+                  progress: Math.round(cloneProgress * 0.3),
+                })
+              }
+            } catch {}
+
+            const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${cloneExitFile}" 2>/dev/null || echo RUNNING`)
+            const poll = interpretPollExit(exitCheck)
+            if (poll.state === "unknown") {
+              pollFailures++
+              if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+                throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+              }
+              await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+              continue
+            }
+            pollFailures = 0
+            if (poll.state === "running") continue
+
+            const exitCode = poll.exitCode
+            if (exitCode !== 0) {
+              const stderrContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${cloneErrFile}" 2>/dev/null | head -c 500`)
+              const errMsg = stderrContent.output?.trim() || "(no output)"
+              await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+              throw new Error(`vmkfstools failed (exit ${exitCode}): ${errMsg}`)
+            }
+
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+            break
+          }
+
+          cloneCreated = true
+          downloadPath = cloneFlatPath
+          const cloneTime = Math.round((Date.now() - cloneStartTime) / 1000)
+          await appendLog(jobId, `Clone created on ESXi datastore (${cloneTime}s)`, "success")
+        } catch (cloneErr: any) {
+          throw new Error(`vmkfstools clone failed: ${cloneErr.message}`)
+        }
+      }
+
+      // Stream via SSH dd → dd of=block device
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Streaming "${disk.label}" via SSH to block device (${diskSizeGB} GB)...`)
+      await appendLog(jobId, `Source path: ${downloadPath}`, "info")
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `streaming_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      const pidFile = `${ctrlPrefix}.pid`
+      const dlScript = `${ctrlPrefix}.dl.sh`
+      const progressFile = `${ctrlPrefix}.progress`
+      const errFile = `${ctrlPrefix}.stderr`
+      const sshCmd = `${sshPrefix} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "dd if='${downloadPath}' bs=4M" | dd of="${devicePath}" bs=4M status=progress 2>"${progressFile}"`
+
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${dlScript}" << 'DLEOF'\n${setupCmd}\n${sshCmd}\n${capturePipelineStatus()}\n${cleanupCmd}\n${writePipelineExit(pidFile + ".exit")}\nDLEOF`
+      )
+
+      const startDl = await executeSSH(config.targetConnectionId, nodeIp,
+        `nohup bash "${dlScript}" > /dev/null 2>&1 & echo $!`)
+      if (!startDl.success || !startDl.output?.trim()) {
+        if (cloneCreated) await executeOnEsxi(`vmkfstools -U '${cloneVmdkPath}'`).catch(() => {})
+        throw new Error(`Failed to start SSH streaming: ${startDl.error}`)
+      }
+      const ddPid = startDl.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${ddPid} > "${pidFile}"`)
+
+      const totalBytes = disk.capacityBytes
+      let transferredBytes = 0
+      let transferSpeed = ""
+      const startTime = Date.now()
+
+      try {
+        let pollFailures = 0
+        while (true) {
+          if (isCancelled(jobId)) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${ddPid} 2>/dev/null; rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${ctrlPrefix}.esxi-key" "${errFile}"`)
+            throw new Error("Migration cancelled")
+          }
+          await new Promise(r => setTimeout(r, 3000))
+
+          const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${pidFile}.exit" 2>/dev/null || echo RUNNING`)
+          const poll = interpretPollExit(exitCheck)
+          if (poll.state === "unknown") {
+            pollFailures++
+            if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+              await executeSSH(config.targetConnectionId, nodeIp, `kill ${ddPid} 2>/dev/null; rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${ctrlPrefix}.esxi-key" "${errFile}"`)
+              throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+            }
+            await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+            continue
+          }
+          pollFailures = 0
+          const isRunning = poll.state === "running"
+
+          // Parse dd progress output
+          const progressResult = await executeSSH(config.targetConnectionId, nodeIp,
+            `tail -c 200 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -oP '^\\d+' | tail -1 || echo 0`)
+          transferredBytes = Number.parseInt(progressResult.output?.trim() || "0", 10) || 0
+
+          const elapsed = (Date.now() - startTime) / 1000
+          const speedBps = elapsed > 0 ? transferredBytes / elapsed : 0
+          transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+          const diskProgress = totalBytes > 0 ? Math.min(Math.round((transferredBytes / totalBytes) * 100), 99) : 0
+          const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+          await updateJob(jobId, "transferring", {
+            bytesTransferred: BigInt(transferredBytes),
+            transferSpeed,
+            progress: Math.round(overallProgress * 0.7),
+          })
+
+          if (!isRunning) {
+            const exitCode = poll.state === "exited" ? poll.exitCode : 0
+            const elapsed = (Date.now() - startTime) / 1000
+
+            if (exitCode !== 0) {
+              // Check if data was mostly transferred despite non-zero exit (SSH warnings)
+              // For block devices, we can't easily check size — trust the dd progress
+              if (transferredBytes >= Math.floor(disk.capacityBytes * 0.9)) {
+                await appendLog(jobId, `SSH exited with code ${exitCode} but transfer looks complete (${(transferredBytes / 1073741824).toFixed(1)} GB) — continuing`, "warn")
+              } else {
+                await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${ctrlPrefix}.esxi-key" "${errFile}"`)
+                throw new Error(`SSH streaming failed (exit ${exitCode})`)
+              }
+            }
+
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${progressFile}" "${ctrlPrefix}.esxi-key" "${errFile}"`)
+            break
+          }
+        }
+      } finally {
+        if (cloneCreated) {
+          await executeOnEsxi(`vmkfstools -U '${cloneVmdkPath}'`).catch((e) => {
+            appendLog(jobId, `Warning: failed to cleanup ESXi clone: ${e.message}`, "warn")
+          })
+        }
+      }
+
+      await updateJob(jobId, "transferring", { bytesTransferred: BigInt(transferredBytes), transferSpeed })
+      await appendLog(jobId, `SSH streaming complete: ${(transferredBytes / 1073741824).toFixed(1)} GB in ${((Date.now() - startTime) / 1000).toFixed(0)}s (${transferSpeed})`, "success")
+
+      // Unmap RBD device if we mapped it
+      const allocVol = allocatedVolumes.find(v => v.devicePath === devicePath)
+      if (allocVol?.rbdMapped) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${devicePath}" 2>/dev/null`).catch(() => {})
+      }
+    }
+
+    // Helper: download a single disk from ESXi via curl on UNISPHERE node
+    // overrideUrl: used by NFC lease in live mode (datastore browser returns 500 when snapshot active)
+    async function downloadDisk(i: number, disk: EsxiDiskInfo, overrideUrl?: string) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Downloading "${disk.label}" (${diskSizeGB} GB, ${disk.thinProvisioned ? "thin" : "thick"})...`)
+
+      const tmpFile = storageTempDir ? `${storageTempDir}/unicenter-mig-${jobId}-disk${i}` : `${tempBase}/unicenter-mig-${jobId}-disk${i}`
+      const soapCookie = soapSession!.cookie
+
+      // Strip double quotes from cookie value to avoid shell quoting issues
+      // ESXi returns: vmware_soap_session="abc123" — quotes are decorative, not required
+      const safeCookie = soapCookie.replaceAll('"', '')
+      const vmdkUrl = overrideUrl || buildVmdkDownloadUrl(esxiUrl, disk)
+      await appendLog(jobId, `Download URL: ${vmdkUrl.replace(/\?.*/, '?...')}${overrideUrl ? ' (NFC lease)' : ''}`, "info")
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `downloading_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      const pidFile = `${tmpFile}.pid`
+      const statsFile = `${tmpFile}.stats`
+      const dlScript = `${tmpFile}.dl.sh`
+      // Write download script to avoid shell quoting issues with cookie/URL values
+      // Note: no -f flag — we check HTTP code and file size after download
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${dlScript}" << 'DLEOF'\ncurl -sk -b '${safeCookie}' -o "${tmpFile}.vmdk" -w '{"speed":%{speed_download},"size":%{size_download},"time":%{time_total},"http_code":%{http_code}}' '${vmdkUrl}' > "${statsFile}" 2>&1\necho $? > "${pidFile}.exit"\nDLEOF`
+      )
+      const startDl = await executeSSH(
+        config.targetConnectionId, nodeIp,
+        `nohup bash "${dlScript}" > /dev/null 2>&1 & echo $!`
+      )
+      if (!startDl.success || !startDl.output?.trim()) {
+        throw new Error(`Failed to start download: ${startDl.error}`)
+      }
+      const curlPid = startDl.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${curlPid} > "${pidFile}"`)
+
+      const totalBytes = disk.capacityBytes
+      let downloadedBytes = 0
+      let downloadSpeed = ""
+      let downloadTime = 0
+      const startTime = Date.now()
+
+      let pollFailures = 0
+      while (true) {
+        if (isCancelled(jobId)) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${curlPid} 2>/dev/null; rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+          throw new Error("Migration cancelled")
+        }
+
+        await new Promise(r => setTimeout(r, 3000))
+
+        const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${pidFile}.exit" 2>/dev/null || echo RUNNING`)
+        const poll = interpretPollExit(exitCheck)
+        if (poll.state === "unknown") {
+          pollFailures++
+          if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${curlPid} 2>/dev/null; rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+            throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+          }
+          await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+          continue
+        }
+        pollFailures = 0
+        const isRunning = poll.state === "running"
+
+        const sizeResult = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vmdk" 2>/dev/null || echo 0`)
+        const currentSize = Number.parseInt(sizeResult.output?.trim() || "0", 10) || 0
+        downloadedBytes = currentSize
+
+        const elapsed = (Date.now() - startTime) / 1000
+        const speedBps = elapsed > 0 ? currentSize / elapsed : 0
+        downloadSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+        const diskProgress = totalBytes > 0 ? Math.min(Math.round((currentSize / totalBytes) * 100), 99) : 0
+        const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+        await updateJob(jobId, "transferring", {
+          bytesTransferred: BigInt(currentSize),
+          transferSpeed: downloadSpeed,
+          progress: isLive ? Math.round(overallProgress * 0.7) : overallProgress,
+        })
+
+        if (!isRunning) {
+          const exitCode = poll.state === "exited" ? poll.exitCode : 0
+          if (exitCode !== 0) {
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+            throw new Error(`Download failed: curl exit code ${exitCode}`)
+          }
+
+          const statsContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${statsFile}" 2>/dev/null`)
+          const curlStats = statsContent.output?.match(/\{[^}]+\}/)
+          let httpCode = 0
+          if (curlStats) {
+            try {
+              const stats = JSON.parse(curlStats[0])
+              downloadedBytes = stats.size || currentSize
+              downloadSpeed = stats.speed > 1048576 ? `${(stats.speed / 1048576).toFixed(1)} MB/s` : `${(stats.speed / 1024).toFixed(0)} KB/s`
+              downloadTime = stats.time || elapsed
+              httpCode = stats.http_code || 0
+            } catch {}
+          } else {
+            downloadTime = elapsed
+          }
+
+          // Validate HTTP status code
+          if (httpCode >= 400 || httpCode === 0) {
+            // Read first bytes of the downloaded file to see error content
+            const errorPreview = await executeSSH(config.targetConnectionId, nodeIp, `head -c 500 "${tmpFile}.vmdk" 2>/dev/null | tr '\\n' ' '`)
+            const preview = errorPreview.output?.trim().substring(0, 200) || "(empty)"
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+            throw new Error(`Download failed: HTTP ${httpCode} from ESXi. Response: ${preview}`)
+          }
+
+          // Validate downloaded file size (must be at least 1 MB for any real disk)
+          const fileSizeCheck = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vmdk" 2>/dev/null || echo 0`)
+          const actualSize = Number.parseInt(fileSizeCheck.output?.trim() || "0", 10)
+          if (actualSize < 1048576) {
+            const errorPreview = await executeSSH(config.targetConnectionId, nodeIp, `head -c 500 "${tmpFile}.vmdk" 2>/dev/null | tr '\\n' ' '`)
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+            throw new Error(`Download produced a ${actualSize}-byte file (expected ~${diskSizeGB} GB, HTTP ${httpCode}). Content: ${errorPreview.output?.trim().substring(0, 200)}`)
+          }
+
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${statsFile}" "${dlScript}"`)
+          break
+        }
+      }
+
+      await updateJob(jobId, "transferring", {
+        bytesTransferred: BigInt(downloadedBytes),
+        transferSpeed: downloadSpeed,
+      })
+      await appendLog(jobId, `Download complete: ${(downloadedBytes / 1073741824).toFixed(1)} GB in ${downloadTime.toFixed(0)}s (${downloadSpeed})`, "success")
+    }
+
+    // Helper: build ESXi SSH prefix (sshpass + legacy algorithms for ESXi BusyBox SSH)
+    // Returns { setupCmd, sshPrefix, cleanupCmd } to be used in shell scripts on UNISPHERE node
+    function buildEsxiSshPrefix(tmpPrefix: string) {
+      const esxiHost = esxiUrl.replace(/^https?:\/\//, "").replace(/\/.*$/, "")
+      const esxiSshPort = esxiConn.sshPort || 22
+      const esxiSshUser = esxiConn.sshUser || "root"
+      const esxiPass = esxiConn.sshPassEnc ? decryptSecret(esxiConn.sshPassEnc) : ""
+      const esxiSshOpts = `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o PreferredAuthentications=keyboard-interactive,password`
+
+      let setupCmd = ""
+      let sshPrefix = ""
+      let cleanupCmd = ""
+
+      if (esxiConn.sshAuthMethod === "key" && esxiConn.sshKeyEnc) {
+        const esxiKey = decryptSecret(esxiConn.sshKeyEnc)
+        const keyFile = `${tmpPrefix}.esxi-key`
+        setupCmd = `cat > "${keyFile}" << 'KEYEOF'\n${esxiKey}\nKEYEOF\nchmod 600 "${keyFile}"`
+        sshPrefix = `ssh ${esxiSshOpts} -i "${keyFile}"`
+        cleanupCmd = `rm -f "${keyFile}"`
+      } else if (esxiPass) {
+        const safePass = esxiPass.replaceAll("'", "'\\''")
+        setupCmd = `export SSHPASS='${safePass}'`
+        sshPrefix = `sshpass -e ssh ${esxiSshOpts}`
+        cleanupCmd = ""
+      }
+
+      return { esxiHost, esxiSshPort, esxiSshUser, esxiSshOpts, setupCmd, sshPrefix, cleanupCmd }
+    }
+
+    // Helper: execute a command on ESXi via SSH from UNISPHERE node (background + polling, no timeout issues)
+    async function executeOnEsxi(command: string, timeoutMs = 3600000): Promise<string> {
+      const tmpPrefix = `/tmp/unicenter-mig-${jobId}-esxicmd`
+      const { esxiHost, esxiSshPort, esxiSshUser, setupCmd, sshPrefix, cleanupCmd } = buildEsxiSshPrefix(tmpPrefix)
+      const script = `${tmpPrefix}.sh`
+      const outFile = `${tmpPrefix}.out`
+      const errFile = `${tmpPrefix}.stderr`
+      const exitFile = `${tmpPrefix}.exit`
+
+      const sshCmd = `${sshPrefix} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "${command.replaceAll('"', '\\"')}" >"${outFile}" 2>"${errFile}"`
+
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${script}" << 'ESXIEOF'\n${setupCmd}\n${sshCmd}\nEXIT_CODE=$?\n${cleanupCmd}\necho $EXIT_CODE > "${exitFile}"\nESXIEOF`
+      )
+
+      // Run in background
+      const startResult = await executeSSH(config.targetConnectionId, nodeIp,
+        `nohup bash "${script}" > /dev/null 2>&1 & echo $!`
+      )
+      if (!startResult.success || !startResult.output?.trim()) {
+        throw new Error(`Failed to start ESXi command: ${startResult.error}`)
+      }
+      const pid = startResult.output.trim()
+
+      // Poll for completion
+      const startTime = Date.now()
+      let pollFailures = 0
+      while (true) {
+        if (isCancelled(jobId)) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${script}" "${outFile}" "${errFile}" "${exitFile}" "${tmpPrefix}.esxi-key"`)
+          throw new Error("Migration cancelled")
+        }
+        if (Date.now() - startTime > timeoutMs) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${script}" "${outFile}" "${errFile}" "${exitFile}" "${tmpPrefix}.esxi-key"`)
+          throw new Error(`ESXi command timed out after ${Math.round(timeoutMs / 60000)}m`)
+        }
+
+        await new Promise(r => setTimeout(r, 3000))
+
+        const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${exitFile}" 2>/dev/null || echo RUNNING`)
+        const poll = interpretPollExit(exitCheck)
+        if (poll.state === "unknown") {
+          pollFailures++
+          if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${script}" "${outFile}" "${errFile}" "${exitFile}" "${tmpPrefix}.esxi-key"`)
+            throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+          }
+          await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+          continue
+        }
+        pollFailures = 0
+        if (poll.state === "running") continue
+
+        const exitCode = poll.exitCode
+        const outputContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${outFile}" 2>/dev/null`)
+        const output = outputContent.output?.trim() || ""
+
+        if (exitCode !== 0) {
+          const stderrContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${errFile}" 2>/dev/null | head -c 500`)
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${script}" "${outFile}" "${errFile}" "${exitFile}" "${tmpPrefix}.esxi-key"`)
+          const errMsg = stderrContent.output?.trim() || output
+          throw new Error(`ESXi command failed (exit ${exitCode}): ${errMsg}`)
+        }
+
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${script}" "${outFile}" "${errFile}" "${exitFile}" "${tmpPrefix}.esxi-key"`)
+        return output
+      }
+    }
+
+    // ── SSHFS helpers ──
+    // Mount ESXi datastore on UNISPHERE node via SSHFS (SSH filesystem)
+    // Works with VMFS, NFS, vSAN — anything accessible under /vmfs/volumes/ on ESXi
+    async function mountSshfs(datastoreName: string): Promise<string> {
+      const { esxiHost, esxiSshPort, esxiSshUser } = buildEsxiSshPrefix(`/tmp/unicenter-sshfs-${jobId}`)
+      const esxiPass = esxiConn.sshPassEnc ? decryptSecret(esxiConn.sshPassEnc) : ""
+      const esxiKey = (esxiConn.sshAuthMethod === "key" && esxiConn.sshKeyEnc) ? decryptSecret(esxiConn.sshKeyEnc) : ""
+      const mountPath = sshfsMountPath
+
+      // Ensure fuse allows other users (needed for qemu-img/qm to access mounted files)
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || ` +
+        `sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf 2>/dev/null || ` +
+        `echo 'user_allow_other' >> /etc/fuse.conf`
+      )
+
+      // SSHFS options — FUSE3 compatible (sshfs 3.x on Debian Trixie/UNISPHERE 9)
+      // Note: big_writes, large_read, kernel_cache are FUSE2-only and removed in FUSE3
+      // ssh_command must be quoted to avoid comma conflicts with sshfs -o parser
+      const sshfsBaseOpts = "StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,cache=yes,max_read=1048576,entry_timeout=3600,negative_timeout=3600,attr_timeout=3600"
+
+      // ESXi SSH legacy algorithms — passed via ssh_command to avoid comma parsing issues
+      // We write a wrapper script so sshfs ssh_command= points to it (no comma escaping needed)
+      const sshWrapperPath = `${mountPath}.ssh-wrapper.sh`
+      const sshWrapperContent = `#!/bin/sh\nexec ssh -p ${esxiSshPort} -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o PreferredAuthentications=keyboard-interactive,password -o Compression=no -o Ciphers=aes128-gcm@openssh.com,aes128-ctr,aes256-ctr -o TCPKeepAlive=yes -o IPQoS=throughput "$@"`
+
+      // Resolve datastore symlink on ESXi — SFTP doesn't follow symlinks for mount root
+      // /vmfs/volumes/Datastore is a symlink to /vmfs/volumes/<UUID>, we need the real path
+      let remotePath = `/vmfs/volumes/${datastoreName}`
+      const { esxiHost: resolveHost, esxiSshPort: resolvePort, esxiSshUser: resolveUser, setupCmd: resolveSetup, sshPrefix: resolveSshPrefix, cleanupCmd: resolveCleanup } = buildEsxiSshPrefix(`/tmp/unicenter-sshfs-resolve-${jobId}`)
+      const safeDsName = datastoreName.replaceAll("'", "'\\''")
+      const resolveCmd = `${resolveSetup ? resolveSetup + ' && ' : ''}${resolveSshPrefix} -p ${resolvePort} ${resolveUser}@${resolveHost} "readlink -f '/vmfs/volumes/${safeDsName}'" 2>/dev/null${resolveCleanup ? ' ; ' + resolveCleanup : ''}`
+      const resolveResult = await executeSSH(config.targetConnectionId, nodeIp, resolveCmd)
+      if (resolveResult.success && resolveResult.output?.trim().startsWith("/vmfs/")) {
+        remotePath = resolveResult.output.trim()
+        await appendLog(jobId, `Resolved datastore path: ${datastoreName} -> ${remotePath}`, "info")
+      } else {
+        // readlink failed — try fallback: ls -la to parse symlink target
+        await appendLog(jobId, `readlink failed for ${datastoreName}, trying ls -la fallback...`, "warn")
+        const fallbackCmd = `${resolveSetup ? resolveSetup + ' && ' : ''}${resolveSshPrefix} -p ${resolvePort} ${resolveUser}@${resolveHost} "ls -la '/vmfs/volumes/${safeDsName}'" 2>/dev/null${resolveCleanup ? ' ; ' + resolveCleanup : ''}`
+        const fallbackResult = await executeSSH(config.targetConnectionId, nodeIp, fallbackCmd)
+        // ls -la on a symlink: lrwxrwxrwx ... 3Par_DMZ1 -> 6508540b-49183378-c5fe-bc97e1ab7c50
+        const arrowMatch = fallbackResult.output?.match(/->\s*(\S+)/)
+        if (arrowMatch?.[1]) {
+          const resolvedUuid = arrowMatch[1]
+          remotePath = resolvedUuid.startsWith("/") ? resolvedUuid : `/vmfs/volumes/${resolvedUuid}`
+          await appendLog(jobId, `Resolved datastore via ls fallback: ${datastoreName} -> ${remotePath}`, "info")
+        } else {
+          // SFTP cannot follow symlinks — this will likely fail, warn clearly
+          await appendLog(jobId, `Could not resolve datastore symlink for "${datastoreName}". SSHFS/SFTP cannot follow symlinks — mount will likely fail. If it does, check SSH connectivity from the eSage node to the ESXi host.`, "error")
+        }
+      }
+      let mounted = false
+      const mountErrors: string[] = []
+
+      if (esxiKey) {
+        // Key-based auth
+        const keyFile = `${mountPath}.esxi-key`
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${keyFile}" << 'KEYEOF'\n${esxiKey}\nKEYEOF\nchmod 600 "${keyFile}"`
+        )
+        const sshWrapperKey = `#!/bin/sh\nexec ssh -p ${esxiSshPort} -i ${keyFile} -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no "$@"`
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${sshWrapperPath}" << 'SSHEOF'\n${sshWrapperKey}\nSSHEOF\nchmod +x "${sshWrapperPath}"`
+        )
+        // Try with perf options
+        const mountCmd = `mkdir -p "${mountPath}" && sshfs -o ${sshfsBaseOpts},ssh_command=${sshWrapperPath} ${esxiSshUser}@${esxiHost}:${remotePath} "${mountPath}" 2>&1`
+        const rc = await executeSSH(config.targetConnectionId, nodeIp, mountCmd)
+        if (rc.success) mounted = true
+        else mountErrors.push(`attempt 1 (key+perf): ${(rc.error || rc.output || '').toString().trim().slice(0, 300)}`)
+        if (!mounted) {
+          // Fallback: minimal
+          const mountCmd2 = `mkdir -p "${mountPath}" && sshfs -o StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other,reconnect,ssh_command=${sshWrapperPath} ${esxiSshUser}@${esxiHost}:${remotePath} "${mountPath}" 2>&1`
+          const rc2 = await executeSSH(config.targetConnectionId, nodeIp, mountCmd2)
+          if (rc2.success) mounted = true
+          else mountErrors.push(`attempt 2 (key+minimal): ${(rc2.error || rc2.output || '').toString().trim().slice(0, 300)}`)
+        }
+      } else if (esxiPass) {
+        // Password-based auth via password_stdin + ssh wrapper script
+        const safePass = esxiPass.replaceAll("'", "'\\''")
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${sshWrapperPath}" << 'SSHEOF'\n${sshWrapperContent}\nSSHEOF\nchmod +x "${sshWrapperPath}"`
+        )
+        // Try with perf options + algo wrapper
+        const mountCmd = `mkdir -p "${mountPath}" && printf '%s' '${safePass}' | sshfs -o password_stdin,${sshfsBaseOpts},ssh_command=${sshWrapperPath} ${esxiSshUser}@${esxiHost}:${remotePath} "${mountPath}" 2>&1`
+        const rc = await executeSSH(config.targetConnectionId, nodeIp, mountCmd)
+        if (rc.success) mounted = true
+        else mountErrors.push(`attempt 1 (perf+algo): ${(rc.error || rc.output || '').toString().trim().slice(0, 300)}`)
+        if (!mounted) {
+          // Fallback: no algo wrapper (let ssh negotiate)
+          const mountCmd2 = `mkdir -p "${mountPath}" && printf '%s' '${safePass}' | sshfs -o password_stdin,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other,reconnect,ServerAliveInterval=15,cache=yes,entry_timeout=3600,attr_timeout=3600 ${esxiSshUser}@${esxiHost}:${remotePath} "${mountPath}" 2>&1`
+          const rc2 = await executeSSH(config.targetConnectionId, nodeIp, mountCmd2)
+          if (rc2.success) mounted = true
+          else mountErrors.push(`attempt 2 (negotiate): ${(rc2.error || rc2.output || '').toString().trim().slice(0, 300)}`)
+        }
+        if (!mounted) {
+          // Fallback: absolute minimal
+          const mountCmd3 = `mkdir -p "${mountPath}" && printf '%s' '${safePass}' | sshfs -o password_stdin,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other,reconnect,cache=yes ${esxiSshUser}@${esxiHost}:${remotePath} "${mountPath}" 2>&1`
+          const rc3 = await executeSSH(config.targetConnectionId, nodeIp, mountCmd3)
+          if (rc3.success) mounted = true
+          else mountErrors.push(`attempt 3 (minimal): ${(rc3.error || rc3.output || '').toString().trim().slice(0, 300)}`)
+        }
+      }
+
+      if (!mounted) {
+        // Cleanup wrapper script
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${sshWrapperPath}" "${mountPath}.esxi-key"`).catch(() => {})
+        // Surface the actual SSH/sshfs error so the user can diagnose. Common causes:
+        //   - "Connection refused": SSH not enabled on the ESXi (vSphere -> Configure -> Services -> SSH)
+        //   - "Permission denied": wrong password, or root login disabled
+        //   - "subsystem request failed" / "Connection reset": SFTP subsystem disabled on ESXi
+        //   - "no matching host key type": ESXi's old SSH algos need the wrapper (already attempted)
+        const errSummary = mountErrors.length
+          ? mountErrors.join(" | ")
+          : "no SSH/sshfs output captured (check authentication method and ESXi SSH availability)"
+        throw new Error(
+          `Failed to mount ESXi datastore via SSHFS on ${esxiHost}:${esxiSshPort}. ` +
+          `Underlying errors: ${errSummary}. ` +
+          `Verify: (1) SSH enabled on ESXi (vSphere Client > Configure > Services > SSH > Start), ` +
+          `(2) credentials valid (try 'ssh ${esxiSshUser}@${esxiHost}' from the eSage node), ` +
+          `(3) SFTP subsystem available on ESXi (try 'sftp ${esxiSshUser}@${esxiHost}').`
+        )
+      }
+
+      // Verify mount by listing files
+      const verifyResult = await executeSSH(config.targetConnectionId, nodeIp, `ls "${mountPath}/" | head -5`)
+      if (!verifyResult.success || !verifyResult.output?.trim()) {
+        await unmountSshfs()
+        throw new Error("SSHFS mount succeeded but datastore appears empty. Check ESXi SSH access and datastore name.")
+      }
+
+      await appendLog(jobId, `SSHFS mounted: ${esxiHost}:${remotePath} → ${mountPath}`, "success")
+      return mountPath
+    }
+
+    // Unmount SSHFS and cleanup
+    async function unmountSshfs() {
+      if (!sshfsMountPath) return
+      try {
+        await executeSSH(config.targetConnectionId, nodeIp, `fusermount -uz "${sshfsMountPath}" 2>/dev/null; rmdir "${sshfsMountPath}" 2>/dev/null; rm -f "${sshfsMountPath}.esxi-key" "${sshfsMountPath}.ssh-wrapper.sh" 2>/dev/null`)
+      } catch {
+        // Best effort cleanup
+      }
+    }
+
+    // Transfer disk via SSHFS for file-based storage (qemu-img convert from mounted VMDK)
+    async function transferDiskViaSshfs(i: number, disk: EsxiDiskInfo) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Converting "${disk.label}" via SSHFS (${diskSizeGB} GB)...`)
+
+      // The flat VMDK is the raw data file; the descriptor .vmdk is a small text file
+      // qemu-img needs the flat file for direct raw access
+      const flatPath = disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+      const sshfsDiskPath = `${sshfsMountPath}/${flatPath}`
+      const tmpFile = storageTempDir ? `${storageTempDir}/unicenter-mig-${jobId}-disk${i}` : `${tempBase}/unicenter-mig-${jobId}-disk${i}`
+
+      // Verify the disk file is accessible via SSHFS
+      const checkFile = await executeSSH(config.targetConnectionId, nodeIp, `test -f "${sshfsDiskPath}" && echo EXISTS || echo MISSING`)
+      if (checkFile.output?.trim() !== "EXISTS") {
+        // -flat.vmdk not found (common on vSAN where data is object-backed)
+        // Fall back to VMDK descriptor - qemu-img -f vmdk can read it and follow references
+        const altPath = `${sshfsMountPath}/${disk.relativePath}`
+        const checkAlt = await executeSSH(config.targetConnectionId, nodeIp, `test -f "${altPath}" && echo EXISTS || echo MISSING`)
+        if (checkAlt.output?.trim() === "EXISTS") {
+          await appendLog(jobId, `Using VMDK descriptor (vSAN/object storage): qemu-img will read via descriptor`, "info")
+          return await sshfsConvertAndImport(i, disk, altPath, tmpFile, "vmdk")
+        }
+        throw new Error(`Disk file not found via SSHFS: ${sshfsDiskPath} (also tried descriptor: ${altPath})`)
+      }
+
+      await sshfsConvertAndImport(i, disk, sshfsDiskPath, tmpFile, "raw")
+    }
+
+    // Core convert+import from an SSHFS path for file-based storage
+    // inputFormat: "raw" for flat VMDKs (direct raw data), "vmdk" for VMDK descriptors (vSAN/object storage)
+    async function sshfsConvertAndImport(i: number, disk: EsxiDiskInfo, sourcePath: string, tmpFile: string, inputFormat: "raw" | "vmdk" = "raw") {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      const scsiSlot = `scsi${i}`
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `converting_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      // Convert directly from SSHFS mount to target format
+      // qemu-img reads from SSHFS (FUSE) and writes locally — no intermediate download needed
+      const ctrlPrefix = `/tmp/unicenter-mig-${jobId}-sshfs${i}`
+      const progressFile = `${ctrlPrefix}.progress`
+      const pidFile = `${ctrlPrefix}.pid`
+      const exitFile = `${ctrlPrefix}.exit`
+      const convertScript = `${ctrlPrefix}.sh`
+      const outputFile = `${tmpFile}.${importFormat}`
+
+      // Use qemu-img convert with progress output
+      // inputFormat=vmdk: reads VMDK descriptor and follows references (required for vSAN)
+      // inputFormat=raw: reads flat VMDK as raw data (standard VMFS)
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${convertScript}" << 'CONVEOF'\nqemu-img convert -p -f ${inputFormat} -O ${importFormat} "${sourcePath}" "${outputFile}" 2>"${progressFile}"\necho $? > "${exitFile}"\nCONVEOF`
+      )
+
+      const startConvert = await executeSSH(config.targetConnectionId, nodeIp,
+        `nohup bash "${convertScript}" > /dev/null 2>&1 & echo $!`)
+      if (!startConvert.success || !startConvert.output?.trim()) {
+        throw new Error(`Failed to start qemu-img convert: ${startConvert.error}`)
+      }
+      const pid = startConvert.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${pid} > "${pidFile}"`)
+
+      const startTime = Date.now()
+      let pollFailures = 0
+      while (true) {
+        if (isCancelled(jobId)) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${convertScript}" "${pidFile}" "${exitFile}" "${progressFile}" "${outputFile}"`)
+          throw new Error("Migration cancelled")
+        }
+        await new Promise(r => setTimeout(r, 3000))
+
+        // Parse qemu-img progress: outputs lines like "(12.34/100%)"
+        const progressResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `tail -c 100 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -oP '[\\d.]+(?=/100%)' | tail -1 || echo 0`)
+        const pct = Number.parseFloat(progressResult.output?.trim() || "0") || 0
+        const estimatedBytes = Math.round((pct / 100) * disk.capacityBytes)
+
+        const elapsed = (Date.now() - startTime) / 1000
+        const speedBps = elapsed > 0 ? estimatedBytes / elapsed : 0
+        const transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+        const diskProgress = Math.min(Math.round(pct), 99)
+        const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+        await updateJob(jobId, "transferring", {
+          bytesTransferred: BigInt(estimatedBytes),
+          transferSpeed: `SSHFS: ${transferSpeed}`,
+          progress: isLive ? Math.round(overallProgress * 0.7) : overallProgress,
+        })
+
+        const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${exitFile}" 2>/dev/null || echo RUNNING`)
+        const poll = interpretPollExit(exitCheck)
+        if (poll.state === "unknown") {
+          pollFailures++
+          if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${convertScript}" "${pidFile}" "${exitFile}" "${progressFile}" "${outputFile}"`)
+            throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+          }
+          await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+          continue
+        }
+        pollFailures = 0
+        if (poll.state === "exited") {
+          const exitCode = poll.exitCode
+          // Capture the FULL stderr from qemu-img BEFORE deleting the progress file.
+          // qemu-img writes both progress lines (carriage-return separated) and error
+          // messages to stderr; on failure the last lines are usually the actual error.
+          // Without this we'd surface the useless "exit 1" generic, hiding the root cause
+          // (locked file, bad descriptor, permission denied, broken vmdk chain, etc.).
+          let stderrTail = ""
+          if (exitCode !== 0) {
+            const stderrCapture = await executeSSH(
+              config.targetConnectionId,
+              nodeIp,
+              `tail -c 2000 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -v '/100%' | tail -10`,
+            )
+            stderrTail = (stderrCapture.output || "").trim()
+          }
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${convertScript}" "${pidFile}" "${exitFile}" "${progressFile}"`)
+          if (exitCode !== 0) {
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${outputFile}"`)
+            throw new Error(
+              `qemu-img convert failed (exit ${exitCode}) on ${sourcePath}. ` +
+              `Source format: ${inputFormat}, target format: ${importFormat}. ` +
+              (stderrTail
+                ? `qemu-img stderr (last lines): ${stderrTail}`
+                : `No stderr captured. Common causes: VMDK descriptor references missing -flat file (vSAN object access issue), VMDK locked by running VM (power off and retry), or sparse VMDK with broken extent map.`),
+            )
+          }
+          break
+        }
+      }
+
+      const elapsed = (Date.now() - startTime) / 1000
+      const fileSizeResult = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${outputFile}" 2>/dev/null || echo 0`)
+      const outputSize = Number.parseInt(fileSizeResult.output?.trim() || "0", 10)
+      const speedBps = elapsed > 0 ? disk.capacityBytes / elapsed : 0
+      const transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+      await appendLog(jobId, `Conversion complete: ${diskSizeGB} GB in ${elapsed.toFixed(0)}s (${transferSpeed}), output ${(outputSize / 1073741824).toFixed(1)} GB`, "success")
+
+      // Import into eSage storage
+      await appendLog(jobId, `Adding disk to storage "${config.targetStorage}"...`)
+      await updateJob(jobId, "transferring", { currentStep: `importing_disk_${i + 1}` })
+
+      // Rename-or-import (#292): the converted image was written into the target
+      // storage's own images/<vmid> directory, so adopting it by rename skips the
+      // second full disk copy `qm disk import` used to do here. The shared helper
+      // owns the guard rails, the import fallback and the attach.
+      const { volumeId: diskVolume, adopted } = await adoptImportAndAttachFileVolume({
+        unisphereConn,
+        targetNode: config.targetNode,
+        connectionId: config.targetConnectionId,
+        nodeIp,
+        sourcePath: outputFile,
+        targetStorage: config.targetStorage,
+        imagesDir: storageTempDir,
+        targetVmid: targetVmid!,
+        format: importFormat,
+        slot: scsiSlot,
+        driveOpts: isFileBased ? ",discard=on" : "",
+        diskLabel: `Disk ${i + 1}`,
+        taken: adoptedVolumes,
+        onLog: (m, level) => appendLog(jobId, m, level),
+      })
+      if (adopted) adoptedVolumes.push({ volumeId: diskVolume, devicePath: "" })
+    }
+
+    // Stream disk via SSHFS for block storage (dd or qemu-img convert to pre-allocated device)
+    async function streamDiskViaSshfsToBlock(i: number, disk: EsxiDiskInfo, devicePath: string) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Streaming "${disk.label}" via SSHFS to block device (${diskSizeGB} GB)...`)
+
+      const flatPath = disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+      let sshfsDiskPath = `${sshfsMountPath}/${flatPath}`
+      let useVmdkDescriptor = false
+
+      // Verify file exists
+      const checkFile = await executeSSH(config.targetConnectionId, nodeIp, `test -f "${sshfsDiskPath}" && echo EXISTS || echo MISSING`)
+      if (checkFile.output?.trim() !== "EXISTS") {
+        // -flat.vmdk not found (common on vSAN where data is object-backed)
+        // Fall back to VMDK descriptor - qemu-img can read it and follow references to actual data
+        const altPath = `${sshfsMountPath}/${disk.relativePath}`
+        const checkAlt = await executeSSH(config.targetConnectionId, nodeIp, `test -f "${altPath}" && echo EXISTS || echo MISSING`)
+        if (checkAlt.output?.trim() === "EXISTS") {
+          sshfsDiskPath = altPath
+          useVmdkDescriptor = true
+          await appendLog(jobId, `Using VMDK descriptor (vSAN/object storage): qemu-img convert will read disk data via descriptor`, "info")
+        } else {
+          throw new Error(`Disk file not found via SSHFS: ${sshfsDiskPath} (also tried descriptor: ${altPath})`)
+        }
+      }
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `streaming_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      const ctrlPrefix = `/tmp/unicenter-mig-${jobId}-sshfsblk${i}`
+      const progressFile = `${ctrlPrefix}.progress`
+      const pidFile = `${ctrlPrefix}.pid`
+      const exitFile = `${ctrlPrefix}.exit`
+      const transferScript = `${ctrlPrefix}.sh`
+
+      if (useVmdkDescriptor) {
+        // vSAN / object storage: use qemu-img convert to read VMDK descriptor and write raw to block device
+        // qemu-img understands VMDK format and follows descriptor references to the actual data objects
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${transferScript}" << 'XFEREOF'\nqemu-img convert -p -f vmdk -O raw "${sshfsDiskPath}" "${devicePath}" 2>"${progressFile}"\necho $? > "${exitFile}"\nXFEREOF`
+        )
+      } else {
+        // VMFS / standard: flat VMDK is raw data, dd directly to block device (faster, no conversion overhead)
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${transferScript}" << 'XFEREOF'\ndd if="${sshfsDiskPath}" of="${devicePath}" bs=4M status=progress 2>"${progressFile}"\necho $? > "${exitFile}"\nXFEREOF`
+        )
+      }
+
+      const startCmd = await executeSSH(config.targetConnectionId, nodeIp,
+        `nohup bash "${transferScript}" > /dev/null 2>&1 & echo $!`)
+      if (!startCmd.success || !startCmd.output?.trim()) {
+        throw new Error(`Failed to start ${useVmdkDescriptor ? 'qemu-img convert' : 'dd'}: ${startCmd.error}`)
+      }
+      const pid = startCmd.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${pid} > "${pidFile}"`)
+
+      const totalBytes = disk.capacityBytes
+      let transferredBytes = 0
+      const startTime = Date.now()
+
+      let pollFailures = 0
+      while (true) {
+        if (isCancelled(jobId)) {
+          await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${transferScript}" "${pidFile}" "${exitFile}" "${progressFile}"`)
+          throw new Error("Migration cancelled")
+        }
+        await new Promise(r => setTimeout(r, 3000))
+
+        if (useVmdkDescriptor) {
+          // Parse qemu-img progress: outputs lines like "(12.34/100%)"
+          const progressResult = await executeSSH(config.targetConnectionId, nodeIp,
+            `tail -c 100 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -oP '[\\d.]+(?=/100%)' | tail -1 || echo 0`)
+          const pct = Number.parseFloat(progressResult.output?.trim() || "0") || 0
+          transferredBytes = Math.round((pct / 100) * totalBytes)
+        } else {
+          // Parse dd progress: "123456789 bytes ..."
+          const progressResult = await executeSSH(config.targetConnectionId, nodeIp,
+            `tail -c 200 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -oP '^\\d+' | tail -1 || echo 0`)
+          transferredBytes = Number.parseInt(progressResult.output?.trim() || "0", 10) || 0
+        }
+
+        const elapsed = (Date.now() - startTime) / 1000
+        const speedBps = elapsed > 0 ? transferredBytes / elapsed : 0
+        const transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+        const diskProgress = totalBytes > 0 ? Math.min(Math.round((transferredBytes / totalBytes) * 100), 99) : 0
+        const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+        await updateJob(jobId, "transferring", {
+          bytesTransferred: BigInt(transferredBytes),
+          transferSpeed: `SSHFS: ${transferSpeed}`,
+          progress: isLive ? Math.round(overallProgress * 0.7) : overallProgress,
+        })
+
+        const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${exitFile}" 2>/dev/null || echo RUNNING`)
+        const poll = interpretPollExit(exitCheck)
+        if (poll.state === "unknown") {
+          pollFailures++
+          if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${pid} 2>/dev/null; rm -f "${transferScript}" "${pidFile}" "${exitFile}" "${progressFile}"`)
+            throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+          }
+          await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+          continue
+        }
+        pollFailures = 0
+        if (poll.state === "exited") {
+          const exitCode = poll.exitCode
+          // Capture stderr tail BEFORE deleting progressFile (same bug as transferDiskViaSshfs).
+          let stderrTail = ""
+          if (exitCode !== 0) {
+            const stderrCapture = await executeSSH(
+              config.targetConnectionId,
+              nodeIp,
+              `tail -c 2000 "${progressFile}" 2>/dev/null | tr '\\r' '\\n' | grep -v '/100%' | tail -10`,
+            )
+            stderrTail = (stderrCapture.output || "").trim()
+          }
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${transferScript}" "${pidFile}" "${exitFile}" "${progressFile}"`)
+          if (exitCode !== 0) {
+            const tool = useVmdkDescriptor ? 'qemu-img convert' : 'dd'
+            throw new Error(
+              `${tool} failed (exit ${exitCode}) on ${sshfsDiskPath} -> ${devicePath}. ` +
+              (stderrTail
+                ? `${tool} stderr (last lines): ${stderrTail}`
+                : `No stderr captured. For vSAN: descriptor may reference unreachable -flat object. For block storage: target device may be in use or wrong size.`),
+            )
+          }
+          break
+        }
+      }
+
+      const elapsed = (Date.now() - startTime) / 1000
+      const speedBps = elapsed > 0 ? transferredBytes / elapsed : 0
+      const transferSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+      await appendLog(jobId, `SSHFS streaming complete: ${(transferredBytes / 1073741824).toFixed(1)} GB in ${elapsed.toFixed(0)}s (${transferSpeed})`, "success")
+
+      // Unmap RBD device if we mapped it
+      const allocVol = allocatedVolumes.find(v => v.devicePath === devicePath)
+      if (allocVol?.rbdMapped) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${devicePath}" 2>/dev/null`).catch(() => {})
+      }
+    }
+
+    // Helper: download a disk from ESXi via vmkfstools clone + SSH dd pipe (for live migration)
+    // Flow: 1) vmkfstools -i on ESXi to clone VMDK (works on locked disks via VMFS API)
+    //       2) SSH dd to pipe the clone (unlocked) from ESXi to UNISPHERE node
+    //       3) Cleanup clone on ESXi
+    async function downloadDiskViaSsh(i: number, disk: EsxiDiskInfo, needsClone = false) {
+      const diskSizeGB = (disk.capacityBytes / 1073741824).toFixed(1)
+      const tmpFile = storageTempDir ? `${storageTempDir}/unicenter-mig-${jobId}-disk${i}` : `${tempBase}/unicenter-mig-${jobId}-disk${i}`
+      const { esxiHost, esxiSshPort, esxiSshUser, setupCmd, sshPrefix, cleanupCmd } = buildEsxiSshPrefix(tmpFile)
+
+      // Build the VMFS path
+      const flatPath = disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+      const vmfsPath = `/vmfs/volumes/${disk.datastoreName}/${flatPath}`
+      // Clone path on ESXi datastore (temporary, cleaned up after download)
+      const cloneName = `.unicenter-clone-${jobId}-disk${i}`
+      const cloneVmdkPath = `/vmfs/volumes/${disk.datastoreName}/${cloneName}.vmdk`
+      const cloneFlatPath = `/vmfs/volumes/${disk.datastoreName}/${cloneName}-flat.vmdk`
+
+      let downloadPath = vmfsPath
+      let cloneCreated = false
+
+      if (needsClone) {
+        // Step 1: Clone VMDK on ESXi using vmkfstools (works on locked/running VMDKs after snapshot)
+        await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Cloning "${disk.label}" on ESXi via vmkfstools (${diskSizeGB} GB)...`)
+        await updateJob(jobId, "transferring", {
+          currentStep: `cloning_disk_${i + 1}`,
+          currentDisk: i,
+          bytesTransferred: BigInt(0),
+          totalBytes: BigInt(disk.capacityBytes),
+        })
+
+        try {
+          const descriptorPath = `/vmfs/volumes/${disk.datastoreName}/${disk.relativePath}`
+
+          // Run vmkfstools clone in background on ESXi (via UNISPHERE → ESXi SSH)
+          const cloneTmpPrefix = `/tmp/unicenter-mig-${jobId}-clone${i}`
+          const { esxiHost: clHost, esxiSshPort: clPort, esxiSshUser: clUser, setupCmd: clSetup, sshPrefix: clSshPrefix, cleanupCmd: clCleanup } = buildEsxiSshPrefix(cloneTmpPrefix)
+          const cloneScript = `${cloneTmpPrefix}.sh`
+          const cloneExitFile = `${cloneTmpPrefix}.exit`
+          const cloneErrFile = `${cloneTmpPrefix}.stderr`
+          const cloneOutFile = `${cloneTmpPrefix}.out`
+
+          const cloneSshCmd = `${clSshPrefix} -p ${clPort} ${clUser}@${clHost} "vmkfstools -i '${descriptorPath}' '${cloneVmdkPath}' -d thin" >"${cloneOutFile}" 2>"${cloneErrFile}"`
+
+          await executeSSH(config.targetConnectionId, nodeIp,
+            `cat > "${cloneScript}" << 'CLEOF'\n${clSetup}\n${cloneSshCmd}\nEXIT_CODE=$?\n${clCleanup}\necho $EXIT_CODE > "${cloneExitFile}"\nCLEOF`
+          )
+
+          const startClone = await executeSSH(config.targetConnectionId, nodeIp,
+            `nohup bash "${cloneScript}" > /dev/null 2>&1 & echo $!`
+          )
+          if (!startClone.success || !startClone.output?.trim()) {
+            throw new Error(`Failed to start vmkfstools: ${startClone.error}`)
+          }
+
+          // Poll for clone completion with progress tracking via clone file size on ESXi
+          const cloneStartTime = Date.now()
+          let pollFailures = 0
+          while (true) {
+            if (isCancelled(jobId)) throw new Error("Migration cancelled")
+            if (Date.now() - cloneStartTime > 3600000) throw new Error("vmkfstools clone timed out (1h)")
+
+            await new Promise(r => setTimeout(r, 5000))
+
+            // Check clone file size on ESXi for progress (via nested SSH with sshpass setup)
+            try {
+              const sizeCheck = await executeSSH(config.targetConnectionId, nodeIp,
+                `${clSetup} && ${clSshPrefix} -p ${clPort} ${clUser}@${clHost} "stat -c %s '${cloneFlatPath}' 2>/dev/null || echo 0" 2>/dev/null`
+              )
+              const clonedBytes = Number.parseInt(sizeCheck.output?.trim() || "0", 10) || 0
+              if (clonedBytes > 0) {
+                const cloneProgress = Math.min(Math.round((clonedBytes / disk.capacityBytes) * 100), 99)
+                const elapsed = (Date.now() - cloneStartTime) / 1000
+                const speed = elapsed > 0 ? clonedBytes / elapsed : 0
+                const speedStr = speed > 1048576 ? `${(speed / 1048576).toFixed(1)} MB/s` : `${(speed / 1024).toFixed(0)} KB/s`
+                await updateJob(jobId, "transferring", {
+                  currentStep: `cloning_disk_${i + 1}`,
+                  bytesTransferred: BigInt(clonedBytes),
+                  totalBytes: BigInt(disk.capacityBytes),
+                  transferSpeed: `Cloning: ${speedStr}`,
+                  progress: Math.round(cloneProgress * 0.3),
+                })
+              }
+            } catch {
+              // Progress check failed — non-critical, continue polling
+            }
+
+            const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${cloneExitFile}" 2>/dev/null || echo RUNNING`)
+            const poll = interpretPollExit(exitCheck)
+            if (poll.state === "unknown") {
+              pollFailures++
+              if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+                throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+              }
+              await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+              continue
+            }
+            pollFailures = 0
+            if (poll.state === "running") continue
+
+            const exitCode = poll.exitCode
+            if (exitCode !== 0) {
+              const stderrContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${cloneErrFile}" 2>/dev/null | head -c 500`)
+              const errMsg = stderrContent.output?.trim() || "(no output)"
+              await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+              throw new Error(`vmkfstools failed (exit ${exitCode}): ${errMsg}`)
+            }
+
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${cloneScript}" "${cloneExitFile}" "${cloneErrFile}" "${cloneOutFile}" "${cloneTmpPrefix}.esxi-key"`)
+            break
+          }
+
+          cloneCreated = true
+          downloadPath = cloneFlatPath
+          const cloneTime = Math.round((Date.now() - cloneStartTime) / 1000)
+          await appendLog(jobId, `Clone created on ESXi datastore (${cloneTime}s)`, "success")
+        } catch (cloneErr: any) {
+          throw new Error(`vmkfstools clone failed: ${cloneErr.message}`)
+        }
+      }
+
+      // Step 2: Download via SSH dd pipe (clone is unlocked, or VM is off so original is unlocked)
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Downloading "${disk.label}" via SSH dd (${diskSizeGB} GB)...`)
+      await appendLog(jobId, `Source path: ${downloadPath}`, "info")
+
+      await updateJob(jobId, "transferring", {
+        currentStep: `downloading_disk_${i + 1}`,
+        currentDisk: i,
+        bytesTransferred: BigInt(0),
+        totalBytes: BigInt(disk.capacityBytes),
+      })
+
+      const pidFile = `${tmpFile}.pid`
+      const dlScript = `${tmpFile}.dl.sh`
+      const errFile = `${tmpFile}.stderr`
+      const sshCmd = `${sshPrefix} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "dd if='${downloadPath}' bs=4M" > "${tmpFile}.vmdk" 2>"${errFile}"`
+
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `cat > "${dlScript}" << 'DLEOF'\n${setupCmd}\n${sshCmd}\nEXIT_CODE=$?\n${cleanupCmd}\necho $EXIT_CODE > "${pidFile}.exit"\nDLEOF`
+      )
+
+      const startDl = await executeSSH(
+        config.targetConnectionId, nodeIp,
+        `nohup bash "${dlScript}" > /dev/null 2>&1 & echo $!`
+      )
+      if (!startDl.success || !startDl.output?.trim()) {
+        if (cloneCreated) await executeOnEsxi(`vmkfstools -U '${cloneVmdkPath}'`).catch(() => {})
+        throw new Error(`Failed to start SSH download: ${startDl.error}`)
+      }
+      const ddPid = startDl.output.trim()
+      await executeSSH(config.targetConnectionId, nodeIp, `echo ${ddPid} > "${pidFile}"`)
+
+      const totalBytes = disk.capacityBytes
+      let downloadedBytes = 0
+      let downloadSpeed = ""
+      let downloadTime = 0
+      const startTime = Date.now()
+
+      try {
+        let pollFailures = 0
+        while (true) {
+          if (isCancelled(jobId)) {
+            await executeSSH(config.targetConnectionId, nodeIp, `kill ${ddPid} 2>/dev/null; rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${dlScript}" "${tmpFile}.esxi-key" "${errFile}"`)
+            throw new Error("Migration cancelled")
+          }
+
+          await new Promise(r => setTimeout(r, 3000))
+
+          const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${pidFile}.exit" 2>/dev/null || echo RUNNING`)
+          const poll = interpretPollExit(exitCheck)
+          if (poll.state === "unknown") {
+            pollFailures++
+            if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+              await executeSSH(config.targetConnectionId, nodeIp, `kill ${ddPid} 2>/dev/null; rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${dlScript}" "${tmpFile}.esxi-key" "${errFile}"`)
+              throw new Error(`Lost contact with the eSage node while monitoring the transfer (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+            }
+            await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (${pollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES})`, "warn")
+            continue
+          }
+          pollFailures = 0
+          const isRunning = poll.state === "running"
+
+          const sizeResult = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vmdk" 2>/dev/null || echo 0`)
+          const currentSize = Number.parseInt(sizeResult.output?.trim() || "0", 10) || 0
+          downloadedBytes = currentSize
+
+          const elapsed = (Date.now() - startTime) / 1000
+          const speedBps = elapsed > 0 ? currentSize / elapsed : 0
+          downloadSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+          const diskProgress = totalBytes > 0 ? Math.min(Math.round((currentSize / totalBytes) * 100), 99) : 0
+          const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+          await updateJob(jobId, "transferring", {
+            bytesTransferred: BigInt(currentSize),
+            transferSpeed: downloadSpeed,
+            progress: Math.round(overallProgress * 0.7),
+          })
+
+          if (!isRunning) {
+            const exitCode = poll.state === "exited" ? poll.exitCode : 0
+            downloadTime = elapsed
+
+            if (exitCode !== 0) {
+              // Check if the file was actually downloaded despite non-zero exit (SSH warnings can cause exit 1)
+              const fileSizeOnError = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vmdk" 2>/dev/null || echo 0`)
+              const actualSizeOnError = Number.parseInt(fileSizeOnError.output?.trim() || "0", 10)
+              const expectedMin = Math.floor(disk.capacityBytes * 0.9) // Allow 10% tolerance for thin disks
+
+              if (actualSizeOnError >= expectedMin) {
+                // File looks complete despite non-zero exit — SSH warning, not a real error
+                await appendLog(jobId, `SSH exited with code ${exitCode} but file size looks correct (${(actualSizeOnError / 1073741824).toFixed(1)} GB) — continuing`, "warn")
+              } else {
+                const stderrContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${errFile}" 2>/dev/null | head -c 500`)
+                const errMsg = stderrContent.output?.trim() || "(no stderr output)"
+                await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${dlScript}" "${tmpFile}.esxi-key" "${errFile}"`)
+                throw new Error(`SSH dd download failed (exit ${exitCode}): ${errMsg}`)
+              }
+            }
+
+            const fileSizeCheck = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vmdk" 2>/dev/null || echo 0`)
+            const actualSize = Number.parseInt(fileSizeCheck.output?.trim() || "0", 10)
+            if (actualSize < 1048576) {
+              await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${pidFile}" "${pidFile}.exit" "${dlScript}" "${tmpFile}.esxi-key"`)
+              throw new Error(`SSH dd produced a ${actualSize}-byte file (expected ~${diskSizeGB} GB)`)
+            }
+
+            await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${dlScript}" "${tmpFile}.esxi-key" "${errFile}"`)
+            break
+          }
+        }
+      } finally {
+        // Step 3: Always cleanup the clone on ESXi
+        if (cloneCreated) {
+          await executeOnEsxi(`vmkfstools -U '${cloneVmdkPath}'`).catch((e) => {
+            appendLog(jobId, `Warning: failed to cleanup ESXi clone: ${e.message}`, "warn")
+          })
+        }
+      }
+
+      await updateJob(jobId, "transferring", {
+        bytesTransferred: BigInt(downloadedBytes),
+        transferSpeed: downloadSpeed,
+      })
+      await appendLog(jobId, `SSH download complete: ${(downloadedBytes / 1073741824).toFixed(1)} GB in ${downloadTime.toFixed(0)}s (${downloadSpeed})`, "success")
+    }
+
+    // Helper: convert + import + attach a single disk
+    async function convertAndImportDisk(i: number) {
+      const tmpFile = storageTempDir ? `${storageTempDir}/unicenter-mig-${jobId}-disk${i}` : `${tempBase}/unicenter-mig-${jobId}-disk${i}`
+      // Boot disk slot comes from the mapper: sata0 for OVMF guests (the firmware
+      // cannot enumerate an LSI controller) and for Windows guests (no boot-start
+      // VirtIO driver in an untouched guest, #653). Data disks (i>=1) stay on
+      // SCSI for performance.
+      const scsiSlot = i === 0 ? unisphereParams.bootDiskSlot : `scsi${i}`
+
+      // Convert VMDK to target format
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Converting to ${importFormat} format...`)
+      await updateJob(jobId, "transferring", { currentStep: `converting_disk_${i + 1}` })
+
+      const convertResult = await executeSSHWithTimeout(
+        prisma, config.targetConnectionId, nodeIp,
+        `qemu-img convert -f raw -O ${importFormat} "${tmpFile}.vmdk" "${tmpFile}.${importFormat}" 2>&1 && echo CONVERT_OK`,
+        14400000
+      )
+      if (!convertResult.success || !convertResult.output?.includes("CONVERT_OK")) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk" "${tmpFile}.${importFormat}"`)
+        throw new Error(`Conversion failed: ${convertResult.error || convertResult.output}`)
+      }
+      await appendLog(jobId, `Conversion to ${importFormat} complete`, "success")
+      await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vmdk"`)
+
+      if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+      // Import disk into eSage storage
+      await appendLog(jobId, `Adding disk to storage "${config.targetStorage}"...`)
+      await updateJob(jobId, "transferring", { currentStep: `importing_disk_${i + 1}` })
+
+      // Rename-or-import (#292): the shared helper adopts the converted image by
+      // rename when it can, imports it otherwise, and attaches the result. See
+      // adoptImportAndAttachFileVolume for the guard rails.
+      const { volumeId: diskVolume, adopted } = await adoptImportAndAttachFileVolume({
+        unisphereConn,
+        targetNode: config.targetNode,
+        connectionId: config.targetConnectionId,
+        nodeIp,
+        sourcePath: `${tmpFile}.${importFormat}`,
+        targetStorage: config.targetStorage,
+        imagesDir: storageTempDir,
+        targetVmid: targetVmid!,
+        format: importFormat,
+        slot: scsiSlot,
+        driveOpts: isFileBased ? ",discard=on" : "",
+        diskLabel: `Disk ${i + 1}`,
+        taken: adoptedVolumes,
+        onLog: (m, level) => appendLog(jobId, m, level),
+      })
+      if (adopted) adoptedVolumes.push({ volumeId: diskVolume, devicePath: "" })
+    }
+
+    // Mount SSHFS if transfer mode requires it
+    // All disks on the same datastore share one mount; multiple datastores need separate mounts
+    const sshfsMountedDatastores = new Map<string, string>() // datastoreName → mountPath
+    if (useSSHFS) {
+      const datastores = [...new Set(vmConfig.disks.map(d => d.datastoreName))]
+      for (const ds of datastores) {
+        const baseMountPath = sshfsMountPath
+        // For multi-datastore VMs, append datastore name to mount path
+        if (datastores.length > 1) {
+          sshfsMountPath = `${baseMountPath}-${ds.replaceAll(/[^a-zA-Z0-9_-]/g, '_')}`
+        }
+        const mountPath = await mountSshfs(ds)
+        sshfsMountedDatastores.set(ds, mountPath)
+        if (datastores.length > 1) {
+          sshfsMountPath = baseMountPath // restore
+        }
+      }
+    }
+
+    try {
+
+    if (isSshfsBoot) {
+      // ── SSHFS Boot mode: near-zero downtime ──
+      // Flow: stop VMware VM → boot eSage VM from SSHFS-mounted VMDKs → drive-mirror to local storage
+      // Downtime = VMware stop + eSage boot (seconds). Disk copy runs in background while VM is live.
+
+      await appendLog(jobId, "=== SSHFS BOOT: Near-zero downtime migration ===", "info")
+
+      // ── Phase 1: Deploy temp SSH key to ESXi (QEMU libssh requires key auth) ──
+      const esxiHost = new URL(esxiUrl).hostname
+      const esxiSshPort = esxiConn.sshPort || 22
+      const esxiSshUser = esxiConn.sshUser || "root"
+      const esxiPass = esxiConn.sshPassEnc ? decryptSecret(esxiConn.sshPassEnc) : ""
+      const esxiKeyRaw = (esxiConn.sshAuthMethod === "key" && esxiConn.sshKeyEnc) ? decryptSecret(esxiConn.sshKeyEnc) : ""
+
+      const tmpKeyPath = `/tmp/unicenter-sshfsboot-${jobId}-key`
+      let qemuSshKeyPath = ""
+      let useSshfsForBoot = false
+      let ndbSocketPaths: string[] = []
+
+      if (esxiKeyRaw) {
+        // Already have a key - just write it to UNISPHERE node
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `cat > "${tmpKeyPath}" << 'KEYEOF'\n${esxiKeyRaw}\nKEYEOF\nchmod 600 "${tmpKeyPath}"`)
+        qemuSshKeyPath = tmpKeyPath
+        await appendLog(jobId, "Using existing SSH key for QEMU SSH driver", "info")
+      } else if (esxiPass) {
+        // Generate a temp key and deploy to ESXi
+        await appendLog(jobId, "Deploying temporary SSH key to ESXi...", "info")
+
+        // Generate RSA key on UNISPHERE node (best ESXi compatibility)
+        const genResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `ssh-keygen -t rsa -b 4096 -f "${tmpKeyPath}" -N '' -q -C 'unicenter-sshfsboot-${jobId}' 2>&1 && echo KEYGEN_OK`)
+        if (!genResult.success || !genResult.output?.includes("KEYGEN_OK")) {
+          throw new Error(`Failed to generate SSH key: ${genResult.error || genResult.output}`)
+        }
+
+        // Read public key
+        const pubKeyResult = await executeSSH(config.targetConnectionId, nodeIp, `cat "${tmpKeyPath}.pub"`)
+        const pubKey = pubKeyResult.output?.trim()
+        if (!pubKey) throw new Error("Failed to read generated SSH public key")
+
+        // Deploy to ESXi via nested SSH (using sshpass for password auth)
+        // ESXi stores keys in /etc/ssh/keys-<user>/authorized_keys
+        const safeEsxiPass = esxiPass.replaceAll("'", "'\\''")
+        const esxiSshOpts = `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o PreferredAuthentications=keyboard-interactive,password`
+
+        const deployCmd = `export SSHPASS='${safeEsxiPass}' && sshpass -e ssh ${esxiSshOpts} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "mkdir -p /etc/ssh/keys-${esxiSshUser} 2>/dev/null; echo '${pubKey}' >> /etc/ssh/keys-${esxiSshUser}/authorized_keys; echo DEPLOYED" 2>&1`
+        const deployResult = await executeSSH(config.targetConnectionId, nodeIp, deployCmd)
+
+        if (!deployResult.output?.includes("DEPLOYED")) {
+          // Fallback: try ~/.ssh/authorized_keys
+          const deployCmd2 = `export SSHPASS='${safeEsxiPass}' && sshpass -e ssh ${esxiSshOpts} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "mkdir -p ~/.ssh 2>/dev/null; chmod 700 ~/.ssh; echo '${pubKey}' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo DEPLOYED" 2>&1`
+          const deployResult2 = await executeSSH(config.targetConnectionId, nodeIp, deployCmd2)
+
+          if (!deployResult2.output?.includes("DEPLOYED")) {
+            await appendLog(jobId, "SSH key deployment to ESXi failed - will use SSHFS/FUSE fallback for boot", "warn")
+          }
+        }
+
+        // Verify key-based login works
+        const verifyResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `ssh -i "${tmpKeyPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10 -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} 'echo KEYOK' 2>&1`)
+
+        if (verifyResult.output?.includes("KEYOK")) {
+          qemuSshKeyPath = tmpKeyPath
+          await appendLog(jobId, "SSH key deployed and verified", "success")
+        } else {
+          await appendLog(jobId, "SSH key verification failed - will use SSHFS/FUSE fallback for boot", "warn")
+        }
+      }
+
+      // ── Phase 2: Test QEMU SSH driver connectivity ──
+      let bootMethod: "qemu-ssh" | "sshfs" | "nbd" | null = null
+      const diskBus = vmConfig.disks[0]?.controllerType?.toLowerCase()?.includes("scsi") ? "scsi" : "sata"
+      const firstDisk = vmConfig.disks[0]
+
+      // Detect vSAN: -flat.vmdk doesn't exist as a separate POSIX file on vSAN
+      // We need to check via SSHFS whether the flat file or the descriptor should be used
+      const firstFlatPath = firstDisk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+      const firstDescriptorPath = firstDisk.relativePath
+      let useVmdkFormat = false // true when we must use VMDK descriptor instead of flat raw
+
+      // Check if -flat.vmdk exists (won't on vSAN)
+      if (useSSHFS) {
+        const firstMountPath = sshfsMountedDatastores.get(firstDisk.datastoreName) || sshfsMountPath
+        const flatCheck = await executeSSH(config.targetConnectionId, nodeIp,
+          `test -f "${firstMountPath}/${firstFlatPath}" && echo EXISTS || echo MISSING`)
+        if (flatCheck.output?.trim() !== "EXISTS") {
+          const descCheck = await executeSSH(config.targetConnectionId, nodeIp,
+            `test -f "${firstMountPath}/${firstDescriptorPath}" && echo EXISTS || echo MISSING`)
+          if (descCheck.output?.trim() === "EXISTS") {
+            useVmdkFormat = true
+            await appendLog(jobId, "vSAN detected: -flat.vmdk not found, using VMDK descriptor with format=vmdk", "info")
+          }
+        }
+      }
+
+      // Resolve disk path and format based on vSAN detection
+      const bootDiskFile = useVmdkFormat ? firstDescriptorPath : firstFlatPath
+      const bootDiskFormat = useVmdkFormat ? "vmdk" : "raw"
+      const firstEsxiPath = `/vmfs/volumes/${firstDisk.datastoreName}/${bootDiskFile}`
+
+      if (qemuSshKeyPath) {
+        await appendLog(jobId, "Testing QEMU SSH driver connectivity...", "info")
+        const qemuTestResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `timeout 15 qemu-img info 'json:{"file.driver":"ssh","file.host":"${esxiHost}","file.port":${esxiSshPort},"file.path":"${firstEsxiPath}","file.user":"${esxiSshUser}","file.host-key-check.mode":"none","file.identity-file":"${qemuSshKeyPath}"}' 2>&1`)
+
+        if (qemuTestResult.output?.includes("virtual size") || qemuTestResult.output?.includes("file format")) {
+          bootMethod = "qemu-ssh"
+          await appendLog(jobId, `QEMU SSH driver: connection OK (format=${bootDiskFormat})`, "success")
+        } else {
+          await appendLog(jobId, `QEMU SSH driver test failed: ${qemuTestResult.output?.substring(0, 200)}`, "warn")
+        }
+      }
+
+      // Fallback: SSHFS/FUSE - QEMU reads from local FUSE mount path
+      if (!bootMethod) {
+        await appendLog(jobId, "Trying SSHFS/FUSE boot (QEMU reads from SSHFS mount)...", "info")
+        const firstMountPath = sshfsMountedDatastores.get(firstDisk.datastoreName) || sshfsMountPath
+        const firstFusePath = `${firstMountPath}/${bootDiskFile}`
+
+        const fuseTestResult = await executeSSH(config.targetConnectionId, nodeIp,
+          `timeout 10 qemu-img info ${useVmdkFormat ? "-f vmdk " : ""}'${firstFusePath}' 2>&1`)
+        if (fuseTestResult.output?.includes("virtual size") || fuseTestResult.output?.includes("file format")) {
+          useSshfsForBoot = true
+
+          // AppArmor: QEMU on eSage is restricted - allow reading from FUSE mount
+          await appendLog(jobId, "Setting AppArmor complain mode for FUSE access...", "info")
+          await executeSSH(config.targetConnectionId, nodeIp,
+            `aa-complain /etc/apparmor.d/usr.bin.kvm 2>/dev/null; ` +
+            `if [ -f /etc/apparmor.d/local/usr.bin.kvm ]; then ` +
+            `echo '${firstMountPath}/** rk,' >> /etc/apparmor.d/local/usr.bin.kvm 2>/dev/null; ` +
+            `echo '/tmp/unicenter-sshfs-*/** rk,' >> /etc/apparmor.d/local/usr.bin.kvm 2>/dev/null; ` +
+            `apparmor_parser -r /etc/apparmor.d/usr.bin.kvm 2>/dev/null; fi`)
+
+          bootMethod = "sshfs"
+          await appendLog(jobId, "SSHFS/FUSE boot: QEMU can read mounted VMDKs", "success")
+        } else {
+          await appendLog(jobId, `SSHFS/FUSE test failed: ${fuseTestResult.output?.substring(0, 200)}`, "warn")
+        }
+      }
+
+      // Fallback: NBD bridge - qemu-nbd serves SSHFS file via Unix socket, QEMU connects to NBD
+      if (!bootMethod) {
+        await appendLog(jobId, "Trying NBD bridge (qemu-nbd serves SSHFS files via Unix socket)...", "info")
+        const nbdModResult = await executeSSH(config.targetConnectionId, nodeIp, "modprobe nbd max_part=0 2>/dev/null; which qemu-nbd 2>/dev/null")
+        if (nbdModResult.success && nbdModResult.output?.trim()) {
+          let nbdOk = true
+          for (let di = 0; di < vmConfig.disks.length; di++) {
+            const disk = vmConfig.disks[di]
+            const diskFile = useVmdkFormat ? disk.relativePath : disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+            const mp = sshfsMountedDatastores.get(disk.datastoreName) || sshfsMountPath
+            const fusePath = `${mp}/${diskFile}`
+            const sockPath = `/tmp/unicenter-nbd-${jobId}-${di}.sock`
+
+            await executeSSH(config.targetConnectionId, nodeIp,
+              `fuser -k "${sockPath}" 2>/dev/null; rm -f "${sockPath}"`)
+
+            const nbdStart = await executeSSH(config.targetConnectionId, nodeIp,
+              `qemu-nbd --fork --persistent --socket="${sockPath}" --format=${bootDiskFormat} --cache=writeback --aio=threads '${fusePath}' 2>&1`)
+
+            await new Promise(r => setTimeout(r, 1000))
+            const sockCheck = await executeSSH(config.targetConnectionId, nodeIp, `test -S "${sockPath}" && echo EXISTS`)
+            if (nbdStart.success && sockCheck.output?.includes("EXISTS")) {
+              ndbSocketPaths.push(sockPath)
+              await appendLog(jobId, `NBD disk ${di}: ${sockPath} serving ${fusePath}`, "info")
+            } else {
+              await appendLog(jobId, `NBD disk ${di}: failed to start - ${nbdStart.output?.substring(0, 150)}`, "warn")
+              nbdOk = false
+              break
+            }
+          }
+          if (nbdOk && ndbSocketPaths.length === vmConfig.disks.length) {
+            bootMethod = "nbd"
+            await appendLog(jobId, "NBD bridge ready", "success")
+          }
+        }
+      }
+
+      if (!bootMethod) {
+        // All boot methods failed - fall back to regular SSHFS offline copy
+        await appendLog(jobId, "All remote boot methods failed - falling back to offline SSHFS copy", "warn")
+        // Clean up temp key
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpKeyPath}" "${tmpKeyPath}.pub"`)
+        // Re-use the SSHFS offline transfer code path
+        for (let i = 0; i < vmConfig.disks.length; i++) {
+          await updateJob(jobId, "transferring", { currentDisk: i, progress: Math.round((i / vmConfig.disks.length) * 100) })
+          const diskDs = vmConfig.disks[i].datastoreName
+          if (sshfsMountedDatastores.has(diskDs)) sshfsMountPath = sshfsMountedDatastores.get(diskDs)!
+          if (isFileBased) {
+            await transferDiskViaSshfs(i, vmConfig.disks[i])
+          } else {
+            const vol = await allocateBlockVolume(vmConfig.disks[i].capacityBytes)
+            await streamDiskViaSshfsToBlock(i, vmConfig.disks[i], vol.devicePath)
+            if (isCancelled(jobId)) throw new Error("Migration cancelled")
+            await attachBlockDisk(i, vol.volumeId)
+          }
+          await updateJob(jobId, "transferring", { currentDisk: i + 1, progress: Math.round(((i + 1) / vmConfig.disks.length) * 100) })
+        }
+      } else {
+        // ── Phase 3: Allocate local target volumes for drive-mirror ──
+        await appendLog(jobId, `Boot method: ${bootMethod} - allocating local target volumes (${isFileBased ? 'file-based' : 'block'})...`, "info")
+        const localVolumes: { volumeId: string, devicePath: string, isFileVol?: boolean }[] = []
+
+        // Seed used disk numbers from current VM config so efidisk0 (which occupies
+        // vm-<vmid>-disk-0.raw after `qm create --bios ovmf`) does not collide with data disks.
+        const fileBasedUsedNums = new Set<number>()
+        if (isFileBased) {
+          const vmConfForAlloc = await unisphereFetch<Record<string, any>>(unisphereConn,
+            `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/config`)
+          for (const val of Object.values(vmConfForAlloc || {})) {
+            if (typeof val === 'string') {
+              const m = val.match(/vm-\d+-disk-(\d+)/)
+              if (m) fileBasedUsedNums.add(Number.parseInt(m[1]))
+            }
+          }
+        }
+
+        for (let di = 0; di < vmConfig.disks.length; di++) {
+          const diskSizeBytes = vmConfig.disks[di].capacityBytes
+          if (isFileBased) {
+            // File-based storage (dir, NFS, CIFS): create a raw image file for drive-mirror target
+            const storagePath = storageConfig?.path || '/var/lib/vz'
+            const imgDir = `${storagePath}/images/${targetVmid}`
+            await executeSSH(config.targetConnectionId, nodeIp, `mkdir -p "${imgDir}"`)
+
+            // Pick next free disk number, skipping slots already taken (efidisk0, tpmstate0, ...).
+            let diskNum = 0
+            while (fileBasedUsedNums.has(diskNum)) diskNum++
+            fileBasedUsedNums.add(diskNum)
+
+            const imgPath = `${imgDir}/vm-${targetVmid}-disk-${diskNum}.raw`
+            const sizeGB = Math.ceil(diskSizeBytes / 1073741824)
+            const createResult = await executeSSH(config.targetConnectionId, nodeIp,
+              `qemu-img create -f raw "${imgPath}" ${sizeGB}G 2>&1`)
+            if (!createResult.success) {
+              throw new Error(`Failed to create disk image: ${createResult.error || createResult.output}`)
+            }
+            localVolumes.push({ volumeId: `${config.targetStorage}:${targetVmid}/vm-${targetVmid}-disk-${diskNum}.raw`, devicePath: imgPath, isFileVol: true })
+            await appendLog(jobId, `Disk ${di}: ${imgPath} (${sizeGB} GB raw image)`, "info")
+          } else {
+            // Block storage (LVM, ZFS, RBD): pre-allocate volume
+            const vol = await allocateBlockVolume(diskSizeBytes)
+            localVolumes.push(vol)
+            await appendLog(jobId, `Disk ${di}: ${vol.volumeId} -> ${vol.devicePath} (${(diskSizeBytes / 1073741824).toFixed(1)} GB)`, "info")
+          }
+        }
+
+        // ── Phase 4: Write QEMU args to VM config ──
+        // Build -drive and -device args for each disk pointing to the remote source
+        const confPath = `/etc/unisphere/qemu-server/${targetVmid}.conf`
+        const sshKeyOpt = qemuSshKeyPath ? `,file.identity-file=${qemuSshKeyPath}` : ""
+
+        // Determine SCSI controller if needed
+        let scsiControllerArgs = ""
+        if (diskBus === "scsi") {
+          // Read scsihw from VM config
+          const scsihwResult = await executeSSH(config.targetConnectionId, nodeIp,
+            `grep '^scsihw:' "${confPath}" 2>/dev/null`)
+          const scsihwType = scsihwResult.output?.trim().split(":")[1]?.trim() || "virtio-scsi-pci"
+          const scsiDeviceMap: Record<string, string> = {
+            "pvscsi": "pvscsi",
+            "virtio-scsi-pci": "virtio-scsi-pci",
+            "virtio-scsi-single": "virtio-scsi-pci",
+            "lsi": "lsi53c895a",
+            "lsi53c810": "lsi53c810",
+            "megasas": "megasas",
+          }
+          scsiControllerArgs = `-device ${scsiDeviceMap[scsihwType] || "virtio-scsi-pci"},id=scsihw0 `
+        }
+
+        const argsParts: string[] = []
+        for (let di = 0; di < vmConfig.disks.length; di++) {
+          const disk = vmConfig.disks[di]
+          const diskFile = useVmdkFormat ? disk.relativePath : disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+          const driveId = `sshfs-disk${di}`
+
+          let driveSpec = ""
+          if (bootMethod === "qemu-ssh") {
+            const esxiPath = `/vmfs/volumes/${disk.datastoreName}/${diskFile}`
+            driveSpec = `file.driver=ssh,file.host=${esxiHost},file.port=${esxiSshPort},file.path=${esxiPath},file.user=${esxiSshUser},file.host-key-check.mode=none${sshKeyOpt},format=${bootDiskFormat},if=none,id=${driveId},cache=writeback,aio=threads`
+          } else if (bootMethod === "sshfs") {
+            const mp = sshfsMountedDatastores.get(disk.datastoreName) || sshfsMountPath
+            const fusePath = `${mp}/${diskFile}`
+            driveSpec = `file=${fusePath},format=${bootDiskFormat},if=none,id=${driveId},cache=writeback,aio=threads,detect-zeroes=on`
+          } else if (bootMethod === "nbd") {
+            const sockPath = ndbSocketPaths[di]
+            // NBD exports raw blocks regardless of source format (qemu-nbd handles conversion)
+            driveSpec = `file.driver=nbd,file.path=${sockPath},format=raw,if=none,id=${driveId},cache=writeback,aio=threads`
+          }
+
+          // Device spec matching the disk controller
+          let deviceSpec: string
+          if (diskBus === "scsi" && !(di === 0 && unisphereParams.bootDiskSlot === "sata0")) {
+            deviceSpec = `scsi-hd,bus=scsihw0.0,scsi-id=${di},lun=0,drive=${driveId},bootindex=${di}`
+          } else {
+            // Boot disk rides the q35 AHCI when the guest cannot boot from SCSI
+            // (Windows / OVMF, #653) — mirrors the sata0 slot used at cutover.
+            deviceSpec = `ide-hd,drive=${driveId},bus=ide.${Math.floor(di / 2)},unit=${di % 2},bootindex=${di}`
+          }
+
+          argsParts.push(`-drive ${driveSpec}`)
+          argsParts.push(`-device ${deviceSpec}`)
+        }
+
+        const fullArgs = scsiControllerArgs + argsParts.join(" ")
+
+        // Remove existing disk lines and add custom args
+        for (let di = 0; di < vmConfig.disks.length; di++) {
+          await executeSSH(config.targetConnectionId, nodeIp,
+            `sed -i '/^scsi${di}:/d; /^sata${di}:/d; /^ide${di}:/d; /^virtio${di}:/d' "${confPath}"`)
+        }
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `sed -i '/^args:/d; /^boot:/d' "${confPath}"`)
+
+        // Write args line (escape single quotes)
+        const escapedArgs = fullArgs.replaceAll("'", "'\\''")
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `echo 'args: ${escapedArgs}' >> "${confPath}"`)
+
+        // Ensure key is readable by QEMU process
+        if (qemuSshKeyPath) {
+          await executeSSH(config.targetConnectionId, nodeIp, `chmod 644 "${qemuSshKeyPath}" 2>/dev/null`)
+        }
+
+        await appendLog(jobId, `VM config written with ${bootMethod} drive args`, "success")
+
+        // ── Phase 5: Start VM (downtime ends when VM boots) ──
+        const downtimeStart = Date.now()
+        await appendLog(jobId, `Starting VM ${targetVmid} (${bootMethod} backend + cache=writeback)...`, "info")
+
+        await unisphereFetch<any>(
+          unisphereConn,
+          `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/start`,
+          { method: "POST" }
+        )
+
+        // Wait for VM to be running
+        await new Promise(r => setTimeout(r, 8000))
+        const vmStatus = await unisphereFetch<any>(
+          unisphereConn,
+          `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/current`
+        )
+
+        if (vmStatus?.status !== "running") {
+          // Check QEMU logs for error
+          const logResult = await executeSSH(config.targetConnectionId, nodeIp,
+            `tail -20 /var/log/unisphere/qemu-server/${targetVmid}.log 2>/dev/null | grep -i 'error\\|failed\\|abort' | tail -3`)
+          const qemuLog = logResult.output?.trim() || "(no error in logs)"
+          await appendLog(jobId, `VM failed to start (status: ${vmStatus?.status}). QEMU log: ${qemuLog}`, "error")
+
+          // Try NBD fallback if we were on SSHFS
+          if (bootMethod === "sshfs" && ndbSocketPaths.length === 0) {
+            await appendLog(jobId, "Retrying with NBD bridge fallback...", "warn")
+            // Set up NBD
+            await executeSSH(config.targetConnectionId, nodeIp, "modprobe nbd max_part=0 2>/dev/null")
+            let nbdFallbackOk = true
+            const nbdFallbackParts: string[] = []
+            for (let di = 0; di < vmConfig.disks.length; di++) {
+              const disk = vmConfig.disks[di]
+              const diskP = useVmdkFormat ? disk.relativePath : disk.relativePath.replace(/\.vmdk$/, "-flat.vmdk")
+              const mp = sshfsMountedDatastores.get(disk.datastoreName) || sshfsMountPath
+              const fusePath = `${mp}/${diskP}`
+              const sockPath = `/tmp/unicenter-nbd-${jobId}-${di}.sock`
+
+              await executeSSH(config.targetConnectionId, nodeIp, `fuser -k "${sockPath}" 2>/dev/null; rm -f "${sockPath}"`)
+              const nbdStartResult = await executeSSH(config.targetConnectionId, nodeIp,
+                `qemu-nbd --fork --persistent --socket="${sockPath}" --format=${bootDiskFormat} --cache=writeback --aio=threads '${fusePath}' 2>&1`)
+              await new Promise(r => setTimeout(r, 1000))
+              const sockExists = await executeSSH(config.targetConnectionId, nodeIp, `test -S "${sockPath}" && echo EXISTS`)
+              if (nbdStartResult.success && sockExists.output?.includes("EXISTS")) {
+                ndbSocketPaths.push(sockPath)
+                const driveId = `nbd-disk${di}`
+                const driveSpec = `file.driver=nbd,file.path=${sockPath},format=raw,if=none,id=${driveId},cache=writeback,aio=threads`
+                // Same boot-disk rule as the SSHFS -args builder above: sata0
+                // guests (Windows / OVMF, #653) boot from the q35 AHCI.
+                const deviceSpec = diskBus === "scsi" && !(di === 0 && unisphereParams.bootDiskSlot === "sata0")
+                  ? `scsi-hd,bus=scsihw0.0,scsi-id=${di},lun=0,drive=${driveId},bootindex=${di}`
+                  : `ide-hd,drive=${driveId},bus=ide.${Math.floor(di / 2)},unit=${di % 2},bootindex=${di}`
+                nbdFallbackParts.push(`-drive ${driveSpec}`)
+                nbdFallbackParts.push(`-device ${deviceSpec}`)
+              } else {
+                nbdFallbackOk = false
+                break
+              }
+            }
+
+            if (nbdFallbackOk && nbdFallbackParts.length > 0) {
+              const nbdArgs = scsiControllerArgs + nbdFallbackParts.join(" ")
+              const nbdEscaped = nbdArgs.replaceAll("'", "'\\''")
+              await executeSSH(config.targetConnectionId, nodeIp,
+                `sed -i '/^args:/d' "${confPath}" && echo 'args: ${nbdEscaped}' >> "${confPath}"`)
+              bootMethod = "nbd"
+              await unisphereFetch<any>(unisphereConn,
+                `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/start`,
+                { method: "POST" })
+              await new Promise(r => setTimeout(r, 8000))
+              const vmStatus2 = await unisphereFetch<any>(unisphereConn,
+                `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/current`)
+              if (vmStatus2?.status === "running") {
+                await appendLog(jobId, `VM ${targetVmid} STARTED via NBD bridge - DOWNTIME ENDS`, "success")
+              } else {
+                throw new Error("VM failed to start with all boot methods (SSHFS + NBD). Check QEMU logs on the eSage node.")
+              }
+            } else {
+              throw new Error("VM failed to start and NBD fallback also failed. Check QEMU logs on the eSage node.")
+            }
+          } else {
+            throw new Error(`VM failed to start via ${bootMethod}. Check QEMU logs: tail /var/log/unisphere/qemu-server/${targetVmid}.log`)
+          }
+        } else {
+          const downtimeSec = Math.round((Date.now() - downtimeStart) / 1000)
+          await appendLog(jobId, `VM ${targetVmid} STARTED via ${bootMethod} - DOWNTIME ENDS (${downtimeSec}s)`, "success")
+          await appendLog(jobId, `VM is running on ${bootMethod}-backed storage with writeback cache`, "info")
+        }
+
+        // ── Phase 6: drive-mirror to copy data from remote to local volumes ──
+        await appendLog(jobId, "Starting live storage migration (drive-mirror)...", "info")
+        await updateJob(jobId, "transferring", { progress: 5, currentStep: "drive_mirror" })
+
+        // Helper: send HMP command to running QEMU VM via eSage monitor API
+        // Send HMP command to QEMU via "qm monitor" over SSH (API monitor endpoint is root-only)
+        async function qmMonitorCmd(command: string): Promise<{ success: boolean, output: string }> {
+          const safeCmd = command.replaceAll("'", "'\\''")
+          const result = await executeSSH(config.targetConnectionId, nodeIp,
+            `echo '${safeCmd}' | qm monitor ${targetVmid} 2>&1`)
+          if (!result.success) {
+            return { success: false, output: result.error || "" }
+          }
+          // qm monitor outputs "Entering QEMU Monitor...\n<output>\n" — strip the header
+          const output = (result.output || "").replace(/^Entering.*?Monitor[^\n]*\n?/i, "").trim()
+          return { success: true, output }
+        }
+
+        // Start drive-mirror for each disk
+        const mirrors: { driveId: string, diskTotal: number, diskIndex: number }[] = []
+
+        for (let di = 0; di < vmConfig.disks.length; di++) {
+          const driveId = bootMethod === "nbd" ? `nbd-disk${di}` : `sshfs-disk${di}`
+          const targetPath = localVolumes[di].devicePath
+          const diskTotal = vmConfig.disks[di].capacityBytes
+
+          await appendLog(jobId, `drive-mirror: ${driveId} -> ${targetPath} (${(diskTotal / 1073741824).toFixed(1)} GB)`, "info")
+
+          // Verify drive exists in QEMU block graph
+          const blockInfo = await qmMonitorCmd("info block")
+          if (!blockInfo.output.includes(driveId)) {
+            const drives = blockInfo.output.split("\n").filter(l => l.includes(":") && !l.includes("Removable")).map(l => l.trim().split(":")[0])
+            await appendLog(jobId, `drive '${driveId}' not found. Available: ${drives.slice(0, 10).join(", ")}`, "warn")
+            throw new Error(`Drive ${driveId} not found in QEMU block graph`)
+          }
+
+          // Start drive-mirror: -n = reuse existing target, -f = skip size check
+          let mirrorStarted = false
+          for (const cmd of [`drive_mirror -n -f ${driveId} ${targetPath} raw`, `drive_mirror -n ${driveId} ${targetPath} raw`]) {
+            await appendLog(jobId, `drive-mirror cmd: ${cmd}`, "info")
+            const mirrorResult = await qmMonitorCmd(cmd)
+            await appendLog(jobId, `drive-mirror response: ${mirrorResult.output.substring(0, 200)}`, "info")
+            if (mirrorResult.success && !mirrorResult.output.toLowerCase().includes("error")) {
+              // Set speed to unlimited
+              await qmMonitorCmd(`block_job_set_speed ${driveId} 0`)
+              // Verify job started
+              await new Promise(r => setTimeout(r, 1500))
+              const jobsCheck = await qmMonitorCmd("info block-jobs")
+              await appendLog(jobId, `block-jobs: ${jobsCheck.output.substring(0, 200)}`, "info")
+              if (jobsCheck.output.includes(driveId)) {
+                mirrorStarted = true
+                mirrors.push({ driveId, diskTotal, diskIndex: di })
+                await appendLog(jobId, `drive-mirror started: ${driveId}`, "success")
+                break
+              }
+              // Wait a bit more
+              await new Promise(r => setTimeout(r, 3000))
+              const jobsCheck2 = await qmMonitorCmd("info block-jobs")
+              if (jobsCheck2.output.includes(driveId)) {
+                mirrorStarted = true
+                mirrors.push({ driveId, diskTotal, diskIndex: di })
+                await appendLog(jobId, `drive-mirror started (delayed): ${driveId}`, "success")
+                break
+              }
+            } else {
+              await appendLog(jobId, `drive-mirror attempt failed: ${mirrorResult.output.substring(0, 200)}`, "warn")
+            }
+          }
+
+          if (!mirrorStarted) {
+            throw new Error(`drive-mirror failed to start for ${driveId}. This can happen if QEMU cannot write to the target device.`)
+          }
+        }
+
+        // ── Phase 7: Poll drive-mirror progress until all mirrors are ready ──
+        const MIRROR_TIMEOUT = 7200000 // 2h
+        const PAUSE_PIVOT_AFTER_MS = 60000 // 60s at 100% before pause-pivot
+        const readyDrives = new Set<string>()
+        const at100Since = new Map<string, number>() // driveId -> timestamp
+        const mirrorStart = Date.now()
+        let lastProgressLog = 0
+
+        while (Date.now() - mirrorStart < MIRROR_TIMEOUT) {
+          if (isCancelled(jobId)) {
+            for (const m of mirrors) await qmMonitorCmd(`block_job_cancel ${m.driveId}`)
+            throw new Error("Migration cancelled")
+          }
+          await new Promise(r => setTimeout(r, 2000))
+
+          const jobsResult = await qmMonitorCmd("info block-jobs")
+          if (!jobsResult.success) continue
+
+          let allNear100 = true
+
+          for (const mirror of mirrors) {
+            if (readyDrives.has(mirror.driveId)) continue
+
+            // Check if drive is no longer in block-jobs (completed or errored)
+            if (!jobsResult.output.includes(mirror.driveId)) {
+              const elapsed = Date.now() - mirrorStart
+              if (elapsed < 10000) { allNear100 = false; continue }
+              readyDrives.add(mirror.driveId)
+              continue
+            }
+
+            // Check if this drive is "ready" (mirror synced, waiting for pivot)
+            const readyMatch = new RegExp(`${mirror.driveId.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*ready`, "i")
+            if (readyMatch.test(jobsResult.output)) {
+              readyDrives.add(mirror.driveId)
+              continue
+            }
+
+            // Parse progress: "Completed 123456789 of 987654321 bytes"
+            const progressMatch = jobsResult.output.match(
+              new RegExp(`${mirror.driveId.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*?Completed\\s+(\\d+)\\s+of\\s+(\\d+)`)
+            )
+            if (progressMatch) {
+              const done = Number.parseInt(progressMatch[1], 10)
+              const total = Number.parseInt(progressMatch[2], 10)
+              if (total > 0 && done >= total * 0.995) {
+                if (!at100Since.has(mirror.driveId)) at100Since.set(mirror.driveId, Date.now())
+              } else {
+                at100Since.delete(mirror.driveId)
+                allNear100 = false
+              }
+            } else {
+              allNear100 = false
+            }
+          }
+
+          // Update overall progress
+          const totalBytes = mirrors.reduce((s, m) => s + m.diskTotal, 0)
+          let totalDone = 0
+          for (const mirror of mirrors) {
+            if (readyDrives.has(mirror.driveId)) {
+              totalDone += mirror.diskTotal
+            } else {
+              const pm = jobsResult.output.match(
+                new RegExp(`${mirror.driveId.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*?Completed\\s+(\\d+)`)
+              )
+              if (pm) totalDone += Number.parseInt(pm[1], 10)
+            }
+          }
+          const overallPct = totalBytes > 0 ? Math.min(Math.round((totalDone / totalBytes) * 95), 95) : 0
+          const elapsed = (Date.now() - mirrorStart) / 1000
+          const speedBps = elapsed > 0 ? totalDone / elapsed : 0
+          const speedStr = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+          await updateJob(jobId, "transferring", {
+            bytesTransferred: BigInt(totalDone),
+            totalBytes: BigInt(totalBytes),
+            transferSpeed: `Mirror: ${speedStr}`,
+            progress: overallPct,
+          })
+
+          // Log progress every 10s
+          if (Date.now() - lastProgressLog >= 10000) {
+            for (const mirror of mirrors) {
+              if (readyDrives.has(mirror.driveId)) continue
+              const pm = jobsResult.output.match(
+                new RegExp(`${mirror.driveId.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*?Completed\\s+(\\d+)\\s+of\\s+(\\d+)`)
+              )
+              if (pm) {
+                const done = Number.parseInt(pm[1], 10)
+                const total = Number.parseInt(pm[2], 10)
+                const pct = total > 0 ? (done * 100 / total).toFixed(1) : "0"
+                const spd = elapsed > 0 ? done / (1048576 * elapsed) : 0
+                await appendLog(jobId, `disk${mirror.diskIndex}: ${pct}% (${spd.toFixed(0)} MB/s)`, "info")
+              }
+            }
+            lastProgressLog = Date.now()
+          }
+
+          // Pause-pivot-resume: FUSE/SSHFS can't track dirty blocks, so mirrors
+          // never become "ready". When all disks are at ~100% for PAUSE_PIVOT_AFTER_MS,
+          // pause the VM (freeze CPUs), let mirrors catch up, pivot, then resume.
+          const driveIdsSet = new Set(mirrors.map(m => m.driveId))
+          const notReady = new Set([...driveIdsSet].filter(d => !readyDrives.has(d)))
+          if (notReady.size > 0 && allNear100 && at100Since.size > 0) {
+            const oldest100 = Math.min(...Array.from(at100Since.values()))
+            if (Date.now() - oldest100 > PAUSE_PIVOT_AFTER_MS) {
+              await appendLog(jobId, "All disks at 100% but not 'ready' - using pause-pivot-resume...", "info")
+              await appendLog(jobId, "Pausing VM for atomic pivot (~1-2s)...", "warn")
+
+              // Step 1: Pause VM (HMP "stop" = freeze CPUs, NOT qm stop!)
+              await qmMonitorCmd("stop")
+              await new Promise(r => setTimeout(r, 1000))
+
+              // Step 2: Wait for mirrors to catch up (no new I/O since CPUs frozen)
+              const readyAfterPause = new Set(readyDrives)
+              for (let wait = 0; wait < 10; wait++) {
+                await new Promise(r => setTimeout(r, 1000))
+                const jobs2 = await qmMonitorCmd("info block-jobs")
+                if (jobs2.success) {
+                  for (const mirror of mirrors) {
+                    if (readyAfterPause.has(mirror.driveId)) continue
+                    if (!jobs2.output.includes(mirror.driveId)) {
+                      readyAfterPause.add(mirror.driveId)
+                    } else {
+                      const readyRe = new RegExp(`${mirror.driveId.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*ready`, "i")
+                      if (readyRe.test(jobs2.output)) readyAfterPause.add(mirror.driveId)
+                    }
+                  }
+                }
+                if (readyAfterPause.size >= driveIdsSet.size) break
+              }
+
+              // Step 3: Pivot all drives
+              let pivotOk = true
+              for (const mirror of mirrors) {
+                const pivotResult = await qmMonitorCmd(`block_job_complete ${mirror.driveId}`)
+                if (!pivotResult.success && pivotResult.output.toLowerCase().includes("not ready")) {
+                  await appendLog(jobId, `${mirror.driveId}: pivot failed (not ready) - cancelling`, "warn")
+                  await qmMonitorCmd(`block_job_cancel ${mirror.driveId}`)
+                  pivotOk = false
+                }
+              }
+
+              // Step 4: Wait for pivots
+              await new Promise(r => setTimeout(r, 2000))
+              const jobs3 = await qmMonitorCmd("info block-jobs")
+              const remaining = mirrors.filter(m => jobs3.output.includes(m.driveId))
+              if (remaining.length > 0) {
+                await new Promise(r => setTimeout(r, 5000))
+              }
+
+              // Step 5: Resume VM
+              await qmMonitorCmd("cont")
+
+              if (pivotOk) {
+                const totalGB = mirrors.reduce((s, m) => s + m.diskTotal, 0) / 1073741824
+                const mirrorElapsed = Math.round((Date.now() - mirrorStart) / 1000)
+                await appendLog(jobId, `Pause-pivot-resume complete! ${totalGB.toFixed(1)} GB in ${mirrorElapsed}s - VM resumed on local storage`, "success")
+              } else {
+                await appendLog(jobId, "Pivot during pause partially failed - VM resumed but some disks may still be on remote storage", "warn")
+              }
+              break
+            }
+          }
+
+          // Check if all drives are ready (normal case - non-FUSE backends)
+          if (readyDrives.size >= driveIdsSet.size) {
+            // All ready - pivot atomically
+            await appendLog(jobId, "All mirrors synced - pivoting to local storage...", "info")
+            for (const mirror of mirrors) {
+              const pivotResult = await qmMonitorCmd(`block_job_complete ${mirror.driveId}`)
+              if (!pivotResult.success) {
+                await appendLog(jobId, `Warning: pivot ${mirror.driveId} failed: ${pivotResult.output.substring(0, 150)}`, "warn")
+              }
+            }
+            // Wait for pivots to complete
+            await new Promise(r => setTimeout(r, 3000))
+            const jobsFinal = await qmMonitorCmd("info block-jobs")
+            const remainingFinal = mirrors.filter(m => jobsFinal.output.includes(m.driveId))
+            if (remainingFinal.length > 0) await new Promise(r => setTimeout(r, 5000))
+
+            const totalGB = mirrors.reduce((s, m) => s + m.diskTotal, 0) / 1073741824
+            const mirrorElapsed = Math.round((Date.now() - mirrorStart) / 1000)
+            await appendLog(jobId, `All pivots complete - VM on local storage (${totalGB.toFixed(1)} GB in ${mirrorElapsed}s)`, "success")
+            break
+          }
+        }
+
+        // Check for mirror timeout
+        if (Date.now() - mirrorStart >= MIRROR_TIMEOUT) {
+          for (const mirror of mirrors) await qmMonitorCmd(`block_job_cancel ${mirror.driveId}`)
+          throw new Error("drive-mirror timed out after 2 hours")
+        }
+
+        // ── Phase 8: Reconfigure VM with proper local disk lines ──
+        await appendLog(jobId, "Reconfiguring VM with local disk references...", "info")
+
+        // Stop VM briefly to reconfigure
+        await unisphereFetch<any>(unisphereConn,
+          `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/stop`,
+          { method: "POST" })
+        // Wait for VM to stop
+        for (let wait = 0; wait < 30; wait++) {
+          await new Promise(r => setTimeout(r, 2000))
+          const st = await unisphereFetch<any>(unisphereConn,
+            `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/current`)
+          if (st?.status === "stopped") break
+        }
+
+        // ── UEFI fallback bootloader injection ──
+        // Fresh efidisk0 has no NVRAM boot entries, so OVMF only finds the bootloader if
+        // it lives at the UEFI removable/fallback path \EFI\Boot\bootx64.efi. Windows stores
+        // bootmgfw.efi under \EFI\Microsoft\Boot\ and doesn't always create the fallback copy.
+        // Copy it now (while VM is stopped) so the guest boots without needing NVRAM.
+        if (unisphereParams.bios === "ovmf" && isFileBased && localVolumes[0]) {
+          await appendLog(jobId, "Ensuring UEFI fallback bootloader is present on EFI partition...", "info")
+          const bootDiskPath = localVolumes[0].devicePath
+          const injectScript = [
+            'set +e',
+            'modprobe nbd max_part=16 2>/dev/null',
+            // Find a free nbd device (no pid file means unused)
+            'NBD=""',
+            'for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do',
+            '  if [ ! -s /sys/block/nbd$i/pid ] 2>/dev/null; then NBD=/dev/nbd$i; break; fi',
+            'done',
+            '[ -z "$NBD" ] && { echo "INJECT_RESULT=NO_FREE_NBD"; exit 0; }',
+            `qemu-nbd --connect="$NBD" --format=raw "${bootDiskPath}" 2>/dev/null || { echo "INJECT_RESULT=NBD_FAIL"; exit 0; }`,
+            'sleep 1',
+            'partprobe "$NBD" 2>/dev/null',
+            'sleep 1',
+            // Find EFI System Partition by GUID
+            `EFI_PART=$(lsblk -nr -o NAME,PARTTYPE "$NBD" 2>/dev/null | awk 'tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" {print "/dev/"$1; exit}')`,
+            // Fallback: look for any FAT partition on the disk
+            'if [ -z "$EFI_PART" ]; then',
+            '  for p in ${NBD}p*; do',
+            '    [ -e "$p" ] && blkid -s TYPE -o value "$p" 2>/dev/null | grep -qi vfat && EFI_PART="$p" && break',
+            '  done',
+            'fi',
+            'if [ -z "$EFI_PART" ]; then',
+            '  qemu-nbd --disconnect "$NBD" >/dev/null 2>&1',
+            '  echo "INJECT_RESULT=NO_EFI_PART"; exit 0',
+            'fi',
+            'MNT=$(mktemp -d /tmp/efi-inject-XXXXXX)',
+            'if ! mount -t vfat -o rw "$EFI_PART" "$MNT" 2>/dev/null; then',
+            '  qemu-nbd --disconnect "$NBD" >/dev/null 2>&1; rmdir "$MNT"',
+            '  echo "INJECT_RESULT=MOUNT_FAIL"; exit 0',
+            'fi',
+            'RESULT=NO_BOOTLOADER',
+            // Windows: copy bootmgfw.efi to \EFI\Boot\bootx64.efi if missing
+            'if [ -f "$MNT/EFI/Microsoft/Boot/bootmgfw.efi" ]; then',
+            '  if [ -f "$MNT/EFI/Boot/bootx64.efi" ] || [ -f "$MNT/EFI/BOOT/BOOTX64.EFI" ]; then',
+            '    RESULT=ALREADY_PRESENT',
+            '  else',
+            '    mkdir -p "$MNT/EFI/Boot" && cp "$MNT/EFI/Microsoft/Boot/bootmgfw.efi" "$MNT/EFI/Boot/bootx64.efi" && RESULT=WINDOWS_INJECTED',
+            '  fi',
+            'elif [ -f "$MNT/EFI/Boot/bootx64.efi" ] || [ -f "$MNT/EFI/BOOT/BOOTX64.EFI" ]; then',
+            '  RESULT=ALREADY_PRESENT',
+            'fi',
+            'sync; umount "$MNT"; rmdir "$MNT"',
+            'qemu-nbd --disconnect "$NBD" >/dev/null 2>&1',
+            'echo "INJECT_RESULT=$RESULT"',
+          ].join('\n')
+          const injectResult = await executeSSH(config.targetConnectionId, nodeIp, injectScript)
+          const out = injectResult.output || ""
+          if (out.includes("INJECT_RESULT=WINDOWS_INJECTED")) {
+            await appendLog(jobId, "Windows UEFI fallback bootloader installed (\\EFI\\Boot\\bootx64.efi)", "success")
+          } else if (out.includes("INJECT_RESULT=ALREADY_PRESENT")) {
+            await appendLog(jobId, "UEFI fallback bootloader already present, no injection needed", "info")
+          } else if (out.includes("INJECT_RESULT=NO_BOOTLOADER")) {
+            await appendLog(jobId, "⚠ No recognized bootloader found on EFI partition — VM may not boot", "warn")
+          } else if (out.includes("INJECT_RESULT=NO_EFI_PART")) {
+            await appendLog(jobId, "⚠ No EFI system partition found on disk 0 — VM may not boot if it expects one", "warn")
+          } else {
+            await appendLog(jobId, `⚠ UEFI bootloader injection skipped: ${out.split('\n').find(l => l.startsWith('INJECT_RESULT=')) || out.substring(0, 150)}`, "warn")
+          }
+        }
+
+        // Remove args: via direct config edit — UNISPHERE API forbids non-root tokens from setting/deleting 'args'.
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `sed -i '/^args:/d' "${confPath}"`)
+
+        // When the source controller is SCSI but the guest cannot boot from it,
+        // attach the boot disk as SATA instead. The sata0 decision now comes from
+        // unisphereParams.bootDiskSlot: OVMF guests (the firmware cannot enumerate an
+        // LSI controller) and Windows guests (no boot-start VirtIO/LSI driver in
+        // an untouched guest, #653). Data disks stay on SCSI for performance.
+        const forceSataForBoot = unisphereParams.bootDiskSlot === "sata0" && diskBus === "scsi"
+        if (forceSataForBoot) {
+          await appendLog(jobId, "Attaching boot disk as SATA (firmware or guest cannot boot from the SCSI controller without drivers)", "info")
+        }
+        const slotPerDisk: string[] = []
+        for (let di = 0; di < localVolumes.length; di++) {
+          let slot: string
+          if (forceSataForBoot && di === 0) slot = "sata0"
+          else if (forceSataForBoot) slot = `scsi${di - 1}`
+          else slot = diskBus === "scsi" ? `scsi${di}` : `sata${di}`
+          slotPerDisk.push(slot)
+        }
+
+        // Attach all disks + boot order atomically in a single UNISPHERE API PUT (replaces previous per-disk PUTs).
+        const reconfigBody = new URLSearchParams()
+        const diskOpts = isFileBased ? ",discard=on" : ""
+        for (let di = 0; di < localVolumes.length; di++) {
+          reconfigBody.set(slotPerDisk[di], `${localVolumes[di].volumeId}${diskOpts}`)
+        }
+        reconfigBody.set('boot', `order=${slotPerDisk[0]}`)
+        await unisphereSetVmConfig(unisphereConn, config.targetNode, targetVmid!, reconfigBody)
+        // SSHFS Boot does an atomic grouped PUT instead of per-disk
+        // calls through attachBlockDisk(), so we must mark the entries
+        // here ourselves. Without this, a failure further down (e.g.
+        // the VM restart at status/start) would have the catch-path
+        // cleanup unispheresm-free volumes that are already in qm config.
+        for (const vol of localVolumes) {
+          const entry = allocatedVolumes.find(v => v.volumeId === vol.volumeId)
+          if (entry) entry.attached = true
+        }
+        for (let di = 0; di < localVolumes.length; di++) {
+          await appendLog(jobId, `Disk ${di} attached as ${slotPerDisk[di]} (${localVolumes[di].volumeId})`, "success")
+        }
+
+        // Restart VM — always restart for SSHFS Boot (VM was running before reconfiguration)
+        await appendLog(jobId, "Restarting VM with local disks...", "info")
+        await unisphereFetch<any>(unisphereConn,
+          `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/start`,
+          { method: "POST" })
+        await appendLog(jobId, "VM restarted on local storage", "success")
+
+        // ── Phase 9: Cleanup ──
+        // Remove deployed SSH key from ESXi
+        if (qemuSshKeyPath && !esxiKeyRaw && esxiPass) {
+          const pubKeyResult = await executeSSH(config.targetConnectionId, nodeIp, `cat "${tmpKeyPath}.pub" 2>/dev/null`)
+          const pubKey = pubKeyResult.output?.trim()
+          if (pubKey) {
+            const safePub = pubKey.replaceAll(/[/\\&]/g, '\\$&')
+            const safeEsxiPass2 = esxiPass.replaceAll("'", "'\\''")
+            const esxiSshOpts2 = `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 -o PreferredAuthentications=keyboard-interactive,password`
+            await executeSSH(config.targetConnectionId, nodeIp,
+              `export SSHPASS='${safeEsxiPass2}' && sshpass -e ssh ${esxiSshOpts2} -p ${esxiSshPort} ${esxiSshUser}@${esxiHost} "sed -i '/${safePub.substring(0, 40)}/d' /etc/ssh/keys-${esxiSshUser}/authorized_keys ~/.ssh/authorized_keys 2>/dev/null; echo CLEANED" 2>&1`)
+          }
+        }
+        // Remove temp key from UNISPHERE node
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpKeyPath}" "${tmpKeyPath}.pub"`)
+        // Kill NBD servers
+        for (const sockPath of ndbSocketPaths) {
+          await executeSSH(config.targetConnectionId, nodeIp, `fuser -k "${sockPath}" 2>/dev/null; rm -f "${sockPath}"`)
+        }
+        // Restore AppArmor
+        if (bootMethod === "sshfs") {
+          await executeSSH(config.targetConnectionId, nodeIp,
+            `aa-enforce /etc/apparmor.d/usr.bin.kvm 2>/dev/null`)
+        }
+
+        // Unmap RBD devices
+        for (const vol of allocatedVolumes) {
+          if (vol.rbdMapped) {
+            await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${vol.devicePath}" 2>/dev/null`).catch(() => {})
+          }
+        }
+
+        await appendLog(jobId, "SSHFS Boot migration cleanup complete", "success")
+      }
+
+    } else if (isLive) {
+      // ── Live mode: vmkfstools clone on ESXi → SSH dd to UNISPHERE → power off → convert/import ──
+      // ESXi locks -flat.vmdk files (VMFS lock) when VM runs — both HTTPS /folder/ (HTTP 500)
+      // and dd (Device or resource busy) fail. vmkfstools -i uses the VMFS API to clone even
+      // locked disks. We clone to a temp file on the ESXi datastore, then SSH dd the clone
+      // (which is unlocked) to the UNISPHERE node. This gives crash-consistent copy with downtime
+      // limited to convert + import + boot.
+
+      if (!esxiSshAvailable) {
+        throw new Error("Live migration requires SSH to be configured on the ESXi connection. ESXi locks VMDK files while VMs run — SSH is needed to run vmkfstools clone on the host.")
+      }
+
+      // Phase 0: Create snapshot — makes base VMDK read-only so vmkfstools can clone it
+      await appendLog(jobId, "Creating snapshot on ESXi (base disk becomes read-only)...", "info")
+      try {
+        await soapCreateSnapshot(soapSession!, config.sourceVmId, "unicenter-live-mig", "UniCenter live migration - do not delete manually")
+        await appendLog(jobId, "Snapshot created", "success")
+      } catch (snapErr: any) {
+        throw new Error(`Failed to create ESXi snapshot (required for live migration): ${snapErr.message}`)
+      }
+
+      await appendLog(jobId, "Cloning disks on ESXi via vmkfstools (VM stays running)...", "info")
+
+      // Phase 1: Clone + download/stream all disks while VM runs
+      try {
+        for (let i = 0; i < vmConfig.disks.length; i++) {
+          await updateJob(jobId, "transferring", { currentDisk: i })
+          if (isFileBased) {
+            await downloadDiskViaSsh(i, vmConfig.disks[i], true)
+          } else {
+            // Block storage: allocate + stream directly to device
+            const vol = await allocateBlockVolume(vmConfig.disks[i].capacityBytes)
+            await streamDiskViaSshToBlock(i, vmConfig.disks[i], vol.devicePath, true)
+          }
+          if (isCancelled(jobId)) throw new Error("Migration cancelled")
+        }
+      } finally {
+        // Always remove snapshot after cloning (even on failure)
+        await appendLog(jobId, "Removing ESXi snapshot...", "info")
+        // Bounded on purpose: the very next phase powers the source off and
+        // starts counting downtime, so this must not inherit the multi-hour
+        // budget a warm delta pass needs (nothing here waits on the merge).
+        await soapRemoveAllSnapshots(soapSession!, config.sourceVmId, { timeoutMs: SNAPSHOT_REMOVE_TERMINAL_TIMEOUT_MS }).catch((e: any) => {
+          appendLog(jobId, `Warning: failed to remove snapshot: ${e.message}`, "warn")
+        })
+      }
+
+      // Phase 2: Power off source VM (downtime starts here)
+      const downtimeStart = Date.now()
+      await appendLog(jobId, "All disks transferred - powering off source VM (downtime starts now)...", "warn")
+      await powerOffSourceVm(jobId, soapSession!, config.sourceVmId)
+
+      // Phase 3: Import/attach disks
+      if (isFileBased) {
+        // File-based: convert + import from storage temp path
+        await appendLog(jobId, "Converting and importing disks to eSage...")
+        for (let i = 0; i < vmConfig.disks.length; i++) {
+          const progressBase = 70 + Math.round((i / vmConfig.disks.length) * 25)
+          await updateJob(jobId, "transferring", { currentDisk: i, progress: progressBase })
+          await convertAndImportDisk(i)
+          if (isCancelled(jobId)) throw new Error("Migration cancelled")
+        }
+      } else {
+        // Block storage: data already streamed — just attach volumes
+        await appendLog(jobId, "Attaching pre-streamed volumes to VM...")
+        for (let i = 0; i < vmConfig.disks.length; i++) {
+          const progressBase = 70 + Math.round((i / vmConfig.disks.length) * 25)
+          await updateJob(jobId, "transferring", { currentDisk: i, progress: progressBase })
+          await attachBlockDisk(i, allocatedVolumes[i].volumeId)
+        }
+      }
+
+      const downtimeSec = Math.round((Date.now() - downtimeStart) / 1000)
+      const downtimeMin = Math.floor(downtimeSec / 60)
+      const downtimeRemSec = downtimeSec % 60
+      await appendLog(jobId, `Source VM downtime: ${downtimeMin > 0 ? `${downtimeMin}m ${downtimeRemSec}s` : `${downtimeSec}s`}`, "info")
+    } else if (useSSHFS) {
+      // ── Offline mode with SSHFS: mount ESXi datastore → convert/stream directly ──
+      // No download step — qemu-img reads from SSHFS mount, writes to local storage
+      for (let i = 0; i < vmConfig.disks.length; i++) {
+        await updateJob(jobId, "transferring", { currentDisk: i, progress: Math.round((i / vmConfig.disks.length) * 100) })
+
+        // Set sshfsMountPath to the correct mount for this disk's datastore
+        const diskDs = vmConfig.disks[i].datastoreName
+        if (sshfsMountedDatastores.has(diskDs)) {
+          sshfsMountPath = sshfsMountedDatastores.get(diskDs)!
+        }
+
+        if (isFileBased) {
+          // File-based storage: qemu-img convert directly from SSHFS mount into the
+          // storage's images/<vmid> dir, then adopt by rename (#292)
+          await transferDiskViaSshfs(i, vmConfig.disks[i])
+        } else {
+          // Block storage: dd from SSHFS mount directly to pre-allocated block device
+          const vol = await allocateBlockVolume(vmConfig.disks[i].capacityBytes)
+          await streamDiskViaSshfsToBlock(i, vmConfig.disks[i], vol.devicePath)
+          if (isCancelled(jobId)) throw new Error("Migration cancelled")
+          await attachBlockDisk(i, vol.volumeId)
+        }
+        await updateJob(jobId, "transferring", {
+          currentDisk: i + 1,
+          progress: Math.round(((i + 1) / vmConfig.disks.length) * 100),
+        })
+      }
+    } else {
+      // ── Offline mode with HTTPS: VM already powered off → download → convert → import ──
+      for (let i = 0; i < vmConfig.disks.length; i++) {
+        await updateJob(jobId, "transferring", { currentDisk: i, progress: Math.round((i / vmConfig.disks.length) * 100) })
+        const isVsanDs = vmConfig.disks[i].datastoreName.toLowerCase().includes('vsan')
+        if (isVsanDs) {
+          throw new Error(`vSAN datastores require SSHFS transfer mode. Please select "SSHFS" or "Auto" transfer mode in the migration settings.`)
+        }
+
+        if (isFileBased) {
+          // File-based storage: download to storage path → convert → adopt by rename (#292)
+          await downloadDisk(i, vmConfig.disks[i])
+          if (isCancelled(jobId)) throw new Error("Migration cancelled")
+          await convertAndImportDisk(i)
+        } else {
+          // Block storage: allocate volume → stream directly to device (no temp files)
+          const vol = await allocateBlockVolume(vmConfig.disks[i].capacityBytes)
+          await streamDiskToBlock(i, vmConfig.disks[i], vol.devicePath)
+          if (isCancelled(jobId)) throw new Error("Migration cancelled")
+          await attachBlockDisk(i, vol.volumeId)
+        }
+        await updateJob(jobId, "transferring", {
+          currentDisk: i + 1,
+          progress: Math.round(((i + 1) / vmConfig.disks.length) * 100),
+        })
+      }
+    }
+
+    } finally {
+      // Always unmount SSHFS (even on error during transfer)
+      if (useSSHFS) {
+        const mountPaths = Array.from(sshfsMountedDatastores.values())
+        for (let mi = 0; mi < mountPaths.length; mi++) {
+          const origMountPath = sshfsMountPath
+          sshfsMountPath = mountPaths[mi]
+          await unmountSshfs()
+          sshfsMountPath = origMountPath
+        }
+      }
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 4: Configure VM ──
+    // (Skipped for sshfs_boot - disk attachment and boot order handled in Phase 8)
+    if (!isSshfsBoot) {
+      await updateJob(jobId, "configuring", { progress: 90 })
+      await appendLog(jobId, "Configuring VM (boot order, agent)...")
+
+      // Set boot order — same slot the attach helpers used for disk 0.
+      const finalBootSlot = unisphereParams.bootDiskSlot
+      await unisphereSetVmConfig(unisphereConn, config.targetNode, targetVmid!, new URLSearchParams({ boot: `order=${finalBootSlot}` }))
+
+      // For Windows VMs: advise on post-migration driver work. The boot disk is
+      // on SATA (inbox boot-start AHCI driver — Windows has no LSI driver and
+      // VirtIO is never boot-start in an untouched guest, #653) and the e1000
+      // NIC uses the inbox driver, so the VM comes up. Data disks sit on VirtIO
+      // SCSI and appear once the virtio-win drivers are installed.
+      if (isWindowsVm(vmConfig)) {
+        await appendLog(jobId, `Windows VM detected - boot disk on SATA + e1000 NIC (built-in Windows drivers). Install VirtIO drivers from the virtio-win ISO afterwards for better disk/network performance and to bring up any VirtIO SCSI data disks.`, "warn")
+      }
+
+      await appendLog(jobId, "VM configuration complete", "success")
+
+      // ── STEP 5: Optionally start ──
+      if (config.startAfterMigration) {
+        await appendLog(jobId, "Starting VM on eSage...")
+        await unisphereFetch<any>(
+          unisphereConn,
+          `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/start`,
+          { method: "POST" }
+        )
+        await appendLog(jobId, "VM started", "success")
+      }
+    }
+
+    // ── STEP 6: Optional qcow2 conversion (#595) ──
+    // After the disks are attached and after the optional start (SSHFS Boot
+    // always restarts the VM above): on a running VM UNISPHERE does move_disk as a
+    // live drive-mirror, no extra downtime. The helper gates itself (opt-in,
+    // storage default format, free space) and NEVER throws: a conversion
+    // problem leaves the disks raw, not the migration failed.
+    await convertDisksToQcow2({
+      enabled: config.convertDisksToQcow2 === true,
+      conn: unisphereConn, node: config.targetNode, vmid: targetVmid!,
+      targetStorage: config.targetStorage, volumes: allocatedVolumes,
+      log: (m, l) => appendLog(jobId, m, l),
+      setPhase: p => updateJob(jobId, "converting_disks", { progress: p }),
+    })
+
+    // ── DONE ──
+    const totalCapacity = vmConfig.disks.reduce((sum, d) => sum + d.capacityBytes, 0)
+    await updateJob(jobId, "completed", {
+      progress: 100,
+      bytesTransferred: BigInt(totalCapacity),
+      totalBytes: BigInt(totalCapacity),
+    })
+    // Non-fatal: a failing log append after the terminal write must not throw
+    // us into the catch, which would flip a completed job to "failed" (#608).
+    await appendLog(jobId, `Migration completed successfully! VM ${targetVmid} is ready on ${config.targetNode}.`, "success").catch(() => {})
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "create",
+      category: "migration",
+      resourceType: "vm",
+      resourceId: String(targetVmid),
+      resourceName: vmConfig.name,
+      details: {
+        source: `ESXi ${esxiConn.name}/${config.sourceVmId}`,
+        target: `${config.targetNode}/${config.targetStorage}`,
+      },
+      status: "success",
+    })
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err)
+    // Terminal status first, and nothing may prevent it — a throwing appendLog
+    // or DB hiccup here would leave the row non-terminal forever (#608). The
+    // cleanup below must also run even if these writes fail.
+    await updateJob(jobId, "failed", { error: errorMsg }).catch(() => {})
+    await appendLog(jobId, `Migration failed: ${errorMsg}`, "error").catch(() => {})
+
+    // Cleanup: remove temp files on eSage node
+    try {
+      const nodeIp = await getNodeIpForMigration(prisma, config.targetConnectionId, config.targetNode,
+        (await getConnectionById(config.targetConnectionId)).baseUrl)
+      // Clean temp files on storage path (file-based storage)
+      if (storageTempDir) {
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `rm -f "${storageTempDir}"/unicenter-mig-${jobId}-disk*.vmdk "${storageTempDir}"/unicenter-mig-${jobId}-disk*.qcow2 "${storageTempDir}"/unicenter-mig-${jobId}-disk*.raw`)
+      }
+      // Clean control files (always in /tmp)
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `rm -f /tmp/unicenter-mig-${jobId}-disk*.pid* /tmp/unicenter-mig-${jobId}-disk*.stats /tmp/unicenter-mig-${jobId}-disk*.dl.sh /tmp/unicenter-mig-${jobId}-ctrl*.pid* /tmp/unicenter-mig-${jobId}-ctrl*.dl.sh /tmp/unicenter-mig-${jobId}-ctrl*.progress /tmp/unicenter-mig-${jobId}-ctrl*.stderr /tmp/unicenter-mig-${jobId}-sshfs*.pid* /tmp/unicenter-mig-${jobId}-sshfs*.exit /tmp/unicenter-mig-${jobId}-sshfs*.progress /tmp/unicenter-mig-${jobId}-sshfs*.sh /tmp/unicenter-mig-${jobId}-sshfsblk*.pid* /tmp/unicenter-mig-${jobId}-sshfsblk*.exit /tmp/unicenter-mig-${jobId}-sshfsblk*.progress /tmp/unicenter-mig-${jobId}-sshfsblk*.sh`)
+      // Unmount SSHFS if still mounted (error path)
+      await executeSSH(config.targetConnectionId, nodeIp,
+        `fusermount -uz /tmp/unicenter-sshfs-${jobId} 2>/dev/null; fusermount -uz /tmp/unicenter-sshfs-${jobId}-* 2>/dev/null; rmdir /tmp/unicenter-sshfs-${jobId}* 2>/dev/null; rm -f /tmp/unicenter-sshfs-${jobId}.esxi-key 2>/dev/null`)
+    } catch {
+      // Best effort cleanup
+    }
+
+    // Targeted free of any unispheresm-allocated volumes that never made it
+    // into the VM config (streaming failed before attachBlockDisk). The
+    // VM-level DELETE below uses destroy-unreferenced-disks=1 which
+    // covers most plugins, but LVM in particular does not always
+    // recognise unattached vm-<vmid>-disk-<N> volumes — leaving them as
+    // orphans the user has to wipe by hand. Targeted unispheresm free is
+    // deterministic for the volumes we know we allocated (#312).
+    //
+    // We deliberately skip volumes flagged as `attached`: those are
+    // already in qm config, so freeing them out from under UNISPHERE would
+    // either fail (volume in use) or, worse, leave the VM pointing at a
+    // missing disk. They get cleaned up by the VM DELETE just below.
+    // volumesToFree also covers a volume created by an allocation that reported a
+    // failure, and skips the slots whose allocation never started (#587).
+    const orphans = volumesToFree(allocatedVolumes)
+    if (orphans.length > 0 && config.targetConnectionId) {
+      try {
+        const nodeIp = await getNodeIpForMigration(prisma, config.targetConnectionId, config.targetNode,
+          (await getConnectionById(config.targetConnectionId)).baseUrl)
+        for (const vol of orphans) {
+          if (vol.rbdMapped && vol.devicePath) {
+            await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${vol.devicePath}" 2>/dev/null`).catch(() => {})
+          }
+          // A `saferemove` LVM storage zeroes the volume before removing it, which
+          // takes far longer than the 30 s executeSSH default.
+          const freed = await executeSSH(config.targetConnectionId, nodeIp,
+            `unispheresm free ${shellEscape(vol.volumeId)} 2>&1`, UNISPHERESM_FREE_TIMEOUT_MS).catch((e: any) => ({ success: false, output: "", error: e?.message }))
+          if (freed.success) {
+            await appendLog(jobId, `Freed orphan volume ${vol.volumeId}`, "warn")
+          } else {
+            await appendLog(jobId, `Could not free ${vol.volumeId}: ${(freed.output || freed.error || "").trim()}`, "warn")
+          }
+        }
+      } catch {
+        // Best effort cleanup
+      }
+    }
+
+    // Cleanup: only when this job actually created the VM. Before that the VMID
+    // is just a reservation (or the user's pick, possibly pointing at somebody
+    // else's VM), and destroying it would delete data we never wrote.
+    if (vmCreated && targetVmid && config.targetConnectionId) {
+      try {
+        const unisphereConn = await getConnectionById(config.targetConnectionId)
+        await destroyUnisphereVm(unisphereConn, config.targetNode, targetVmid)
+        await appendLog(jobId, `Cleaned up partial VM ${targetVmid}`, "warn")
+      } catch {
+        // Cleanup failed — leave for manual intervention
+      }
+    }
+  } finally {
+    stopHeartbeat()
+    if (soapSession) {
+      await soapLogout(soapSession)
+    }
+    cancelledJobs.delete(jobId)
+    jobPrisma.delete(jobId)
+  }
+}
+
+/**
+ * executeSSH with configurable timeout for long-running operations (disk transfers).
+ * The ssh2 library has a 30s default; we need much longer for large disks.
+ */
+async function executeSSHWithTimeout(
+  db: any,
+  connectionId: string,
+  nodeIp: string,
+  command: string,
+  timeoutMs: number
+): Promise<{ success: boolean; output?: string; error?: string }> {
+  const connection = await db.connection.findUnique({
+    where: { id: connectionId },
+    select: {
+      sshEnabled: true, sshPort: true, sshUser: true,
+      sshAuthMethod: true, sshKeyEnc: true, sshPassEnc: true, sshUseSudo: true,
+    },
+  })
+
+  if (!connection?.sshEnabled) {
+    return { success: false, error: "SSH not enabled for this connection" }
+  }
+
+  const { Client } = await import("ssh2")
+
+  const port = connection.sshPort || 22
+  const user = connection.sshUser || "root"
+
+  let key: string | undefined
+  let password: string | undefined
+  let passphrase: string | undefined
+
+  const authMethod = connection.sshAuthMethod || (connection.sshKeyEnc ? "key" : "password")
+  if (authMethod === "key" && connection.sshKeyEnc) {
+    key = decryptSecret(connection.sshKeyEnc)
+    if (connection.sshPassEnc) try { passphrase = decryptSecret(connection.sshPassEnc) } catch {}
+  } else if (connection.sshPassEnc) {
+    password = decryptSecret(connection.sshPassEnc)
+  }
+
+  const finalCommand = connection.sshUseSudo ? `sudo ${command}` : command
+
+  return new Promise((resolve) => {
+    const conn = new Client()
+    const timeout = setTimeout(() => {
+      conn.end()
+      resolve({ success: false, error: `SSH timeout after ${timeoutMs / 1000}s` })
+    }, timeoutMs)
+
+    conn.on("ready", () => {
+      conn.exec(finalCommand, (err, stream) => {
+        if (err) { clearTimeout(timeout); conn.end(); resolve({ success: false, error: err.message }); return }
+
+        let stdout = ""
+        let stderr = ""
+        stream.on("data", (data: Buffer) => { stdout += data.toString() })
+        stream.stderr.on("data", (data: Buffer) => { stderr += data.toString() })
+        stream.on("close", (code: number) => {
+          clearTimeout(timeout)
+          conn.end()
+          if (code === 0 || code === null) {
+            resolve({ success: true, output: stdout.trim() })
+          } else {
+            resolve({ success: false, error: stderr.trim() || `Exit code ${code}` })
+          }
+        })
+      })
+    })
+
+    conn.on("error", (err) => { clearTimeout(timeout); resolve({ success: false, error: err.message }) })
+
+    const connectConfig: Record<string, unknown> = {
+      host: nodeIp, port, username: user, readyTimeout: 30_000,
+      keepaliveInterval: 10000, keepaliveCountMax: 999,
+    }
+    if (key) { connectConfig.privateKey = key; if (passphrase) connectConfig.passphrase = passphrase }
+    else if (password) { connectConfig.password = password }
+
+    conn.connect(connectConfig as any)
+  })
+}

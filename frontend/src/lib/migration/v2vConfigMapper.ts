@@ -1,0 +1,283 @@
+/**
+ * Parse libvirt domain XML (virt-v2v output) and map to eSage UniSphere VM creation parameters
+ */
+
+export interface V2vVmConfig {
+  name: string
+  memory: number // MB
+  cores: number
+  sockets: number
+  firmware: 'bios' | 'efi'
+  ostype: string // l26, win10, win11, etc.
+  machine: string // q35
+  scsihw: string // virtio-scsi-single
+  nics: { model: string; mac?: string }[]
+  disks: { file: string; format: string; device: string }[]
+}
+
+/**
+ * Sanitize VM name for eSage DNS compatibility:
+ * - Replace non-alphanumeric (except . and -) with -
+ * - Collapse consecutive dashes
+ * - Trim leading/trailing dashes and dots
+ * - Max 63 chars
+ */
+function sanitizeName(raw: string): string {
+  let name = raw
+    .replace(/\.(vhdx|vhd|vmdk|qcow2|raw|img|vdi)$/i, '') // strip disk extensions
+    .replaceAll(/[^a-zA-Z0-9.\-]/g, '-')
+    .replaceAll(/-{2,}/g, '-')
+    .replaceAll(/^[.\-]+|[.\-]+$/g, '')
+    .substring(0, 63)
+
+  return name || 'vm'
+}
+
+/**
+ * Convert memory value to MB based on unit attribute.
+ * libvirt defaults to KiB if no unit is specified.
+ */
+function convertMemoryToMB(value: number, unit: string): number {
+  switch (unit.toLowerCase()) {
+    case 'bytes':
+    case 'b':
+      return Math.round(value / (1024 * 1024))
+    case 'kb':
+      return Math.round((value * 1000) / (1024 * 1024))
+    case 'kib':
+    case 'k':
+      return Math.round(value / 1024)
+    case 'mb':
+      return Math.round((value * 1000 * 1000) / (1024 * 1024))
+    case 'mib':
+    case 'm':
+      return value
+    case 'gb':
+      return Math.round((value * 1000 * 1000 * 1000) / (1024 * 1024))
+    case 'gib':
+    case 'g':
+      return value * 1024
+    case 'tb':
+      return Math.round((value * 1000 * 1000 * 1000 * 1000) / (1024 * 1024))
+    case 'tib':
+    case 't':
+      return value * 1024 * 1024
+    default:
+      // libvirt default is KiB
+      return Math.round(value / 1024)
+  }
+}
+
+/**
+ * Detect OS type from XML content and VM name.
+ * Returns a eSage ostype string.
+ */
+function detectOsType(xmlLower: string, nameLower: string): string {
+  const text = xmlLower + ' ' + nameLower
+
+  // Modern virt-v2v embeds a libosinfo URL for the detected guest OS, eg:
+  //   <libosinfo:os id="http://microsoft.com/win/10"/>
+  //   <libosinfo:os id="http://microsoft.com/win/2k19"/>
+  //   <libosinfo:os id="http://microsoft.com/win/11"/>
+  // The slash in "win/10" means text.includes('win10') misses it, so we look
+  // for the full URL shape first. Do this BEFORE the text-substring checks
+  // because libosinfo is the most authoritative signal.
+  const libosWin = text.match(/microsoft\.com\/win\/(2k\d+|\d+)/)
+  if (libosWin) {
+    const v = libosWin[1]
+    if (v === '11' || v === '2k22' || v === '2022' || v === '2k25' || v === '2025') return 'win11'
+    if (v === '10' || v === '2k16' || v === '2016' || v === '2k19' || v === '2019') return 'win10'
+    if (v === '8' || v === '8.1') return 'win8'
+    if (v === '7' || v === '2k8') return 'win7'
+    return 'win10' // unknown Microsoft Windows variant — safe default
+  }
+  // Generic MS Windows signal (covers old/custom libosinfo URLs and the name
+  // metadata virt-v2v puts in the domain).
+  if (text.includes('microsoft.com/win') || text.includes('microsoft windows')) {
+    return 'win10'
+  }
+
+  // Windows 11 / Server 2022 / Server 2025
+  if (
+    text.includes('win11') ||
+    text.includes('windows 11') ||
+    text.includes('windows server 2022') ||
+    text.includes('windows server 2025')
+  ) {
+    return 'win11'
+  }
+
+  // Windows 10 / Server 2019 / Server 2016
+  if (
+    text.includes('win10') ||
+    text.includes('windows 10') ||
+    text.includes('windows server 2019') ||
+    text.includes('windows server 2016')
+  ) {
+    return 'win10'
+  }
+
+  // Windows 8
+  if (text.includes('win8') || text.includes('windows 8')) {
+    return 'win8'
+  }
+
+  // Windows 7
+  if (text.includes('win7') || text.includes('windows 7')) {
+    return 'win7'
+  }
+
+  // Generic Windows
+  if (text.includes('windows')) {
+    return 'win10'
+  }
+
+  // FreeBSD
+  if (text.includes('freebsd')) {
+    return 'other'
+  }
+
+  // Default: Linux
+  return 'l26'
+}
+
+/**
+ * Parse a libvirt domain XML string (virt-v2v output) into a V2vVmConfig.
+ * Uses regex/string matching - no XML library required.
+ */
+export function parseV2vXml(xmlString: string): V2vVmConfig {
+  // --- Name ---
+  const nameMatch = xmlString.match(/<name>([^<]+)<\/name>/)
+  const rawName = nameMatch ? nameMatch[1].trim() : 'vm'
+
+  // --- Memory ---
+  const memMatch = xmlString.match(/<memory([^>]*)>(\d+)<\/memory>/)
+  let memoryMB = 1024 // default fallback
+  if (memMatch) {
+    const unitAttr = memMatch[1].match(/unit\s*=\s*["']([^"']+)["']/)
+    const unit = unitAttr ? unitAttr[1] : 'KiB'
+    memoryMB = convertMemoryToMB(Number.parseInt(memMatch[2], 10), unit)
+  }
+
+  // --- vCPU ---
+  const vcpuMatch = xmlString.match(/<vcpu[^>]*>(\d+)<\/vcpu>/)
+  const cores = vcpuMatch ? Number.parseInt(vcpuMatch[1], 10) : 1
+
+  // --- Firmware ---
+  // Modern virt-v2v emits `<os firmware="efi">` as an attribute on <os>,
+  // older/verbose builds emit `<loader type="pflash">...OVMF_CODE...</loader>`
+  // and an <nvram> element. Cover all three shapes.
+  const isEfi =
+    /\bfirmware\s*=\s*["']efi["']/i.test(xmlString) ||
+    xmlString.includes('type="pflash"') ||
+    xmlString.includes("type='pflash'") ||
+    xmlString.includes('OVMF_CODE') ||
+    xmlString.includes('OVMF_VARS') ||
+    /<nvram[^>]*>/i.test(xmlString)
+  const firmware: 'bios' | 'efi' = isEfi ? 'efi' : 'bios'
+
+  // --- OS type ---
+  const xmlLower = xmlString.toLowerCase()
+  const nameLower = rawName.toLowerCase()
+  const ostype = detectOsType(xmlLower, nameLower)
+
+  // --- NICs ---
+  const nics: V2vVmConfig['nics'] = []
+  const interfaceRegex = /<interface[^>]*>[\s\S]*?<\/interface>/g
+  let ifMatch: RegExpExecArray | null
+  while ((ifMatch = interfaceRegex.exec(xmlString)) !== null) {
+    const block = ifMatch[0]
+    const modelMatch = block.match(/<model\s+type\s*=\s*["']([^"']+)["']/)
+    const macMatch = block.match(/<mac\s+address\s*=\s*["']([^"']+)["']/)
+    const model = modelMatch ? modelMatch[1] : 'virtio'
+    const nic: { model: string; mac?: string } = { model }
+    if (macMatch) {
+      nic.mac = macMatch[1]
+    }
+    nics.push(nic)
+  }
+
+  // --- Disks ---
+  const disks: V2vVmConfig['disks'] = []
+  const diskRegex = /<disk\s+type\s*=\s*["']file["'][^>]*>[\s\S]*?<\/disk>/g
+  let diskMatch: RegExpExecArray | null
+  while ((diskMatch = diskRegex.exec(xmlString)) !== null) {
+    const block = diskMatch[0]
+    const sourceMatch = block.match(/<source\s+file\s*=\s*["']([^"']+)["']/)
+    const driverMatch = block.match(/<driver[^>]+type\s*=\s*["']([^"']+)["']/)
+    const targetMatch = block.match(/<target\s+dev\s*=\s*["']([^"']+)["']/)
+
+    if (sourceMatch) {
+      disks.push({
+        file: sourceMatch[1],
+        format: driverMatch ? driverMatch[1] : 'raw',
+        device: targetMatch ? targetMatch[1] : 'sda',
+      })
+    }
+  }
+
+  return {
+    name: sanitizeName(rawName),
+    memory: memoryMB,
+    cores,
+    sockets: 1,
+    firmware,
+    ostype,
+    machine: 'q35',
+    scsihw: 'virtio-scsi-single',
+    nics,
+    disks,
+  }
+}
+
+/**
+ * Build eSage UniSphere VM creation parameters from a parsed V2vVmConfig.
+ *
+ * `vlanTag` (when set) is appended as `tag=N` to every NIC. The tag is
+ * validated by the API route (1-4094); we still treat anything outside that
+ * range as a no-op so a misconfigured caller can't produce a syntactically
+ * invalid net string that unispheresh would reject at create time.
+ */
+export function buildUnisphereCreateParams(
+  config: V2vVmConfig,
+  vmid: number,
+  networkBridge: string,
+  vlanTag?: number,
+): Record<string, any> {
+  const params: Record<string, any> = {
+    vmid,
+    name: config.name,
+    ostype: config.ostype,
+    cores: config.cores,
+    sockets: config.sockets,
+    memory: config.memory,
+    cpu: 'x86-64-v2-AES',
+    scsihw: config.scsihw,
+    bios: config.firmware === 'efi' ? 'ovmf' : 'seabios',
+    machine: config.machine,
+    boot: 'order=scsi0',
+    agent: 'enabled=0',
+  }
+
+  const tagSuffix =
+    typeof vlanTag === 'number' && Number.isInteger(vlanTag) && vlanTag >= 1 && vlanTag <= 4094
+      ? `,tag=${vlanTag}`
+      : ''
+
+  // Network interfaces
+  config.nics.forEach((nic, i) => {
+    let netValue = `${nic.model},bridge=${networkBridge}`
+    if (nic.mac) {
+      netValue += `,macaddr=${nic.mac}`
+    }
+    netValue += tagSuffix
+    params[`net${i}`] = netValue
+  })
+
+  // If no NICs were found, add a default virtio NIC
+  if (config.nics.length === 0) {
+    params.net0 = `virtio,bridge=${networkBridge}${tagSuffix}`
+  }
+
+  return params
+}

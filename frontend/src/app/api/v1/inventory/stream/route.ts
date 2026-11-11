@@ -1,0 +1,835 @@
+import { NextRequest } from "next/server"
+
+import { getSessionPrisma, getCurrentTenantId } from "@/lib/tenant"
+import { prisma as globalPrisma } from "@/lib/db/prisma"
+import { demoResponse } from "@/lib/demo/demo-api"
+import { getConnectionById, getPbsConnectionByIdUnscoped } from "@/lib/connections/getConnection"
+import { scopePbsDataForTenant, type PbsServerData, type PbsDatastoreData } from "@/lib/inventory/scopePbs"
+import { unisphereFetch } from "@/lib/esage/client"
+import { pbsFetch } from "@/lib/esage/pbs-client"
+import { isSharedStorage } from "@/lib/esage/storage"
+import { getRBACContext, filterVmsByPermission, PERMISSIONS, checkPermission, getRbacInfraScope, applyRbacInfraFilter, filterVisibleConnections, filterCandidateConnections, isConnectionVisible, mayHaveVisibleGuests, pruneEmptyConnections, type RbacInfraScope } from "@/lib/rbac"
+import { resolveManagementIp } from "@/lib/esage/resolveManagementIp"
+import {
+  getInventoryFromCache,
+  setCachedInventory,
+} from "@/lib/cache/inventoryCache"
+import { applyVdcFilter, type VdcScope } from "@/lib/vdc/scope"
+import { getVdcContext } from "@/lib/vdc/context"
+import { getTenantInfrastructureScope, inventoryConnectionPlan, maskingScope } from "@/lib/tenant/infraScope"
+
+export const runtime = "nodejs"
+
+/**
+ * GET /api/v1/inventory/stream
+ *
+ * SSE endpoint that streams inventory data progressively.
+ * Each cluster/PBS is sent as an event as soon as it's ready,
+ * so the frontend can render incrementally without waiting for
+ * the slowest connection.
+ *
+ * Events:
+ *   - event: init         → { totalUnisphere, totalPbs, totalExt }  (how many items to expect)
+ *   - event: cluster      → ClusterData  (one per UNISPHERE connection, as it resolves)
+ *   - event: pbs          → PbsServerData  (one per PBS connection)
+ *   - event: external     → ExternalHypervisor[]  (all external hypervisors at once)
+ *   - event: done         → { stats }  (final summary)
+ *   - event: error        → { message }
+ *
+ * Query params:
+ *   ?refresh=true  — bypass cache
+ */
+
+type NodeData = {
+  node: string
+  status: string
+  cpu?: number
+  mem?: number
+  maxmem?: number
+  disk?: number
+  maxdisk?: number
+  uptime?: number
+  ip?: string
+  maintenance?: string
+}
+
+type GuestData = {
+  vmid: string | number
+  name?: string
+  type: string
+  status: string
+  node: string
+  cpu?: number
+  maxcpu?: number
+  mem?: number
+  maxmem?: number
+  disk?: number
+  maxdisk?: number
+  uptime?: number
+  pool?: string
+  tags?: string
+  template?: number | boolean
+  hastate?: string
+  hagroup?: string
+  lock?: string  // UNISPHERE lock type: "migrate", "backup", "snapshot", etc.
+}
+
+type HaResource = {
+  sid: string
+  state: string
+  group?: string
+}
+
+type ClusterData = {
+  id: string
+  name: string
+  type: string
+  isCluster: boolean
+  status: 'online' | 'degraded' | 'offline'
+  cephHealth?: string
+  latitude?: number | null
+  longitude?: number | null
+  locationLabel?: string | null
+  sshEnabled?: boolean
+  nodes: Array<NodeData & { guests: GuestData[] }>
+}
+
+type StorageItem = {
+  storage: string
+  node: string
+  type: string           // dir, lvm, lvmthin, zfspool, rbd, cephfs, nfs, cifs, etc.
+  shared: boolean
+  content: string[]      // images, rootdir, iso, backup, snippets, vztmpl
+  used: number
+  total: number
+  usedPct: number
+  status: string         // active, inactive
+  enabled: boolean
+  path?: string
+}
+
+type StorageData = {
+  connId: string
+  connName: string
+  isCluster: boolean
+  nodes: Array<{
+    node: string
+    status: string
+    storages: StorageItem[]
+  }>
+  sharedStorages: StorageItem[]
+}
+
+/**
+ * Restrict a StorageData payload to what the tenant's vDC allows:
+ * only the assigned nodes, only the non-shared storages, and the vDC's
+ * allowlist of storage IDs. Returns null if nothing remains for this
+ * connection (caller should skip the send).
+ */
+function scopeStorageDataForTenant(
+  data: StorageData,
+  scope: VdcScope | null
+): StorageData | null {
+  if (!scope) return data
+  const allowedNodes = scope.nodesByConnection.get(data.connId)
+  const allowedStorages = scope.storagesByConnection.get(data.connId)
+  if (!allowedNodes || !allowedStorages || allowedNodes.size === 0 || allowedStorages.size === 0) {
+    return null
+  }
+  const nodes = data.nodes
+    .filter(n => allowedNodes.has(n.node))
+    .map(n => ({
+      ...n,
+      storages: n.storages.filter(s => !s.shared && allowedStorages.has(s.storage)),
+    }))
+  return { ...data, nodes, sharedStorages: [] }
+}
+
+// scopePbsDataForTenant + the PBS payload types are extracted to
+// @/lib/inventory/scopePbs (testable module; route files cannot export
+// non-handler symbols).
+
+/* ------------------------------------------------------------------ */
+/* Per-connection fetch functions (reused from inventory route)         */
+/* ------------------------------------------------------------------ */
+
+async function fetchOneCluster(conn: {
+  id: string; name: string; type: string;
+  latitude?: number | null; longitude?: number | null;
+  locationLabel?: string | null; sshEnabled?: boolean | null;
+  tenantId?: string | null
+}): Promise<ClusterData> {
+  try {
+    const connConfig = await getConnectionById(conn.id, conn.tenantId || undefined)
+
+    // Call /nodes FIRST to establish failover cache if the primary is down.
+    // This prevents the race condition where parallel calls fail before failover activates.
+    let nodes: NodeData[] = []
+    try {
+      nodes = await unisphereFetch<NodeData[]>(connConfig, '/nodes') || []
+    } catch {
+      // Primary failed — failover may have been activated. Retry once.
+      try {
+        nodes = await unisphereFetch<NodeData[]>(connConfig, '/nodes') || []
+      } catch {
+        // Still failing — continue with empty nodes, VMs will create synthetic entries
+      }
+    }
+
+    const [guestsResult, haResult, cephResult, nodeResourcesResult] = await Promise.allSettled([
+      unisphereFetch<GuestData[]>(connConfig, '/cluster/resources?type=vm'),
+      unisphereFetch<HaResource[]>(connConfig, '/cluster/ha/resources'),
+      unisphereFetch<any>(connConfig, '/cluster/ceph/status'),
+      unisphereFetch<any[]>(connConfig, '/cluster/resources?type=node'),
+    ])
+
+    const guests: GuestData[] = guestsResult.status === 'fulfilled' ? guestsResult.value || [] : []
+    const haResources: HaResource[] = haResult.status === 'fulfilled' ? haResult.value || [] : []
+    const nodeResources: any[] = nodeResourcesResult.status === 'fulfilled' ? nodeResourcesResult.value || [] : []
+
+    const nodeHastateMap = new Map<string, string>()
+    for (const nr of nodeResources) {
+      if (nr?.node && nr?.hastate) nodeHastateMap.set(nr.node, nr.hastate)
+    }
+
+    let cephHealth: string | undefined
+    if (cephResult.status === 'fulfilled' && cephResult.value) {
+      const cephData = cephResult.value
+      if (typeof cephData.health === 'string') {
+        cephHealth = cephData.health
+      } else if (cephData.health?.status) {
+        cephHealth = cephData.health.status
+      }
+    }
+
+    const nodeEnrichPromises = nodes.map(async (node) => {
+      if (!node?.node) return { node: node.node, ip: undefined, mem: undefined, maxmem: undefined }
+
+      try {
+        const [networks, nodeStatus] = await Promise.all([
+          unisphereFetch<any[]>(connConfig, `/nodes/${encodeURIComponent(node.node)}/network`).catch(() => null),
+          node.status === 'online'
+            ? unisphereFetch<any>(connConfig, `/nodes/${encodeURIComponent(node.node)}/status`).catch(() => null)
+            : Promise.resolve(null),
+        ])
+
+        return {
+          node: node.node,
+          ip: resolveManagementIp(networks),
+          mem: nodeStatus?.memory?.total > 0 ? Number(nodeStatus.memory.used || 0) : undefined,
+          maxmem: nodeStatus?.memory?.total > 0 ? Number(nodeStatus.memory.total || 0) : undefined,
+        }
+      } catch {
+        return { node: node.node, ip: undefined, mem: undefined, maxmem: undefined }
+      }
+    })
+
+    const nodeEnrichData = await Promise.all(nodeEnrichPromises)
+    const nodeIpMap = new Map<string, { ip?: string; mem?: number; maxmem?: number }>()
+    for (const { node, ip, mem, maxmem } of nodeEnrichData) {
+      if (node) nodeIpMap.set(node, { ip, mem, maxmem })
+    }
+
+    const haMap = new Map<string, HaResource>()
+    for (const ha of haResources) {
+      if (ha.sid) haMap.set(ha.sid, ha)
+    }
+
+    const nodeMap = new Map<string, NodeData & { guests: GuestData[] }>()
+    for (const n of nodes) {
+      if (!n?.node) continue
+      const extra = nodeIpMap.get(n.node)
+      const hastate = nodeHastateMap.get(n.node)
+      const maintenance = hastate === 'maintenance' ? 'maintenance' : undefined
+      nodeMap.set(n.node, {
+        ...n,
+        ...(extra?.mem !== undefined ? { mem: extra.mem } : {}),
+        ...(extra?.maxmem !== undefined ? { maxmem: extra.maxmem } : {}),
+        ip: extra?.ip,
+        maintenance,
+        guests: []
+      })
+    }
+
+    for (const g of guests) {
+      if (!g?.node) continue
+      if (!nodeMap.has(g.node)) {
+        nodeMap.set(g.node, { node: g.node, status: 'unknown', guests: [] })
+      }
+      nodeMap.get(g.node)!.guests.push({
+        vmid: g.vmid,
+        name: g.name || `${g.type}/${g.vmid}`,
+        type: g.type || 'qemu',
+        status: g.status || 'unknown',
+        node: g.node,
+        cpu: g.cpu, maxcpu: g.maxcpu, mem: g.mem, maxmem: g.maxmem,
+        disk: g.disk, maxdisk: g.maxdisk,
+        uptime: g.uptime, pool: g.pool, tags: g.tags,
+        lock: g.lock,
+        template: g.template === 1 || g.template === true,
+        hastate: (() => {
+          const haSid = `${g.type === 'lxc' ? 'ct' : 'vm'}:${g.vmid}`
+          return haMap.get(haSid)?.state
+        })(),
+        hagroup: (() => {
+          const haSid = `${g.type === 'lxc' ? 'ct' : 'vm'}:${g.vmid}`
+          return haMap.get(haSid)?.group
+        })(),
+      })
+    }
+
+    for (const nodeData of nodeMap.values()) {
+      nodeData.guests.sort((a, b) => {
+        const aId = Number.parseInt(String(a.vmid), 10) || 0
+        const bId = Number.parseInt(String(b.vmid), 10) || 0
+        return aId - bId
+      })
+    }
+
+    const nodesArray = Array.from(nodeMap.values())
+    const onlineNodes = nodesArray.filter(n => n.status === 'online').length
+    const totalNodes = nodesArray.length
+
+    let status: 'online' | 'degraded' | 'offline' = 'offline'
+    if (onlineNodes === totalNodes && totalNodes > 0) status = 'online'
+    else if (onlineNodes > 0) status = 'degraded'
+
+    return {
+      id: conn.id,
+      name: conn.name,
+      type: conn.type,
+      isCluster: totalNodes > 1,
+      status,
+      cephHealth,
+      sshEnabled: !!conn.sshEnabled,
+      latitude: conn.latitude,
+      longitude: conn.longitude,
+      locationLabel: conn.locationLabel,
+      nodes: nodesArray.sort((a, b) => a.node.localeCompare(b.node)),
+    }
+  } catch (e: any) {
+    console.error(`[inventory-stream] Failed to load ${conn.name}:`, e?.message)
+    return {
+      id: conn.id,
+      name: conn.name,
+      type: conn.type,
+      isCluster: false,
+      status: 'offline' as const,
+      sshEnabled: !!conn.sshEnabled,
+      latitude: conn.latitude,
+      longitude: conn.longitude,
+      locationLabel: conn.locationLabel,
+      nodes: [],
+    }
+  }
+}
+
+async function fetchStoragesForCluster(conn: {
+  id: string; name: string; type: string; tenantId?: string | null
+}, clusterData: ClusterData): Promise<StorageData> {
+  try {
+    // Pass the connection's own tenantId so the provider (global query) can
+    // fetch storages for clusters owned by MSP tenants, not just default-owned.
+    const connConfig = await getConnectionById(conn.id, conn.tenantId || undefined)
+
+    // Fetch storage resources (per-node status) and storage config (content types, shared flag)
+    const [resourcesResult, configResult] = await Promise.allSettled([
+      unisphereFetch<any[]>(connConfig, '/cluster/resources?type=storage'),
+      unisphereFetch<any[]>(connConfig, '/storage'),
+    ])
+
+    const resources: any[] = resourcesResult.status === 'fulfilled' ? resourcesResult.value || [] : []
+    const configs: any[] = configResult.status === 'fulfilled' ? configResult.value || [] : []
+
+    // Build config lookup map
+    const configMap = new Map<string, any>()
+    for (const cfg of configs) {
+      if (cfg?.storage) configMap.set(cfg.storage, cfg)
+    }
+
+    // Build storage items from resources (these have per-node usage data)
+    const allItems: StorageItem[] = []
+    for (const r of resources) {
+      if (!r?.storage || !r?.node) continue
+      const cfg = configMap.get(r.storage)
+      const contentStr: string = cfg?.content || r?.content || ''
+      const shared = cfg?.shared === 1 || cfg?.shared === true || false
+      const enabled = r?.status === 'available' || r?.enabled !== 0
+
+      allItems.push({
+        storage: r.storage,
+        node: r.node,
+        type: cfg?.type || r?.plugintype || 'unknown',
+        shared,
+        content: contentStr ? contentStr.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
+        used: r.used || r.disk || 0,
+        total: r.maxdisk || r.total || 0,
+        usedPct: r.maxdisk > 0 ? Math.round((r.used || r.disk || 0) / r.maxdisk * 100) : 0,
+        status: r.status === 'available' ? 'active' : 'inactive',
+        enabled,
+        path: cfg?.path,
+      })
+    }
+
+    // Separate shared vs local storages
+    // For shared storages, pick one representative entry (they have same config but per-node usage)
+    const sharedSet = new Map<string, StorageItem>()
+    const nodeStorages = new Map<string, StorageItem[]>()
+
+    for (const item of allItems) {
+      if (isSharedStorage(item)) {
+        // For shared storages, aggregate usage across nodes
+        if (!sharedSet.has(item.storage)) {
+          sharedSet.set(item.storage, { ...item, node: '' })
+        } else {
+          // Keep max usage info
+          const existing = sharedSet.get(item.storage)!
+          existing.used = Math.max(existing.used, item.used)
+          existing.total = Math.max(existing.total, item.total)
+          existing.usedPct = existing.total > 0 ? Math.round(existing.used / existing.total * 100) : 0
+        }
+      } else {
+        if (!nodeStorages.has(item.node)) nodeStorages.set(item.node, [])
+        nodeStorages.get(item.node)!.push(item)
+      }
+    }
+
+    // Build nodes array from cluster data
+    const nodes = clusterData.nodes.map(n => ({
+      node: n.node,
+      status: n.status,
+      storages: (nodeStorages.get(n.node) || []).sort((a, b) => a.storage.localeCompare(b.storage)),
+    }))
+
+    return {
+      connId: conn.id,
+      connName: conn.name,
+      isCluster: clusterData.isCluster,
+      nodes: nodes.sort((a, b) => a.node.localeCompare(b.node)),
+      sharedStorages: Array.from(sharedSet.values()).sort((a, b) => a.storage.localeCompare(b.storage)),
+    }
+  } catch (e: any) {
+    console.error(`[inventory-stream] Failed to load storages for ${conn.name}:`, e?.message)
+    return {
+      connId: conn.id,
+      connName: conn.name,
+      isCluster: false,
+      nodes: [],
+      sharedStorages: [],
+    }
+  }
+}
+
+async function fetchOnePbs(conn: { id: string; name: string }): Promise<PbsServerData> {
+  try {
+    const connConfig = await getPbsConnectionByIdUnscoped(conn.id)
+
+    const [statusResult, datastoresResult] = await Promise.allSettled([
+      pbsFetch<any>(connConfig, '/status'),
+      pbsFetch<any[]>(connConfig, '/admin/datastore'),
+    ])
+
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : null
+    const datastores = datastoresResult.status === 'fulfilled' ? datastoresResult.value || [] : []
+
+    const datastoreDetailsPromises = datastores.map(async (ds): Promise<PbsDatastoreData> => {
+      const storeName = ds.store || ds.name
+      if (!storeName) {
+        return { name: 'unknown', total: 0, used: 0, available: 0, usagePercent: 0, backupCount: 0, vmCount: 0, ctCount: 0, hostCount: 0 }
+      }
+
+      try {
+        const [dsStatusResult, snapshotsResult] = await Promise.allSettled([
+          pbsFetch<any>(connConfig, `/admin/datastore/${encodeURIComponent(storeName)}/status`),
+          pbsFetch<any[]>(connConfig, `/admin/datastore/${encodeURIComponent(storeName)}/snapshots`),
+        ])
+
+        const dsStatus = dsStatusResult.status === 'fulfilled' ? dsStatusResult.value : null
+        const snapshots = snapshotsResult.status === 'fulfilled' ? snapshotsResult.value || [] : []
+
+        const total = dsStatus?.total || 0
+        const used = dsStatus?.used || 0
+        const available = dsStatus?.avail || (total - used)
+
+        let vmCount = 0, ctCount = 0, hostCount = 0
+        for (const snap of snapshots) {
+          const backupType = snap['backup-type']
+          if (backupType === 'vm') vmCount++
+          else if (backupType === 'ct') ctCount++
+          else if (backupType === 'host') hostCount++
+        }
+
+        return {
+          name: storeName, path: ds.path || '', comment: ds.comment || '',
+          total, used, available,
+          usagePercent: total > 0 ? Math.round((used / total) * 100) : 0,
+          backupCount: snapshots.length, vmCount, ctCount, hostCount,
+        }
+      } catch {
+        return {
+          name: storeName, path: ds.path || '', comment: ds.comment || '',
+          total: 0, used: 0, available: 0, usagePercent: 0,
+          backupCount: 0, vmCount: 0, ctCount: 0, hostCount: 0,
+        }
+      }
+    })
+
+    const datastoreDetails = await Promise.all(datastoreDetailsPromises)
+    let totalSize = 0, totalUsed = 0, totalBackups = 0
+    for (const ds of datastoreDetails) {
+      totalSize += ds.total; totalUsed += ds.used; totalBackups += ds.backupCount
+    }
+
+    return {
+      id: conn.id,
+      name: conn.name,
+      type: 'pbs',
+      status: status ? 'online' : 'offline',
+      version: status?.info?.version || undefined,
+      uptime: status?.uptime || undefined,
+      datastores: datastoreDetails,
+      stats: { totalSize, totalUsed, datastoreCount: datastoreDetails.length, backupCount: totalBackups }
+    }
+  } catch (e: any) {
+    console.error(`[inventory-stream] Failed to load PBS ${conn.name}:`, e?.message)
+    return {
+      id: conn.id,
+      name: conn.name,
+      type: 'pbs',
+      status: 'offline',
+      datastores: [],
+      stats: { totalSize: 0, totalUsed: 0, datastoreCount: 0, backupCount: 0 }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* RBAC filtering for a single cluster                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Scope one cluster for the current viewer: per-guest RBAC filter, then the
+ * vDC mask, then the RBAC node prune. Returns null when the cluster must not be
+ * sent at all (nothing left to show and no outright grant on it).
+ */
+async function scopeClusterForViewer(
+  cluster: ClusterData,
+  rbacCtx: any,
+  mask: VdcScope | null,
+  rbacScope: RbacInfraScope | null,
+): Promise<ClusterData | null> {
+  let result = cluster
+  if (rbacCtx && !rbacCtx.isAdmin) {
+    const filteredNodes = await Promise.all(
+      cluster.nodes.map(async node => ({
+        ...node,
+        guests: await filterVmsByPermission(
+          rbacCtx.userId,
+          node.guests.map(g => ({
+            ...g,
+            connId: cluster.id,
+            node: node.node,
+            vmid: String(g.vmid),
+          })),
+          PERMISSIONS.VM_VIEW,
+          rbacCtx.tenantId
+        )
+      }))
+    )
+    result = { ...cluster, nodes: filteredNodes }
+  }
+  // vDC mask first (it also drops guests by pool), then the RBAC node prune, so
+  // a guest-derived perimeter is computed on the final guest set (issue #633).
+  const scoped = applyRbacInfraFilter(applyVdcFilter(result, mask), rbacScope)
+  const kept = pruneEmptyConnections([scoped], rbacScope)
+  return kept.length > 0 ? kept[0] : null
+}
+
+/* ------------------------------------------------------------------ */
+/* GET handler — SSE stream                                            */
+/* ------------------------------------------------------------------ */
+
+export async function GET(request: NextRequest) {
+  const demo = demoResponse(request)
+  if (demo) return demo
+
+  const denied = await checkPermission(PERMISSIONS.VM_VIEW)
+  if (denied) return denied
+
+  const prisma = await getSessionPrisma()
+  const tenantId = await getCurrentTenantId()
+  // Resolved BEFORE the cache read below: this route is session-only (not
+  // in the API-token allowlist, cf. allowlist.ts), so the view cookie always
+  // applies — no isTokenPrincipal opt-out needed here (unlike inventory/route.ts).
+  const vdcContext = await getVdcContext(tenantId)
+  const forceRefresh = request.nextUrl.searchParams.get('refresh') === 'true'
+
+  // Check cache first — if fresh, send everything at once (fast path)
+  const cacheResult = forceRefresh ? { status: 'miss' as const } : getInventoryFromCache(tenantId, vdcContext)
+
+  const encoder = new TextEncoder()
+
+  if (cacheResult.status === 'fresh' || cacheResult.status === 'stale') {
+    // Serve cached data as a quick burst of events
+    const cached = cacheResult.data
+    const rbacCtx = await getRBACContext()
+    const mask = maskingScope(await getTenantInfrastructureScope(tenantId))
+    // Resolve RBAC infra scope once; null = admin/unrestricted (no pruning)
+    const rbacScope = rbacCtx && !rbacCtx.isAdmin
+      ? await getRbacInfraScope(rbacCtx.userId, rbacCtx.tenantId)
+      : null
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = (event: string, data: any) => {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+        }
+
+        try {
+          // Filter clusters by vDC scope then RBAC infra scope (intersection).
+          // Candidate set only: a guest-derived scope is resolved per cluster below.
+          let visibleClusters = mask ? cached.clusters.filter(c => mask.connectionIds.has(c.id)) : cached.clusters
+          visibleClusters = filterCandidateConnections(visibleClusters, rbacScope)
+
+          const visiblePbs = filterVisibleConnections(cached.pbsServers, rbacScope)
+          const visibleExt = filterVisibleConnections(cached.externalHypervisors, rbacScope)
+
+          const scopedClusters: ClusterData[] = []
+          for (const cluster of visibleClusters) {
+            const scoped = await scopeClusterForViewer(cluster, rbacCtx, mask, rbacScope)
+            if (scoped) scopedClusters.push(scoped)
+          }
+
+          send('init', {
+            totalUnisphere: scopedClusters.length,
+            totalPbs: visiblePbs.length,
+            totalExt: visibleExt.length,
+            cached: true,
+          })
+
+          for (const cluster of scopedClusters) {
+            send('cluster', cluster)
+          }
+          for (const pbs of visiblePbs) {
+            const scoped = await scopePbsDataForTenant(pbs, mask)
+            if (scoped) send('pbs', scoped)
+          }
+          if (cached.storages) {
+            // Storage is keyed by connId, not id, so the RBAC gate is spelled out
+            // here. Strict on purpose, same predicate as the cache-miss path: a
+            // guest-derived (tag/pool) perimeter grants guests, never host data,
+            // and both paths must answer identically whatever the cache state
+            // (issue #633).
+            const visibleStorages = cached.storages.filter((s: any) =>
+              (!mask || mask.connectionIds.has(s.connId)) &&
+              (!rbacScope || isConnectionVisible(rbacScope, s.connId))
+            )
+            for (const storage of visibleStorages) {
+              const scoped = scopeStorageDataForTenant(storage, mask)
+              if (scoped) send('storage', scoped)
+            }
+          }
+          if (visibleExt.length > 0) {
+            send('external', visibleExt)
+          }
+          send('done', { stats: cached.stats })
+        } finally {
+          controller.close()
+        }
+      }
+    })
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+
+  // Cache miss — stream progressively as each connection resolves
+  const rbacCtx = await getRBACContext()
+  // Resolve RBAC infra scope once per request; null = admin/unrestricted (no pruning)
+  const rbacScope = rbacCtx && !rbacCtx.isAdmin
+    ? await getRbacInfraScope(rbacCtx.userId, rbacCtx.tenantId)
+    : null
+  const infra = await getTenantInfrastructureScope(tenantId)
+  const mask = maskingScope(infra)
+  const plan = inventoryConnectionPlan(infra)
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: any) => {
+        try {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+        } catch {
+          // Client disconnected
+        }
+      }
+
+      try {
+        const startTime = Date.now()
+
+        // Load connections from DB
+        // provider → globalPrisma, all connections; msp → session prisma, own connections;
+        // iaas (vDC tenant) → globalPrisma restricted to vDC-bound connection IDs
+        const connSelect = { id: true, name: true, type: true, latitude: true, longitude: true, locationLabel: true, sshEnabled: true, tenantId: true } as const
+        const unisphereClient = plan.unisphereClient === 'global' ? globalPrisma : prisma
+        const unisphereWhere = plan.unisphereConnectionIds
+          ? { type: 'unisphere' as const, id: { in: plan.unisphereConnectionIds } }
+          : { type: 'unisphere' as const }
+
+        // PBS: iaas surfaces its vDC-bound PBS (global + bound ids); provider
+        // sees all (global); msp sees its own (session).
+        let pbsWhere: { type: 'pbs'; id?: { in: string[] } }
+        let pbsUseGlobal: boolean
+        if (infra.kind === 'iaas') {
+          pbsUseGlobal = true
+          pbsWhere = { type: 'pbs', id: { in: [...infra.vdcScope.pbsNamespacesByConnection.keys()] } }
+        } else {
+          pbsUseGlobal = plan.pbsExtClient === 'global'
+          pbsWhere = { type: 'pbs' }
+        }
+        const extUseGlobal = plan.pbsExtClient === 'global'
+
+        const [unisphereConnections, pbsConnections, externalConnections] = await Promise.all([
+          unisphereClient.connection.findMany({ where: unisphereWhere, orderBy: { createdAt: 'desc' }, select: connSelect }),
+          (pbsUseGlobal ? globalPrisma : prisma).connection.findMany({ where: pbsWhere, orderBy: { createdAt: 'desc' }, select: { id: true, name: true, type: true } }),
+          (extUseGlobal ? globalPrisma : prisma).connection.findMany({ where: { type: { in: ['vmware', 'hyperv', 'xcpng', 'nutanix'] } }, orderBy: { createdAt: 'desc' }, select: { id: true, name: true, type: true } }),
+        ])
+
+        // Determine which UNISPHERE connections are visible under vDC scope AND RBAC infra scope.
+        // We fetch ALL connections (for the cache), but only stream visible ones to the client.
+        const vdcVisibleIds = mask
+          ? new Set(unisphereConnections.filter(c => mask.connectionIds.has(c.id)).map(c => c.id))
+          : null
+
+        // RBAC infra scope prune: candidate ids only. A guest-derived (tag/pool)
+        // scope keeps every connection here and is resolved per cluster below.
+        const rbacCandidateUnisphereIds = rbacScope
+          ? new Set(unisphereConnections.filter(c => mayHaveVisibleGuests(rbacScope, c.id)).map(c => c.id))
+          : null
+
+        // A UNISPHERE connection is streamed only if it passes BOTH vDC and RBAC filters
+        const isVisibleConn = (connId: string) =>
+          (!vdcVisibleIds || vdcVisibleIds.has(connId)) &&
+          (!rbacCandidateUnisphereIds || rbacCandidateUnisphereIds.has(connId))
+
+        // Storage is host data, not guest data: a guest-derived (tag/pool)
+        // perimeter must never surface it, or the candidate set above would hand
+        // a tag-scoped user the storage layout of every connection (issue #633).
+        const isInfraVisibleConn = (connId: string) =>
+          (!vdcVisibleIds || vdcVisibleIds.has(connId)) &&
+          (!rbacScope || isConnectionVisible(rbacScope, connId))
+
+        const visibleUnisphereCount = unisphereConnections.filter(c => isVisibleConn(c.id)).length
+
+        // RBAC prune PBS and external before counting for init
+        const visiblePbsConnections = filterVisibleConnections(pbsConnections, rbacScope)
+        const visibleExtConnections = filterVisibleConnections(externalConnections, rbacScope)
+
+        // Send init event so frontend knows how many items to expect
+        send('init', {
+          totalUnisphere: visibleUnisphereCount,
+          totalPbs: visiblePbsConnections.length,
+          totalExt: visibleExtConnections.length,
+          cached: false,
+        })
+
+        // Send external hypervisors immediately (no fetch needed)
+        if (visibleExtConnections.length > 0) {
+          send('external', visibleExtConnections)
+        }
+
+        // Fire all fetches concurrently — each sends its event as soon as ready
+        const allClusters: ClusterData[] = []
+        const allPbsServers: PbsServerData[] = []
+        const allStorages: StorageData[] = []
+
+        const clusterPromises = unisphereConnections.map(async (conn) => {
+          const cluster = await fetchOneCluster(conn)
+          allClusters.push(cluster)
+
+          // Only stream clusters visible to both vDC and RBAC infra scope
+          if (isVisibleConn(conn.id)) {
+            const scoped = await scopeClusterForViewer(cluster, rbacCtx, mask, rbacScope)
+            if (scoped) send('cluster', scoped)
+          }
+
+          // Fetch storage data for this cluster and emit immediately (only if visible)
+          const storageData = await fetchStoragesForCluster(conn, cluster)
+          allStorages.push(storageData)
+          if (isInfraVisibleConn(conn.id)) {
+            const scoped = scopeStorageDataForTenant(storageData, mask)
+            if (scoped) send('storage', scoped)
+          }
+        })
+
+        // Only fetch PBS servers visible under RBAC infra scope
+        const pbsPromises = visiblePbsConnections.map(async (conn) => {
+          const pbs = await fetchOnePbs(conn)
+          allPbsServers.push(pbs)
+          const scoped = await scopePbsDataForTenant(pbs, mask)
+          if (scoped) send('pbs', scoped)
+        })
+
+        // Wait for all to complete (each already sent its event)
+        await Promise.allSettled([...clusterPromises, ...pbsPromises])
+
+        // Compute stats
+        let totalNodes = 0, onlineNodes = 0, totalGuests = 0, runningGuests = 0
+        for (const cluster of allClusters) {
+          for (const node of cluster.nodes) {
+            totalNodes++
+            if (node.status === 'online') onlineNodes++
+            for (const guest of node.guests) {
+              totalGuests++
+              if (guest.status === 'running') runningGuests++
+            }
+          }
+        }
+
+        let totalDatastores = 0, totalBackups = 0
+        for (const pbs of allPbsServers) {
+          totalDatastores += pbs.stats.datastoreCount
+          totalBackups += pbs.stats.backupCount
+        }
+
+        const stats = {
+          totalClusters: allClusters.length,
+          totalNodes, totalGuests, onlineNodes, runningGuests,
+          totalPbsServers: allPbsServers.length,
+          totalDatastores, totalBackups,
+        }
+
+        // Update the shared cache so the non-stream endpoint benefits too
+        setCachedInventory({
+          clusters: allClusters,
+          pbsServers: allPbsServers,
+          externalHypervisors: externalConnections,
+          storages: allStorages,
+          stats,
+        }, tenantId, vdcContext)
+
+        console.log(`[inventory-stream] Streamed all data in ${Date.now() - startTime}ms`)
+        send('done', { stats })
+      } catch (e: any) {
+        console.error('[inventory-stream] Error:', e?.message)
+        send('error', { message: e?.message || String(e) })
+      } finally {
+        controller.close()
+      }
+    }
+  })
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  })
+}

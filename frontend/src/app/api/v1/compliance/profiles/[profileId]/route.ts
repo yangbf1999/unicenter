@@ -1,0 +1,98 @@
+// GET/PUT/DELETE /api/v1/compliance/profiles/[profileId]
+import { NextResponse } from 'next/server'
+
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { getProfile, getProfileChecks, updateProfile, updateProfileChecks, deleteProfile } from '@/lib/compliance/profiles'
+import { getCurrentTenantId } from '@/lib/tenant'
+import { demoResponse } from '@/lib/demo/demo-api'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+
+export async function GET(
+  req: Request,
+  ctx: { params: Promise<{ profileId: string }> }
+) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const denied = await checkPermission(PERMISSIONS.ADMIN_COMPLIANCE)
+    if (denied) return denied
+
+    const { profileId } = await ctx.params
+    const tenantId = await getCurrentTenantId()
+    const profile = await getProfile(profileId, tenantId)
+    if (!profile) {
+      return NextResponse.json({ error: 'Profile not found' }, { status: 404 })
+    }
+
+    const checks = await getProfileChecks(profileId, tenantId)
+    return NextResponse.json({ data: { ...profile, checks } })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
+  }
+}
+
+export async function PUT(
+  req: Request,
+  ctx: { params: Promise<{ profileId: string }> }
+) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const denied = await checkPermission(PERMISSIONS.ADMIN_COMPLIANCE)
+    if (denied) return denied
+
+    const { profileId } = await ctx.params
+    const tenantId = await getCurrentTenantId()
+    const existing = await getProfile(profileId, tenantId)
+    if (!existing) {
+      return NextResponse.json({ error: 'Profile not found' }, { status: 404 })
+    }
+
+    const body = await req.json()
+
+    // Update profile metadata
+    if (body.name !== undefined || body.description !== undefined) {
+      await updateProfile(profileId, { name: body.name, description: body.description }, tenantId)
+    }
+
+    // Update checks if provided
+    if (Array.isArray(body.checks)) {
+      await updateProfileChecks(profileId, body.checks, tenantId)
+    }
+
+    const updated = await getProfile(profileId, tenantId)
+    const checks = await getProfileChecks(profileId, tenantId)
+    return NextResponse.json({ data: { ...updated, checks } })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
+  }
+}
+
+export async function DELETE(
+  req: Request,
+  ctx: { params: Promise<{ profileId: string }> }
+) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const denied = await checkPermission(PERMISSIONS.ADMIN_COMPLIANCE)
+    if (denied) return denied
+
+    const { profileId } = await ctx.params
+    const tenantId = await getCurrentTenantId()
+    const existing = await getProfile(profileId, tenantId)
+    if (!existing) {
+      return NextResponse.json({ error: 'Profile not found' }, { status: 404 })
+    }
+
+    await deleteProfile(profileId, tenantId)
+    return NextResponse.json({ success: true })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
+  }
+}

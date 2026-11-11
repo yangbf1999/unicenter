@@ -1,0 +1,338 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+
+vi.mock('@/lib/connections/getConnection', () => ({
+  getConnectionById: vi.fn<(id: string) => Promise<any>>(),
+  // Real pure helper: matches the production "connection not found" detection.
+  isConnectionNotFoundError: (err: unknown) =>
+    /connection not found/i.test((err as { message?: string } | null)?.message || ''),
+}))
+
+vi.mock('@/lib/esage/client', () => ({
+  unisphereFetch: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: vi.fn<(...args: any[]) => Promise<any>>(),
+  buildNodeResourceId: vi.fn<(connId: string, node: string) => string>(
+    (connId, node) => `${connId}:${node}`
+  ),
+  PERMISSIONS: {
+    NODE_VIEW: 'node.view',
+    NODE_MANAGE: 'node.manage',
+  },
+}))
+
+vi.mock('@/lib/ssh/exec', () => ({
+  executeSSH: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/ssh/node-ip', () => ({
+  getNodeIp: vi.fn<(...args: any[]) => Promise<string>>(),
+}))
+
+import { GET, POST, DELETE } from './route'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { unisphereFetch } from '@/lib/esage/client'
+import { checkPermission } from '@/lib/rbac'
+import { executeSSH } from '@/lib/ssh/exec'
+import { getNodeIp } from '@/lib/ssh/node-ip'
+
+const getConnectionByIdMock = getConnectionById as any
+const unisphereFetchMock = unisphereFetch as any
+const checkPermissionMock = checkPermission as any
+const executeSSHMock = executeSSH as any
+const getNodeIpMock = getNodeIp as any
+
+const CONN_ID = 'conn-1'
+const NODE = 'unisphere-node-01'
+const NODE_IP = '10.0.0.1'
+
+const baseParams = { id: CONN_ID, node: NODE }
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  checkPermissionMock.mockResolvedValue(null)
+  getConnectionByIdMock.mockResolvedValue({ id: CONN_ID })
+  unisphereFetchMock.mockResolvedValue([])
+  getNodeIpMock.mockResolvedValue(NODE_IP)
+  executeSSHMock.mockResolvedValue({ success: true, output: '' })
+})
+
+// ---------------------------------------------------------------------------
+// GET
+// ---------------------------------------------------------------------------
+describe('GET /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('returns maintenance=null when node is not in maintenance', async () => {
+    unisphereFetchMock.mockResolvedValue([{ node: NODE, hastate: 'started' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBeNull()
+  })
+
+  it('returns maintenance="maintenance" when hastate is maintenance', async () => {
+    unisphereFetchMock.mockResolvedValue([{ node: NODE, hastate: 'maintenance' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBe('maintenance')
+  })
+
+  it('returns maintenance=null when node is not in the resource list', async () => {
+    unisphereFetchMock.mockResolvedValue([{ node: 'other-node', hastate: 'maintenance' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBeNull()
+  })
+
+  it('500 when unisphereFetch rejects (cluster error now surfaces)', async () => {
+    unisphereFetchMock.mockRejectedValue(new Error('cluster unreachable'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toMatch(/cluster unreachable/i)
+  })
+
+  it('403 when RBAC denies node.view', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('500 when getConnectionById throws', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('404 when getConnectionById rejects with a not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(404)
+    const body = await readJson<any>(res)
+    expect(body.error).toMatch(/not found/i)
+  })
+
+  it('calls unisphereFetch with correct cluster resources path', async () => {
+    unisphereFetchMock.mockResolvedValue([])
+    await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(unisphereFetchMock).toHaveBeenCalledWith(
+      { id: CONN_ID },
+      '/cluster/resources?type=node'
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// POST (enter maintenance)
+// ---------------------------------------------------------------------------
+describe('POST /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('403 when RBAC denies node.manage', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('404 when connection not found', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('500 when getConnectionById rejects with a non-not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('200 happy path: executes enable SSH command and returns output', async () => {
+    executeSSHMock.mockResolvedValue({ success: true, output: 'ok' })
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.success).toBe(true)
+    expect(body.method).toBe('ssh')
+    expect(body.output).toBe('ok')
+
+    expect(getNodeIpMock).toHaveBeenCalledWith({ id: CONN_ID }, NODE)
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      NODE_IP,
+      `ha-manager crm-command node-maintenance enable ${NODE}`
+    )
+  })
+
+  it('500 when SSH command fails (success=false)', async () => {
+    executeSSHMock.mockResolvedValue({ success: false, error: 'permission denied' })
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('permission denied')
+    expect(body.hint).toContain('ha-manager crm-command node-maintenance enable')
+  })
+
+  it('500 when executeSSH throws', async () => {
+    executeSSHMock.mockRejectedValue(new Error('SSH connection refused'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('SSH connection refused')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DELETE (exit maintenance)
+// ---------------------------------------------------------------------------
+describe('DELETE /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('403 when RBAC denies node.manage', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('404 when connection not found', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('500 when getConnectionById rejects with a non-not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('200 happy path: executes disable SSH command and returns output', async () => {
+    executeSSHMock.mockResolvedValue({ success: true, output: 'done' })
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.success).toBe(true)
+    expect(body.method).toBe('ssh')
+
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      NODE_IP,
+      `ha-manager crm-command node-maintenance disable ${NODE}`
+    )
+  })
+
+  it('500 when SSH command fails (success=false)', async () => {
+    executeSSHMock.mockResolvedValue({ success: false, error: 'not in maintenance' })
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('not in maintenance')
+    expect(body.hint).toContain('ha-manager crm-command node-maintenance disable')
+  })
+
+  it('500 when executeSSH throws', async () => {
+    executeSSHMock.mockRejectedValue(new Error('timeout'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('timeout')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Command-injection guard: the [node] path segment is interpolated into the
+// `ha-manager crm-command ... ${node}` shell command, so a name carrying shell
+// metacharacters must be rejected with 400 before any SSH runs.
+// ---------------------------------------------------------------------------
+describe('node-name validation (command injection)', () => {
+  const MALICIOUS = [
+    'unisphere1; touch /tmp/pwn',
+    'unisphere1$(id)',
+    'unisphere1`whoami`',
+    'unisphere1 && reboot',
+    'unisphere1|cat /etc/passwd',
+    '-injected',
+    'a\nb',
+  ]
+
+  for (const node of MALICIOUS) {
+    it(`POST rejects ${JSON.stringify(node)} with 400 and never runs SSH`, async () => {
+      const res = await callRoute(POST as any, { method: 'POST', params: { id: CONN_ID, node } })
+      expect(res.status).toBe(400)
+      const body = await readJson<any>(res)
+      expect(body.error).toMatch(/invalid node name/i)
+      expect(executeSSHMock).not.toHaveBeenCalled()
+      expect(getNodeIpMock).not.toHaveBeenCalled()
+    })
+
+    it(`DELETE rejects ${JSON.stringify(node)} with 400 and never runs SSH`, async () => {
+      const res = await callRoute(DELETE as any, { method: 'DELETE', params: { id: CONN_ID, node } })
+      expect(res.status).toBe(400)
+      expect(executeSSHMock).not.toHaveBeenCalled()
+    })
+  }
+
+  it('accepts a well-formed node name and reaches SSH', async () => {
+    const res = await callRoute(POST as any, { method: 'POST', params: { id: CONN_ID, node: 'unisphere-node-02' } })
+    expect(res.status).toBe(200)
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      NODE_IP,
+      'ha-manager crm-command node-maintenance enable unisphere-node-02',
+    )
+  })
+})

@@ -1,0 +1,83 @@
+/**
+ * Map XCP-ng (Xen Orchestra) VM configuration to eSage UniSphere VM creation parameters
+ */
+
+import type { XoVmConfig } from "@/lib/xcpng/client"
+import type { UnisphereVmCreateParams } from "./configMapper"
+
+/** Map XO guest OS string to eSage ostype */
+function mapOsType(guestOS: string): string {
+  const os = (guestOS || "").toLowerCase()
+
+  if (os.includes("windows 11")) return "win11"
+  if (os.includes("windows 10")) return "win10"
+  if (os.includes("windows 8")) return "win8"
+  if (os.includes("windows 7")) return "win7"
+  if (os.includes("windows server 2022") || os.includes("windows server 2025")) return "win11"
+  if (os.includes("windows server 2019") || os.includes("windows server 2016")) return "win10"
+  if (os.includes("windows")) return "win10"
+  if (os.includes("ubuntu") || os.includes("debian") || os.includes("centos") ||
+      os.includes("rhel") || os.includes("red hat") || os.includes("fedora") ||
+      os.includes("suse") || os.includes("oracle") || os.includes("linux") ||
+      os.includes("alma") || os.includes("rocky")) return "l26"
+  if (os.includes("freebsd")) return "other"
+  return "l26"
+}
+
+/** Detect if the VM is Windows-based */
+export function isWindowsXoVm(config: XoVmConfig): boolean {
+  return (config.guestOS || "").toLowerCase().includes("windows")
+}
+
+/**
+ * Generate eSage VM creation parameters from XO VM config
+ */
+export function mapXoToUnisphereConfig(
+  xoConfig: XoVmConfig,
+  targetVmid: number,
+  targetStorage: string,
+  networkBridge: string = "vmbr0",
+  vlanTag?: number,
+): UnisphereVmCreateParams {
+  const isEfi = xoConfig.firmware === "uefi"
+  const isWin = isWindowsXoVm(xoConfig)
+
+  // virtio-scsi for every guest; Windows keeps e1000 (inbox driver). Boot disk
+  // goes to SATA for Windows and EFI guests — same rule as the ESXi mapper: an
+  // untouched Windows guest has no boot-start VirtIO (or LSI) driver and stops
+  // with INACCESSIBLE_BOOT_DEVICE (#653).
+  const scsihw = "virtio-scsi-single"
+  const nicModel = isWin ? "e1000" : "virtio"
+  const bootDiskSlot: "sata0" | "scsi0" = isEfi || isWin ? "sata0" : "scsi0"
+
+  const tagSuffix =
+    typeof vlanTag === "number" && Number.isInteger(vlanTag) && vlanTag >= 1 && vlanTag <= 4094
+      ? `,tag=${vlanTag}`
+      : ""
+
+  const params: UnisphereVmCreateParams = {
+    vmid: targetVmid,
+    name: xoConfig.name.replace(/[^a-zA-Z0-9-]/g, "-").replace(/^-+|-+$/g, '').substring(0, 63) || 'vm',
+    ostype: mapOsType(xoConfig.guestOS),
+    cores: xoConfig.numCPU,
+    sockets: 1,
+    memory: xoConfig.memoryMB,
+    cpu: "host",
+    scsihw,
+    bios: isEfi ? "ovmf" : "seabios",
+    machine: "q35",
+    boot: `order=${bootDiskSlot}`,
+    bootDiskSlot,
+    agent: "1",
+    net0: `${nicModel},bridge=${networkBridge}${tagSuffix}`,
+  }
+
+  if (isEfi) {
+    // pre-enrolled-keys=1 mirrors the eSage GUI default for UEFI VMs:
+    // OVMF ships with the standard Microsoft Secure Boot keys so guests
+    // (especially Windows) pass Secure Boot verification after migration.
+    params.efidisk0 = `${targetStorage}:1,efitype=4m,pre-enrolled-keys=1`
+  }
+
+  return params
+}

@@ -1,0 +1,1763 @@
+'use client'
+
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
+import { useSession } from 'next-auth/react'
+
+import { useTranslations } from 'next-intl'
+
+import {
+  Alert,
+  AlertTitle,
+  Autocomplete,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  MenuItem,
+  Select,
+  Switch,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+} from '@mui/material'
+import { DataGrid } from '@mui/x-data-grid'
+
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import { useLicense, Features } from '@/contexts/LicenseContext'
+import { useRBAC } from '@/contexts/RBACContext'
+import { useUsers, useRbacRoles, useRbacAssignments, useTenants, useAdminSessions } from '@/hooks/useUsers'
+import EmptyState from '@/components/EmptyState'
+import { TableSkeleton } from '@/components/skeletons'
+import RevokeSessionsDialog from '@/components/security/RevokeSessionsDialog'
+import RevokeSingleSessionDialog from '@/components/security/RevokeSingleSessionDialog'
+import RevokeEverySessionDialog from '@/components/security/RevokeEverySessionDialog'
+import { tooltipSlotProps } from '@/components/settings/ha/tooltipSlotProps'
+import { redirectToLoginOnce } from '@/hooks/useSWRFetch'
+
+/* --------------------------------
+   Helpers
+-------------------------------- */
+
+function timeAgo(date, t) {
+  if (!date) return t ? t('common.notAvailable') : 'N/A'
+  const now = new Date()
+  const past = new Date(date)
+  const diff = Math.floor((now - past) / 1000)
+
+  if (diff < 60) return t ? t('time.secondsAgo') : 'a few seconds ago'
+  if (diff < 3600) return t ? t('time.minutesAgo', { count: Math.floor(diff / 60) }) : `${Math.floor(diff / 60)} min ago`
+  if (diff < 86400) return t ? t('time.hoursAgo', { count: Math.floor(diff / 3600) }) : `${Math.floor(diff / 3600)}h ago`
+
+return t ? t('time.daysAgo', { count: Math.floor(diff / 86400) }) : `${Math.floor(diff / 86400)}d ago`
+}
+
+/* --------------------------------
+   Components
+-------------------------------- */
+
+function RoleChip({ roles, t }) {
+  const list = Array.isArray(roles) ? roles : []
+  if (list.length === 0) {
+    return <Chip size='small' label={t ? t('usersPage.noRole') : 'No role'} variant='outlined' sx={{ opacity: 0.5 }} />
+  }
+
+  // Same role on every membership → single chip (the common MSP case).
+  // Divergent roles (e.g. tenant_admin on tenant-1 + tenant_viewer on
+  // tenant-2) get a Multiple chip whose tooltip lists the breakdown so
+  // the operator notices and audits without leaving the row.
+  const distinctRoleIds = new Set(list.map(r => r.id).filter(Boolean))
+  if (distinctRoleIds.size <= 1) {
+    const role = list[0]
+    return (
+      <Chip
+        size='small'
+        label={t && role.is_system ? t(`rbac.roles.${role.id}`) : role.name}
+        sx={{
+          bgcolor: role.color ? `${role.color}20` : undefined,
+          color: role.color || undefined,
+          borderColor: role.color || undefined,
+        }}
+        variant='outlined'
+      />
+    )
+  }
+  const breakdown = list.map(r => `${r.tenant_name || r.tenant_id || '?'}: ${r.name}`).join(' · ')
+  return (
+    <Tooltip title={breakdown}>
+      <Chip
+        size='small'
+        label={t ? t('usersPage.rolesMixed', { count: distinctRoleIds.size }) : `${distinctRoleIds.size} roles`}
+        variant='outlined'
+        color='warning'
+        icon={<i className='ri-error-warning-line' style={{ fontSize: 14 }} />}
+      />
+    </Tooltip>
+  )
+}
+
+function AuthProviderChip({ provider, t }) {
+  if (provider === 'ldap') {
+    return <Chip size='small' label={t('usersPage.ldapAuth')} variant='outlined' icon={<i className='ri-server-line' style={{ fontSize: 14 }} />} />
+  }
+
+  if (provider === 'oidc') {
+    return <Chip size='small' label={t('usersPage.oidcAuth')} variant='outlined' icon={<i className='ri-shield-keyhole-line' style={{ fontSize: 14 }} />} />
+  }
+
+return <Chip size='small' label={t('usersPage.localAuth')} variant='outlined' icon={<i className='ri-user-line' style={{ fontSize: 14 }} />} />
+}
+
+/* --------------------------------
+   API tokens outliving their creator (issue #632)
+
+   A pxc_ token authenticates on its own: it keeps working after the
+   account that created it is disabled or deleted. That is deliberate — a
+   token driving Prometheus must not die with the admin who created it —
+   but nothing in the UI used to connect the two facts, so an operator
+   disabled an account and believed the access was cut.
+
+   These two helpers surface the surviving tokens at the exact two moments
+   it matters (disable, delete) and offer deletion as an explicit opt-in.
+   Never delete implicitly: the checkbox is unchecked by default and the
+   `deleteApiTokens` flag is only ever sent when the operator ticked it.
+
+   Deletion, not revocation: "delete a token" removes the row here exactly
+   as it does from the tokens table, so the product has one verb and one
+   outcome. The journal entry is what survives.
+-------------------------------- */
+
+// Live tokens created by `userId`. GET /users/[id]/api-tokens is guarded by
+// admin.users — the same permission as this page — so no extra gating here.
+// Fails soft: a load error never blocks the dialog, it only raises
+// `loadFailed` so the caller can mention it discreetly. Warning the operator
+// is best-effort; it must never stand between them and disabling an account.
+function useCreatorApiTokens(userId, active) {
+  const [tokens, setTokens] = useState([])
+  const [loadFailed, setLoadFailed] = useState(false)
+
+  useEffect(() => {
+    if (!active || !userId) {
+      // Dialogs stay mounted between opens — clear the previous target's
+      // tokens so they can never be attributed to the next one.
+      setTokens([])
+      setLoadFailed(false)
+
+      return
+    }
+
+    let cancelled = false
+
+    setLoadFailed(false)
+
+    fetch(`/api/v1/users/${userId}/api-tokens`)
+      .then(async res => {
+        if (!res.ok) throw new Error('load failed')
+
+        return res.json()
+      })
+      .then(body => {
+        if (cancelled) return
+        setTokens(Array.isArray(body?.data) ? body.data : [])
+      })
+      .catch(() => {
+        if (cancelled) return
+        setTokens([])
+        setLoadFailed(true)
+      })
+
+    return () => { cancelled = true }
+  }, [userId, active])
+
+  return { tokens, loadFailed }
+}
+
+// The warning block shared by the disable (UserDialog) and delete paths.
+// `warningKey` swaps the sentence; everything else — the token listing and
+// the opt-in checkbox — is identical on both sides.
+function ApiTokenOffboardingWarning({ tokens, warningKey, fallbackWarning, deleteTokens, onDeleteTokensChange, t }) {
+  const count = tokens.length
+
+  return (
+    <Alert severity='warning' icon={<i className='ri-key-2-line' />} sx={{ mt: 2, mb: 1 }}>
+      <AlertTitle sx={{ mb: 0.5 }}>{t ? t('usersPage.apiTokens.title') : 'API tokens'}</AlertTitle>
+      {/* Typography never inherits its container's colour — spell out
+          `inherit` so the text follows the Alert's warning palette. */}
+      <Typography variant='body2' sx={{ color: 'inherit' }}>
+        {t ? t(warningKey, { count }) : fallbackWarning}
+      </Typography>
+      <Box component='ul' sx={{ m: 0, mt: 1, pl: 2.5 }}>
+        {tokens.map(token => (
+          <Box component='li' key={token.id} sx={{ mb: 0.25 }}>
+            {/* No monospace on the prefix — project-wide convention. */}
+            <Typography variant='caption' component='div' sx={{ color: 'inherit' }}>
+              <strong>{token.name}</strong>
+              {' · '}
+              {token.token_prefix}
+              {' · '}
+              {token.last_used_at
+                ? `${t ? t('settings.apiTokens.columns.lastUsed') : 'Last used'}: ${timeAgo(token.last_used_at, t)}`
+                : (t ? t('usersPage.apiTokens.neverUsed') : 'Never used')}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+      <FormControlLabel
+        sx={{ mt: 0.5, alignItems: 'flex-start' }}
+        control={
+          <Checkbox
+            size='small'
+            color='warning'
+            checked={deleteTokens}
+            onChange={e => onDeleteTokensChange(e.target.checked)}
+            sx={{ pt: 0.25 }}
+          />
+        }
+        label={
+          <Box component='span' sx={{ display: 'block' }}>
+            <Typography variant='body2' component='span' sx={{ color: 'inherit', display: 'block' }}>
+              {t ? t('usersPage.apiTokens.deleteCheckbox') : 'Delete these tokens as well'}
+            </Typography>
+            <Typography variant='caption' component='span' sx={{ color: 'inherit', opacity: 0.85, display: 'block' }}>
+              {t
+                ? t('usersPage.apiTokens.deleteHint')
+                : 'Any integration using them stops working immediately. This cannot be undone.'}
+            </Typography>
+          </Box>
+        }
+      />
+    </Alert>
+  )
+}
+
+// Load failures are reported inline and unobtrusively — see the fail-soft
+// note on useCreatorApiTokens.
+function ApiTokenLoadError({ t }) {
+  return (
+    <Typography variant='caption' sx={{ display: 'block', mt: 1, color: 'warning.main' }}>
+      {t ? t('usersPage.apiTokens.loadError') : 'Failed to load the API tokens of this user'}
+    </Typography>
+  )
+}
+
+/* --------------------------------
+   User Dialog - Création/Modification
+-------------------------------- */
+
+// Roles that must NEVER be assigned in a non-default tenant. Mirrors
+// TENANT_FORBIDDEN_ROLE_IDS in /security/rbac and the backend whitelist
+// (PROVIDER_ONLY_ROLE_IDS + PROTECTED_ROLE_IDS in src/lib/rbac/index.ts).
+//
+// Reason: legacy "global" roles (operator / vm_admin / viewer / vm_user)
+// grant automation.view which unlocks DRS / Site Recovery / Network
+// Security / Resources — pages Tenant Admin explicitly excludes. Protected
+// wildcards (super_admin / provider_admin) are provider-scope by design;
+// binding them under a tenant is either meaningless (super_admin is
+// cross-tenant) or an escalation surface (provider_admin → tenant_admin++).
+const TENANT_FORBIDDEN_ROLE_IDS = new Set([
+  'role_super_admin',
+  'role_provider_admin',
+  'role_operator',
+  'role_vm_admin',
+  'role_viewer',
+  'role_vm_user',
+])
+
+function UserDialog({ open, onClose, user, onSave, rbacRoles, t, showRbac = true, currentUserId, currentSessionTenantId = 'default', enableTenantMgmt = false, tenantsList = [] }) {
+  // Self-protection: the current user cannot change their own role or disable
+  // their own account (matches the backend guards in /users/[id] and
+  // /rbac/assignments). Hide those controls in the edit dialog.
+  const isSelf = !!user?.id && user.id === currentUserId
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const [selectedRole, setSelectedRole] = useState(null)
+  const [initialRoleId, setInitialRoleId] = useState(null)
+  const [selectedTenants, setSelectedTenants] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  // Opt-in deletion of the tokens this account created (issue #632).
+  // Unchecked by default, and only honoured while the warning is on screen.
+  const [deleteApiTokens, setDeleteApiTokens] = useState(false)
+
+  const isEdit = !!user
+  // Password is owned by the external IdP for SSO/LDAP accounts — never let the
+  // app set a local password on them (would open a credentials path bypassing SSO).
+  const isExternalAuth = isEdit && (user?.auth_provider === 'ldap' || user?.auth_provider === 'oidc')
+  // Super admins are pinned to every tenant by design — disable the
+  // multi-select but still display their current memberships so the
+  // operator sees the rule rather than an empty field.
+  const tenantPickerDisabled = isEdit && !!user?.is_super_admin
+  // Detect role divergence across tenants. Used in provider view to
+  // warn that saving a single role propagates to every membership and
+  // overwrites per-tenant differences (typically set via the per-tenant
+  // user list at Settings → Tenants → <X> → users).
+  const rolesAreDivergent = isEdit && Array.isArray(user?.roles)
+    ? new Set(user.roles.map(r => r.id).filter(Boolean)).size > 1
+    : false
+
+  // Tokens the target created, loaded whenever the dialog edits somebody
+  // else. Self-edits cannot reach the Enabled switch at all (see isSelf).
+  const { tokens: creatorTokens, loadFailed: tokensLoadFailed } = useCreatorApiTokens(
+    user?.id,
+    open && isEdit && !isSelf
+  )
+
+  // Only warn on the transition active → inactive. An account that was
+  // already disabled when the dialog opened teaches the operator nothing
+  // new here, and a dialog opened to rename somebody must stay quiet.
+  const showTokenWarning = isEdit && !isSelf && creatorTokens.length > 0 && !enabled && !!user?.enabled
+
+  useEffect(() => {
+    if (user) {
+      setName(user.name || '')
+      setEmail(user.email || '')
+      // user.enabled is a Postgres boolean since the SQLite cutover; the
+      // legacy int comparison (=== 1) was always false and pinned the
+      // Switch off regardless of the row's real state.
+      setEnabled(!!user.enabled)
+      // Divergent roles → leave the picker empty so the operator must
+      // pick a role explicitly (and acknowledge the propagation).
+      const distinctIds = new Set((user.roles || []).map(r => r.id).filter(Boolean))
+      const initialRole = distinctIds.size > 1 ? null : (user.roles?.[0] || null)
+      setSelectedRole(initialRole)
+      setInitialRoleId(initialRole?.id ?? null)
+      setSelectedTenants(Array.isArray(user.tenants) ? user.tenants.map(t2 => t2.id) : [])
+      setPassword('')
+    } else {
+      setName('')
+      setEmail('')
+      setPassword('')
+      setEnabled(true)
+      setSelectedRole(null)
+      setSelectedTenants([])
+    }
+
+    setError('')
+    setDeleteApiTokens(false)
+  }, [user, open])
+
+  // Clear the role state when the selected tenants make the current role
+  // tenant-forbidden. Without this, the role disappears from the dropdown
+  // (filtered visually) but stays in component state and rides along on
+  // submit — the backend would still refuse, but with a non-obvious 400
+  // toast far from where the operator made the change.
+  useEffect(() => {
+    if (!selectedRole) return
+    const targetTenantIds = enableTenantMgmt
+      ? (selectedTenants.length > 0
+          ? selectedTenants
+          : (user?.tenants?.map(tn => tn.id) ?? []))
+      : [currentSessionTenantId]
+    const hasNonDefaultTarget = targetTenantIds.some(id => id !== 'default')
+    if (hasNonDefaultTarget && TENANT_FORBIDDEN_ROLE_IDS.has(selectedRole.id)) {
+      setSelectedRole(null)
+    }
+  }, [selectedTenants, selectedRole, enableTenantMgmt, currentSessionTenantId, user])
+
+  // The account write already succeeded when a role write fails, so the list
+  // must still refresh, but the dialog stays open with the reason instead of
+  // closing on an account whose rights are not what the operator just picked.
+  // Left silent, this produced accounts that could see nothing at all and no
+  // error anywhere to explain it (issue #755).
+  const reportRoleWriteFailure = async res => {
+    const data = await res.json().catch(() => ({}))
+
+    onSave()
+    setError(
+      data.error ||
+        (t
+          ? t('usersPage.roleAssignmentFailed')
+          : 'The account was saved but its role could not be assigned. Check its permissions.')
+    )
+  }
+
+  const handleSave = async () => {
+    setError('')
+
+    if (!isEdit && !email) {
+      setError(t ? t('common.error') : 'Email required')
+
+return
+    }
+
+    if (!isEdit && !password) {
+      setError(t ? t('common.error') : 'Password required')
+
+return
+    }
+
+    if (password && password.length < 8) {
+      setError(t ? t('usersPage.passwordMinLength') : 'Password must be at least 8 characters')
+
+return
+    }
+
+    // On create from the provider view, the user MUST land in at least
+    // one tenant — the auth safety net refuses login for tenant-orphan
+    // users with no super_admin role. Stop here so we don't 400 round-
+    // trip to the server.
+    if (!isEdit && enableTenantMgmt && selectedTenants.length === 0) {
+      setError(t ? t('usersPage.tenantsRequired') : 'Select at least one tenant')
+
+return
+    }
+
+    setLoading(true)
+
+    try {
+      // Créer/Modifier l'utilisateur. Tenant assignments are sent in the
+      // same payload only from the provider view (enableTenantMgmt). On
+      // edit, the server still enforces the SUPER_ADMIN_PROTECTED and
+      // LAST_TENANT guards via removeUserFromTenant. On create, the
+      // server uses the list as the seed memberships (first id becomes
+      // the default), refusing an empty list to keep the auth safety
+      // net's "every user has at least one tenant" invariant.
+      //
+      // RBAC role: in provider view we send `roleId` so the server
+      // propagates it to every membership atomically (and the per-tenant
+      // DELETE-then-POST loop below is skipped). In tenant-scoped view
+      // we keep the per-tenant assignment flow further down.
+      const userBody = isEdit
+        ? {
+            name,
+            enabled: enabled ? 1 : 0,
+            ...(password ? { password } : {}),
+            ...(enableTenantMgmt && !tenantPickerDisabled ? { tenantIds: selectedTenants } : {}),
+            // Only include roleId when the operator actually changed it.
+            // This avoids re-sending a protected role (super_admin /
+            // provider_admin) the backend would refuse, when the dialog is
+            // just being used to edit other fields.
+            ...(enableTenantMgmt && showRbac && !isSelf && (selectedRole?.id ?? null) !== initialRoleId
+              ? { roleId: selectedRole?.id ?? null }
+              : {}),
+            // Gated on showTokenWarning, not on the checkbox alone: ticking
+            // the box then switching the account back on must not smuggle a
+            // deletion through with a save that no longer disables anyone.
+            ...(showTokenWarning && deleteApiTokens ? { deleteApiTokens: true } : {}),
+          }
+        : {
+            email,
+            password,
+            name,
+            ...(enableTenantMgmt ? { tenantIds: selectedTenants } : {}),
+          }
+
+      const res = await fetch(isEdit ? `/api/v1/users/${user.id}` : '/api/v1/users', {
+        method: isEdit ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(userBody),
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error || (t ? t('common.error') : 'Error'))
+
+return
+      }
+
+      // A self-edit that sets a new password (or unchecks Enabled) revokes
+      // every session of the account, including the one this tab is on
+      // (users/[id] PATCH → revokeAllSessions with no exception). Everything
+      // this function would do next — the RBAC assignment calls below,
+      // onSave()'s revalidation — can only 401 against the dead session.
+      // Leave for /login now; the operator signs back in with the new password.
+      if (isEdit && isSelf && (password || !enabled)) {
+        redirectToLoginOnce()
+        return
+      }
+
+      const userId = isEdit ? user.id : data.data.id
+
+      // Provider view (default tenant + Enterprise) handled the role
+      // propagation server-side via the PATCH `roleId` field above.
+      // Skip the per-assignment fallback to avoid double writes.
+      if (!(isEdit && enableTenantMgmt)) {
+        // Tenant-scoped view (or create): drop existing assignments
+        // visible to this caller and create a fresh one in the current
+        // tenant. Same behaviour as before — still one role per tenant
+        // for non-provider operators.
+        if (isEdit && user.roles) {
+          for (const role of user.roles) {
+            if (role.assignment_id) {
+              const dropRes = await fetch(`/api/v1/rbac/assignments/${role.assignment_id}`, {
+                method: 'DELETE'
+              })
+
+              if (!dropRes.ok) return reportRoleWriteFailure(dropRes)
+            }
+          }
+        }
+
+        if (selectedRole) {
+          const assignRes = await fetch('/api/v1/rbac/assignments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: userId,
+              role_id: selectedRole.id,
+              // inherit so the role's default scope applies automatically (issue #383)
+              scope_type: 'inherit',
+              scope_target: null
+            })
+          })
+
+          if (!assignRes.ok) return reportRoleWriteFailure(assignRes)
+        }
+      }
+
+      onSave()
+      onClose()
+    } catch (e) {
+      setError(t ? t('errors.connectionError') : 'Connection error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth='sm' fullWidth>
+      <DialogTitle>{isEdit ? (t ? t('common.edit') : 'Edit') : (t ? t('common.add') : 'Add')}</DialogTitle>
+      <DialogContent>
+        {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+
+        <TextField
+          fullWidth
+          label={t ? t('common.name') : 'Name'}
+          value={name}
+          onChange={e => setName(e.target.value)}
+          sx={{ mt: 2, mb: 2 }}
+          placeholder='John Doe'
+        />
+
+        {!isEdit && (
+          <TextField
+            fullWidth
+            label={t ? t('usersPage.emailLabel') : 'Email'}
+            type='email'
+            value={email}
+            onChange={e => setEmail(e.target.value)}
+            sx={{ mb: 2 }}
+            required
+          />
+        )}
+
+        {isEdit && (
+          <TextField
+            fullWidth
+            label={t ? t('usersPage.emailLabel') : 'Email'}
+            value={user?.email || ''}
+            disabled
+            sx={{ mb: 2 }}
+          />
+        )}
+
+        <TextField
+          fullWidth
+          label={isEdit ? (t ? t('usersPage.newPassword') : 'New password (leave empty to keep current)') : (t ? t('auth.password') : 'Password')}
+          type={showPassword ? 'text' : 'password'}
+          value={isExternalAuth ? '' : password}
+          onChange={e => setPassword(e.target.value)}
+          sx={{ mb: 2 }}
+          required={!isEdit}
+          disabled={isExternalAuth}
+          helperText={isExternalAuth ? (t ? t('usersPage.passwordManagedByIdp') : 'Password is managed by the identity provider') : (t ? t('usersPage.minChars') : 'Minimum 8 characters')}
+          InputProps={{
+            endAdornment: isExternalAuth ? undefined : (
+              <InputAdornment position='end'>
+                <IconButton size='small' onClick={() => setShowPassword(!showPassword)}>
+                  <i className={showPassword ? 'ri-eye-off-line' : 'ri-eye-line'} />
+                </IconButton>
+              </InputAdornment>
+            ),
+          }}
+        />
+
+        {showRbac && !isSelf && enableTenantMgmt && rolesAreDivergent && (
+          <Alert severity='warning' sx={{ mb: 2 }} icon={<i className='ri-error-warning-line' />}>
+            {t ? t('usersPage.rolesDivergentWarning') : 'Roles differ across this user\'s tenants. Saving a role here will overwrite every per-tenant assignment.'}
+            <Box component='span' sx={{ display: 'block', fontSize: '0.75rem', mt: 0.5, opacity: 0.85 }}>
+              {(user?.roles || []).map(r => `${r.tenant_name || r.tenant_id || '?'}: ${r.name}`).join(' · ')}
+            </Box>
+          </Alert>
+        )}
+
+        {showRbac && !isSelf && (() => {
+          // Filter roles by the tenants this assignment will land on:
+          //  - Provider view (enableTenantMgmt): the role propagates to every
+          //    selected tenant via PATCH `roleId`, so if any of those tenants
+          //    is non-default, exclude tenant-forbidden roles. Falls back to
+          //    the user's existing memberships when nothing is selected yet
+          //    (edit flow before the operator touches the picker).
+          //  - Tenant-scoped view: assignment lands in the current session
+          //    tenant; if that's non-default, exclude forbidden roles.
+          //
+          // When the user is a member of `default` (in addition to others),
+          // we still hide forbidden roles — the backend would 400 on the
+          // tenant-scoped propagation, so surfacing the option misleads.
+          const targetTenantIds = enableTenantMgmt
+            ? (selectedTenants.length > 0
+                ? selectedTenants
+                : (user?.tenants?.map(tn => tn.id) ?? []))
+            : [currentSessionTenantId]
+          const hasNonDefaultTarget = targetTenantIds.some(id => id !== 'default')
+          // PROTECTED_ROLE_IDS (super_admin, provider_admin) are managed
+          // exclusively from Security > RBAC > Assignments — the backend
+          // PATCH /users/[id] refuses them. Hide them from this dropdown
+          // so the operator doesn't pick something the API rejects.
+          const visibleRoles = (hasNonDefaultTarget
+            ? rbacRoles.filter(r => !TENANT_FORBIDDEN_ROLE_IDS.has(r.id))
+            : rbacRoles).filter(r => r.id !== 'role_super_admin' && r.id !== 'role_provider_admin')
+
+          return (
+          <>
+          <Autocomplete
+            options={visibleRoles}
+            value={selectedRole}
+            onChange={(_, newValue) => setSelectedRole(newValue)}
+            getOptionLabel={(option) => t && option.is_system ? t(`rbac.roles.${option.id}`) : option.name}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            renderInput={(params) => (
+              <TextField
+                {...params}
+                label={t ? t('usersPage.rbacRole') : 'RBAC Role'}
+                placeholder={t ? t('usersPage.selectRole') : 'Select a role...'}
+                helperText={t ? t('usersPage.roleDefinesPermissions') : 'The role defines user permissions'}
+              />
+            )}
+            renderOption={(props, option) => (
+              <li {...props} key={option.id}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <Box
+                    sx={{
+                      width: 12,
+                      height: 12,
+                      borderRadius: '50%',
+                      bgcolor: option.color || 'grey.400'
+                    }}
+                  />
+                  <Box>
+                    <Typography variant='body2'>{t && option.is_system ? t(`rbac.roles.${option.id}`) : option.name}</Typography>
+                    <Typography variant='caption' sx={{ opacity: 0.6 }}>{option.description}</Typography>
+                  </Box>
+                </Box>
+              </li>
+            )}
+            sx={{ mb: 2 }}
+          />
+          <Alert severity='info' icon={<i className='ri-information-line' />} sx={{ mt: -0.5, mb: 2, py: 0.25, '& .MuiAlert-message': { py: 0.5 } }}>
+            <Typography variant='caption'>
+              {t ? t('usersPage.protectedRolesNote') : 'Super Admin / Provider Admin are managed in Security › RBAC.'}
+            </Typography>
+          </Alert>
+          </>
+          )
+        })()}
+
+        {!showRbac && !isSelf && (
+          <Alert severity='info' icon={<i className='ri-information-line' />} sx={{ mb: 2 }}>
+            <Typography variant='caption'>
+              {t ? t('usersPage.communityAdminNotice') : 'In Community edition, every user has full administrator access. Scoped, role-based permissions require the Enterprise edition.'}
+            </Typography>
+          </Alert>
+        )}
+
+        {isEdit && !isSelf && (
+          <FormControlLabel
+            control={
+              <Switch
+                checked={enabled}
+                onChange={e => setEnabled(e.target.checked)}
+              />
+            }
+            label={t ? t('usersPage.accountActive') : 'Account active'}
+          />
+        )}
+
+        {isEdit && !isSelf && tokensLoadFailed && <ApiTokenLoadError t={t} />}
+
+        {showTokenWarning && (
+          <ApiTokenOffboardingWarning
+            tokens={creatorTokens}
+            warningKey='usersPage.apiTokens.disableWarning'
+            fallbackWarning={`This account created ${creatorTokens.length} active API token(s). Disabling the account does not stop them: a token authenticates on its own.`}
+            deleteTokens={deleteApiTokens}
+            onDeleteTokensChange={setDeleteApiTokens}
+            t={t}
+          />
+        )}
+
+        {enableTenantMgmt && (
+          <Autocomplete
+            multiple
+            options={tenantsList}
+            value={tenantsList.filter(tt => selectedTenants.includes(tt.id))}
+            onChange={(_, newValue) => setSelectedTenants(newValue.map(v => v.id))}
+            getOptionLabel={option => option.name}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            disabled={tenantPickerDisabled}
+            renderTags={(value, getTagProps) =>
+              value.map((option, index) => (
+                <Chip
+                  size='small'
+                  label={option.name}
+                  {...getTagProps({ index })}
+                  key={option.id}
+                />
+              ))
+            }
+            renderInput={params => (
+              <TextField
+                {...params}
+                label={t ? t('usersPage.tenantsLabel') : 'Tenants'}
+                placeholder={tenantPickerDisabled ? '' : (t ? t('usersPage.tenantsPlaceholder') : 'Select tenants...')}
+                helperText={tenantPickerDisabled
+                  ? (t ? t('usersPage.tenantsAllTooltip') : 'Super admin — access to every tenant')
+                  : (t ? t('usersPage.tenantsHelper') : 'The user will be a member of every selected tenant')}
+                required={!isEdit}
+              />
+            )}
+            sx={{ mt: 2 }}
+          />
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>{t ? t('common.cancel') : 'Cancel'}</Button>
+        <Button variant='contained' onClick={handleSave} disabled={loading}>
+          {loading ? (t ? t('common.saving') : 'Saving...') : (t ? t('common.save') : 'Save')}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+/* --------------------------------
+   Delete Confirm Dialog
+-------------------------------- */
+
+function DeleteDialog({ open, onClose, user, onConfirm, currentUserId, t }) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  // Opt-in deletion of the tokens this account created (issue #632).
+  const [deleteApiTokens, setDeleteApiTokens] = useState(false)
+
+  const isSelf = user?.id === currentUserId
+
+  const { tokens: creatorTokens, loadFailed: tokensLoadFailed } = useCreatorApiTokens(
+    user?.id,
+    open && !isSelf
+  )
+
+  const showTokenWarning = !isSelf && creatorTokens.length > 0
+
+  // The dialog is never unmounted between two targets — start every delete
+  // from an unticked box so a previous decision cannot ride along.
+  useEffect(() => {
+    setDeleteApiTokens(false)
+  }, [user, open])
+
+  const handleDelete = async () => {
+    setLoading(true)
+    setError('')
+
+    try {
+      // The query flag is opt-in: without it the backend deletes the account
+      // and leaves the tokens live, which is the historical behaviour.
+      const url = showTokenWarning && deleteApiTokens
+        ? `/api/v1/users/${user.id}?deleteApiTokens=true`
+        : `/api/v1/users/${user.id}`
+
+      const res = await fetch(url, { method: 'DELETE' })
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error || (t ? t('common.error') : 'Error'))
+
+return
+      }
+
+      onConfirm()
+      onClose()
+    } catch (e) {
+      setError(t ? t('errors.connectionError') : 'Connection error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose}>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className='ri-error-warning-line' style={{ color: '#ef4444' }} />
+        {t ? t('usersPage.deleteUser') : 'Delete user'}
+      </DialogTitle>
+      <DialogContent>
+        {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+
+        {isSelf ? (
+          <Alert severity='warning'>
+            {t ? t('usersPage.cannotDeleteSelf') : 'You cannot delete your own account.'}
+          </Alert>
+        ) : (
+          <>
+            <Typography>
+              {t ? t('common.deleteConfirmation') : 'Are you sure you want to delete this item?'} <strong>{user?.email}</strong> ?
+            </Typography>
+            <Typography variant='body2' sx={{ mt: 1, color: 'warning.main' }}>
+              {t ? t('usersPage.deleteWarning') : 'This action is irreversible. All role assignments will also be deleted.'}
+            </Typography>
+            {tokensLoadFailed && <ApiTokenLoadError t={t} />}
+            {showTokenWarning && (
+              <ApiTokenOffboardingWarning
+                tokens={creatorTokens}
+                warningKey='usersPage.apiTokens.deleteWarning'
+                fallbackWarning={`This account created ${creatorTokens.length} active API token(s). They survive the deletion: a token authenticates on its own.`}
+                deleteTokens={deleteApiTokens}
+                onDeleteTokensChange={setDeleteApiTokens}
+                t={t}
+              />
+            )}
+          </>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>{t ? t('common.cancel') : 'Cancel'}</Button>
+        <Button
+          variant='contained'
+          color='error'
+          onClick={handleDelete}
+          disabled={loading || isSelf}
+          startIcon={loading ? <CircularProgress size={16} /> : <i className='ri-delete-bin-line' />}
+        >
+          {t ? t('common.delete') : 'Delete'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+/* --------------------------------
+   Disable 2FA Confirm Dialog
+-------------------------------- */
+
+function Disable2FADialog({ open, onClose, user, onSuccess, t }) {
+  const [emailInput, setEmailInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  const expectedEmail = user?.email || ''
+  const canConfirm = emailInput === expectedEmail
+
+  const handleDisable = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/v1/admin/users/${user.id}/2fa/disable`, {
+        method: 'POST',
+      })
+      if (res.ok) {
+        onSuccess(user.id)
+        onClose()
+        return
+      }
+      let data = {}
+      try { data = await res.json() } catch (_) {}
+      if (res.status === 409 && data.code === 'POLICY_LOCK') {
+        setError(t('twoFactor.policyLockError'))
+      } else {
+        setError(data.error || t('common.error'))
+      }
+    } catch (_) {
+      setError(t('errors.connectionError'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleClose = () => {
+    setEmailInput('')
+    setError('')
+    onClose()
+  }
+
+  return (
+    <Dialog open={open} onClose={handleClose} maxWidth='sm' fullWidth>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className='ri-lock-unlock-line' style={{ color: '#ef4444' }} />
+        {t('twoFactor.adminDisableConfirmTitle', { email: expectedEmail })}
+      </DialogTitle>
+      <DialogContent>
+        {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+        <Typography sx={{ mb: 2 }}>
+          {t('twoFactor.adminDisableConfirmBody')}
+        </Typography>
+        <TextField
+          fullWidth
+          label={t('usersPage.emailLabel')}
+          type='email'
+          value={emailInput}
+          onChange={e => setEmailInput(e.target.value)}
+          autoComplete='off'
+        />
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={handleClose}>{t('common.cancel')}</Button>
+        <Button
+          variant='contained'
+          color='error'
+          onClick={handleDisable}
+          disabled={loading || !canConfirm}
+          startIcon={loading ? <CircularProgress size={16} /> : <i className='ri-lock-unlock-line' />}
+        >
+          {t('twoFactor.disableButton')}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+/* --------------------------------
+   Require / Cancel 2FA-requirement Dialog
+   (non-destructive — simple confirm, no email typing)
+-------------------------------- */
+
+function Require2FADialog({ open, mode, onClose, user, onSuccess, t }) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  const isRequire = mode === 'require'
+  const titleKey = isRequire ? 'twoFactor.adminRequireConfirmTitle' : 'twoFactor.adminClearRequirementConfirmTitle'
+  const bodyKey = isRequire ? 'twoFactor.adminRequireConfirmBody' : 'twoFactor.adminClearRequirementConfirmBody'
+  const path = isRequire ? 'require' : 'clear-requirement'
+
+  const handleConfirm = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch(`/api/v1/admin/users/${user.id}/2fa/${path}`, {
+        method: 'POST',
+      })
+      if (res.ok) {
+        onSuccess(user.id, isRequire)
+        onClose()
+        return
+      }
+      let data = {}
+      try { data = await res.json() } catch (_) {}
+      setError(data.error || t('common.error'))
+    } catch (_) {
+      setError(t('errors.connectionError'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleClose = () => {
+    setError('')
+    onClose()
+  }
+
+  return (
+    <Dialog open={open} onClose={handleClose} maxWidth='sm' fullWidth>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className={isRequire ? 'ri-shield-keyhole-line' : 'ri-shield-cross-line'} />
+        {t(titleKey, { email: user?.email || '' })}
+      </DialogTitle>
+      <DialogContent sx={{ pt: '20px !important' }}>
+        {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+        <Typography>{t(bodyKey)}</Typography>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={handleClose}>{t('common.cancel')}</Button>
+        <Button
+          variant='contained'
+          onClick={handleConfirm}
+          disabled={loading}
+          startIcon={loading ? <CircularProgress size={16} /> : null}
+        >
+          {t('common.confirm')}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+/* --------------------------------
+   Admin Sessions Tab (super-admin only)
+
+   Every live session in the installation, across every tenant — a
+   deliberate reversal of the "count only" boundary the sibling
+   admin/users/[id]/sessions route still documents. Gated purely by the
+   parent only mounting this when useRBAC().isAdmin is true; the API route
+   re-checks with requireSuperAdminCaller() regardless.
+-------------------------------- */
+
+function AdminSessionsTab({ t }) {
+  const { data, error: fetchError, isLoading, mutate } = useAdminSessions(true)
+  // Only used to hand the caller's id to RevokeSessionsDialog, which decides
+  // whether a revoke-all targets the caller themselves (warning + redirect).
+  const { data: session } = useSession()
+  const sessions = data?.data || []
+  const truncated = data?.truncated === true
+  const loadError = fetchError ? t('errors.connectionError') : ''
+
+  const [revokeDialogOpen, setRevokeDialogOpen] = useState(false)
+  const [sessionToRevoke, setSessionToRevoke] = useState(null)
+
+  const handleRevoke = (row) => {
+    setSessionToRevoke(row)
+    setRevokeDialogOpen(true)
+  }
+
+  const handleRevoked = useCallback((sessionId) => {
+    // Optimistically drop the row without a full network round-trip.
+    // mutate() will reconcile on next SWR revalidation.
+    mutate(prev => {
+      if (!prev?.data) return prev
+      return { ...prev, data: prev.data.filter(s => s.id !== sessionId) }
+    }, false)
+  }, [mutate])
+
+  const [revokeAllDialogOpen, setRevokeAllDialogOpen] = useState(false)
+  const [userToRevokeAll, setUserToRevokeAll] = useState(null)
+
+  const handleRevokeAllForUser = (row) => {
+    // RevokeSessionsDialog expects a user shape ({ id, email }); the sessions
+    // row carries both, under session-listing names.
+    setUserToRevokeAll({ id: row.userId, email: row.userEmail })
+    setRevokeAllDialogOpen(true)
+  }
+
+  const handleAllRevoked = useCallback((userId) => {
+    // Optimistically drop every session row of that user without a full
+    // network round-trip. mutate() will reconcile on next SWR revalidation.
+    mutate(prev => {
+      if (!prev?.data) return prev
+      return { ...prev, data: prev.data.filter(s => s.userId !== userId) }
+    }, false)
+  }, [mutate])
+
+  const [revokeEveryDialogOpen, setRevokeEveryDialogOpen] = useState(false)
+
+  const columns = useMemo(
+    () => [
+      {
+        field: 'userEmail',
+        headerName: t('sessions.userHeader'),
+        flex: 1,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+            <Typography variant='body2' noWrap sx={{ fontWeight: 600 }}>{params.row.userEmail}</Typography>
+            {/* The listing is "every session in the installation", including the
+                caller's own — mark it the way the profile card marks its current
+                session, so a revoke click here is never a surprise. */}
+            {params.row.current && (
+              <Chip label={t('sessions.currentChip')} size='small' color='success' />
+            )}
+          </Box>
+        ),
+      },
+      {
+        field: 'tenantName',
+        headerName: t('sessions.tenantHeader'),
+        width: 160,
+        renderCell: params => (
+          <Typography variant='body2' noWrap>{params.row.tenantName}</Typography>
+        ),
+      },
+      {
+        field: 'createdAt',
+        headerName: t('sessions.signedInLabel'),
+        width: 160,
+        renderCell: params => (
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {new Date(params.row.createdAt).toLocaleString()}
+          </Typography>
+        ),
+      },
+      {
+        field: 'lastSeenAt',
+        headerName: t('sessions.lastActiveLabel'),
+        width: 150,
+        renderCell: params => (
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {timeAgo(params.row.lastSeenAt, t)}
+          </Typography>
+        ),
+      },
+      {
+        field: 'ipAddress',
+        headerName: t('sessions.ipLabel'),
+        width: 140,
+        renderCell: params => (
+          // No monospace on the IP — project-wide convention.
+          <Typography variant='body2'>{params.row.ipAddress || t('common.unknown')}</Typography>
+        ),
+      },
+      {
+        field: 'device',
+        headerName: t('sessions.deviceHeader'),
+        width: 170,
+        sortable: false,
+        renderCell: params => {
+          const parts = [params.row.browser, params.row.os].filter(Boolean)
+          const label = parts.length > 0 ? parts.join(' · ') : t('common.unknown')
+          return (
+            <Tooltip title={params.row.userAgent || t('common.unknown')} slotProps={tooltipSlotProps}>
+              {/* No monospace on the device label — project-wide convention. */}
+              <Typography variant='body2' noWrap>{label}</Typography>
+            </Tooltip>
+          )
+        },
+      },
+      {
+        field: 'actions',
+        headerName: t('common.actions'),
+        width: 110,
+        sortable: false,
+        renderCell: params => (
+          <>
+            <Tooltip title={t('sessions.adminRevokeOneMenu')}>
+              <IconButton
+                size='small'
+                color='warning'
+                onClick={() => handleRevoke(params.row)}
+              >
+                {/* circle-r = THIS session (same icon as the profile card's
+                    single revoke); box = ALL sessions of the row's user. */}
+                <i className='ri-logout-circle-r-line' />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('sessions.adminRevokeMenu')}>
+              <IconButton
+                size='small'
+                color='warning'
+                onClick={() => handleRevokeAllForUser(params.row)}
+              >
+                <i className='ri-logout-box-line' />
+              </IconButton>
+            </Tooltip>
+          </>
+        ),
+      },
+    ],
+    [t]
+  )
+
+  return (
+    <>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+        <Typography variant='body2' sx={{ opacity: 0.6 }}>
+          {sessions.length} {t('sessions.columnHeader').toLowerCase()}
+        </Typography>
+        {/* Visible whenever anything is revocable — one session or a
+            hundred. The DELETE is total (caller included), so even a lone
+            own session is a valid target; the dialog says so and the
+            confirm ends on the /login redirect. */}
+        {sessions.length > 0 && (
+          <Button
+            variant='outlined'
+            color='error'
+            size='small'
+            startIcon={<i className='ri-logout-box-line' />}
+            onClick={() => setRevokeEveryDialogOpen(true)}
+          >
+            {t('sessions.adminRevokeEveryButton')}
+          </Button>
+        )}
+      </Box>
+
+      {loadError && <Alert severity='error' sx={{ mb: 2 }}>{loadError}</Alert>}
+      {truncated && <Alert severity='warning' sx={{ mb: 2 }}>{t('sessions.adminAllTruncatedWarning')}</Alert>}
+
+      <Box sx={{ flex: 1, minHeight: 400 }}>
+        {!isLoading && sessions.length === 0 && !loadError ? (
+          <EmptyState
+            icon='ri-device-line'
+            title={t('sessions.adminAllEmptyTitle')}
+            description={t('sessions.adminAllEmptyDesc')}
+            size='large'
+          />
+        ) : (
+          <DataGrid
+            rows={sessions}
+            columns={columns}
+            loading={isLoading}
+            pageSizeOptions={[10, 25, 50]}
+            disableRowSelectionOnClick
+            rowHeight={52}
+            columnHeaderHeight={40}
+            sx={{
+              border: 'none',
+              '& .MuiDataGrid-cell': {
+                display: 'flex',
+                alignItems: 'center',
+                overflow: 'hidden',
+              },
+              '& .MuiDataGrid-columnHeaders': {
+                borderBottom: '1px solid',
+                borderColor: 'divider',
+              },
+            }}
+          />
+        )}
+      </Box>
+
+      <RevokeSingleSessionDialog
+        open={revokeDialogOpen}
+        onClose={() => setRevokeDialogOpen(false)}
+        session={sessionToRevoke}
+        onSuccess={handleRevoked}
+        t={t}
+      />
+
+      <RevokeSessionsDialog
+        open={revokeAllDialogOpen}
+        onClose={() => setRevokeAllDialogOpen(false)}
+        user={userToRevokeAll}
+        onSuccess={handleAllRevoked}
+        currentUserId={session?.user?.id}
+        t={t}
+      />
+
+      <RevokeEverySessionDialog
+        open={revokeEveryDialogOpen}
+        onClose={() => setRevokeEveryDialogOpen(false)}
+        t={t}
+      />
+    </>
+  )
+}
+
+/* --------------------------------
+   Main Page
+-------------------------------- */
+
+export default function UsersPage() {
+  const { data: session } = useSession()
+  const t = useTranslations()
+  const { hasFeature } = useLicense()
+  const { isAdmin } = useRBAC()
+  const showRbac = hasFeature(Features.RBAC)
+  const showTenants = hasFeature(Features.MULTI_TENANCY)
+  // Cross-tenant management (list every user, edit memberships from the
+  // user dialog) is only allowed from the provider tenant. Tenant-scoped
+  // sessions stay limited to their own scope. Community editions never
+  // load the tenants list.
+  const isInDefaultTenant = (session?.user?.tenantId || 'default') === 'default'
+  const enableTenantMgmt = showTenants && isInDefaultTenant
+  const [activeTab, setActiveTab] = useState(0)
+
+  // The Sessions tab (index 1) only exists for super admins. Derived rather
+  // than reset via an effect (a synchronous setState in a bare useEffect
+  // triggers react-hooks/set-state-in-effect and an extra render): if
+  // isAdmin is false — on load before RBAC resolves, or because the flag
+  // flips while that tab is active — this renders tab 0 immediately,
+  // without ever landing on a blank card for tab 1.
+  const effectiveTab = isAdmin ? activeTab : 0
+
+  const { setPageInfo } = usePageTitle()
+
+  useEffect(() => {
+    setPageInfo(t('navigation.users'), t('security.users'), 'ri-user-line')
+
+return () => setPageInfo('', '', '')
+  }, [setPageInfo, t])
+
+  // SWR data fetching
+  const { data: usersData, error: usersError, isLoading: usersLoading, mutate: mutateUsers } = useUsers()
+  const { data: assignmentsData, mutate: mutateAssignments } = useRbacAssignments()
+  const { data: rolesData } = useRbacRoles(showRbac)
+  const { data: tenantsData } = useTenants(enableTenantMgmt)
+  const tenantsList = tenantsData?.data || []
+
+  // Combine users with their RBAC role assignments
+  const users = useMemo(() => {
+    const rawUsers = usersData?.data || []
+    const assignments = assignmentsData?.data || []
+
+    return rawUsers.map(user => {
+      const userAssignments = assignments.filter(a => (a.user?.id || a.user_id) === user.id)
+
+      return {
+        ...user,
+        roles: userAssignments.map(a => ({
+          id: a.role?.id || a.role_id,
+          name: a.role?.name || a.role_name,
+          color: a.role?.color || a.role_color,
+          tenant_id: a.tenant_id || null,
+          tenant_name: a.tenant_name || null,
+          assignment_id: a.id,
+          scope_type: a.scope_type,
+          scope_target: a.scope_target
+        }))
+      }
+    })
+  }, [usersData, assignmentsData])
+
+  const rbacRoles = rolesData?.data || []
+  const loading = usersLoading
+  const error = usersError ? (usersError.message || t('errors.loadingError')) : ''
+
+  // Revalidate all data after mutations (create/edit/delete)
+  const revalidateAll = useCallback(() => {
+    mutateUsers()
+    mutateAssignments()
+  }, [mutateUsers, mutateAssignments])
+
+  // Dialogs
+  const [userDialogOpen, setUserDialogOpen] = useState(false)
+  const [selectedUser, setSelectedUser] = useState(null)
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [userToDelete, setUserToDelete] = useState(null)
+
+  const handleEdit = (user) => {
+    setSelectedUser(user)
+    setUserDialogOpen(true)
+  }
+
+  const handleDelete = (user) => {
+    setUserToDelete(user)
+    setDeleteDialogOpen(true)
+  }
+
+  const handleAdd = () => {
+    setSelectedUser(null)
+    setUserDialogOpen(true)
+  }
+
+  const [disable2FADialogOpen, setDisable2FADialogOpen] = useState(false)
+  const [userToDisable2FA, setUserToDisable2FA] = useState(null)
+
+  const handleDisable2FA = (user) => {
+    setUserToDisable2FA(user)
+    setDisable2FADialogOpen(true)
+  }
+
+  const handle2FADisabled = useCallback((userId) => {
+    // Optimistically flip totp_enabled to false for the row without a full
+    // network round-trip. mutateUsers() will reconcile on next SWR revalidation.
+    mutateUsers(prev => {
+      if (!prev?.data) return prev
+      return {
+        ...prev,
+        data: prev.data.map(u => u.id === userId ? { ...u, totp_enabled: false } : u),
+      }
+    }, false)
+  }, [mutateUsers])
+
+  const [require2FADialogOpen, setRequire2FADialogOpen] = useState(false)
+  const [require2FADialogMode, setRequire2FADialogMode] = useState('require') // 'require' | 'clear'
+  const [userToRequire2FA, setUserToRequire2FA] = useState(null)
+
+  const handleRequire2FA = (user) => {
+    setUserToRequire2FA(user)
+    setRequire2FADialogMode('require')
+    setRequire2FADialogOpen(true)
+  }
+
+  const handleClearRequire2FA = (user) => {
+    setUserToRequire2FA(user)
+    setRequire2FADialogMode('clear')
+    setRequire2FADialogOpen(true)
+  }
+
+  const handle2FARequirementChanged = useCallback((userId, isRequired) => {
+    mutateUsers(prev => {
+      if (!prev?.data) return prev
+      return {
+        ...prev,
+        data: prev.data.map(u => u.id === userId ? { ...u, require_2fa_enrollment: isRequired } : u),
+      }
+    }, false)
+  }, [mutateUsers])
+
+  const columns = useMemo(
+    () => [
+      {
+        field: 'email',
+        headerName: t('usersPage.emailHeader'),
+        flex: 1,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minWidth: 0, width: '100%' }}>
+            <Box
+              sx={{
+                width: 32,
+                height: 32,
+                borderRadius: '50%',
+                bgcolor: 'action.hover',
+                color: 'text.secondary',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              <i className='ri-user-line' style={{ fontSize: 16 }} />
+            </Box>
+            <Box sx={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', minWidth: 0 }}>
+              <Typography variant='body2' noWrap sx={{ fontWeight: 600, lineHeight: 1.3 }}>{params.row.email}</Typography>
+              {params.row.name && (
+                <Typography variant='caption' noWrap sx={{ opacity: 0.6, lineHeight: 1.2 }}>{params.row.name}</Typography>
+              )}
+            </Box>
+          </Box>
+        ),
+      },
+      // Colonne RBAC - seulement si la feature est disponible
+      ...(showRbac ? [{
+        field: 'roles',
+        headerName: t('navigation.rbacRoles'),
+        width: 200,
+        renderCell: params => <RoleChip roles={params.row.roles} t={t} />,
+      }] : []),
+      // Tenants (multi-tenancy view) - Enterprise only.
+      ...(showTenants ? [{
+        field: 'tenants',
+        headerName: t('usersPage.tenantsHeader'),
+        width: 240,
+        sortable: false,
+        renderCell: params => {
+          // Super admins are members of every tenant by design — listing
+          // 1 000 chips would cripple the row. Render a single capped chip
+          // that conveys the rule, and skip the per-tenant breakdown.
+          if (params.row.is_super_admin) {
+            return (
+              <Tooltip title={t('usersPage.tenantsAllTooltip')}>
+                <Chip
+                  size='small'
+                  label={t('usersPage.tenantsAll')}
+                  color='primary'
+                  variant='filled'
+                  icon={<i className='ri-shield-keyhole-line' style={{ fontSize: 14 }} />}
+                />
+              </Tooltip>
+            )
+          }
+          const list = Array.isArray(params.row.tenants) ? params.row.tenants : []
+          if (list.length === 0) {
+            return <Typography variant='body2' sx={{ opacity: 0.5, fontStyle: 'italic' }}>{t('usersPage.tenantsNone')}</Typography>
+          }
+          // Cap chip rendering at 3 to keep row height stable — anything
+          // beyond gets folded into a "+N" chip whose tooltip lists the
+          // overflow names so you can still inspect on demand.
+          const visible = list.slice(0, 3)
+          const overflow = list.slice(3)
+          return (
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', alignItems: 'center', minWidth: 0 }}>
+              {visible.map(t2 => (
+                <Chip
+                  key={t2.id}
+                  size='small'
+                  label={t2.name}
+                  color={t2.isDefault ? 'primary' : 'default'}
+                  variant={t2.isDefault ? 'filled' : 'outlined'}
+                />
+              ))}
+              {overflow.length > 0 && (
+                <Tooltip title={overflow.map(t2 => t2.name).join(', ')}>
+                  <Chip
+                    size='small'
+                    label={`+${overflow.length}`}
+                    variant='outlined'
+                    sx={{ opacity: 0.8 }}
+                  />
+                </Tooltip>
+              )}
+            </Box>
+          )
+        },
+      }] : []),
+      {
+        field: 'auth_provider',
+        headerName: t('usersPage.authHeader'),
+        width: 100,
+        renderCell: params => <AuthProviderChip provider={params.row.auth_provider} t={t} />,
+      },
+      {
+        field: 'totp_enabled',
+        headerName: t('twoFactor.columnHeader'),
+        width: 70,
+        sortable: true,
+        renderCell: params => {
+          const tooltipSlot = {
+            tooltip: {
+              sx: {
+                bgcolor: 'background.paper',
+                color: 'text.primary',
+                border: '1px solid',
+                borderColor: 'divider',
+                boxShadow: 1,
+              },
+            },
+          }
+          if (params.row.totp_enabled) {
+            return (
+              <Tooltip title={t('twoFactor.statusEnabled')} slotProps={tooltipSlot}>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%' }}>
+                  <i className='ri-shield-check-line' style={{ fontSize: 18, color: '#22c55e' }} />
+                </Box>
+              </Tooltip>
+            )
+          }
+          if (params.row.require_2fa_enrollment) {
+            return (
+              <Tooltip title={t('twoFactor.requirementPending')} slotProps={tooltipSlot}>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%' }}>
+                  <i className='ri-time-line' style={{ fontSize: 18, color: '#f59e0b' }} />
+                </Box>
+              </Tooltip>
+            )
+          }
+          return (
+            <Typography variant='body2' sx={{ opacity: 0.35, textAlign: 'center', width: '100%' }}>
+              {'–'}
+            </Typography>
+          )
+        },
+      },
+      {
+        field: 'enabled',
+        headerName: t('common.status'),
+        width: 100,
+        renderCell: params => (
+          <Chip
+            size='small'
+            label={params.row.enabled ? t('common.active') : t('common.inactive')}
+            color={params.row.enabled ? 'success' : 'default'}
+            variant='outlined'
+          />
+        ),
+      },
+      {
+        field: 'last_login_at',
+        headerName: t('audit.actions.login'),
+        width: 160,
+        renderCell: params => (
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {timeAgo(params.row.last_login_at, t)}
+          </Typography>
+        ),
+      },
+      {
+        field: 'created_at',
+        headerName: t('common.date'),
+        width: 120,
+        renderCell: params => (
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {new Date(params.row.created_at).toLocaleDateString()}
+          </Typography>
+        ),
+      },
+      {
+        field: 'active_session_count',
+        headerName: t('sessions.columnHeader'),
+        width: 90,
+        sortable: true,
+        renderCell: params => (
+          <Typography
+            variant='body2'
+            sx={{ textAlign: 'center', width: '100%', opacity: params.row.active_session_count ? 0.85 : 0.35 }}
+          >
+            {params.row.active_session_count ?? 0}
+          </Typography>
+        ),
+      },
+      {
+        field: 'actions',
+        headerName: t('common.actions'),
+        width: 120,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', gap: 0.5 }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => handleEdit(params.row)}>
+                <i className='ri-edit-line' />
+              </IconButton>
+            </Tooltip>
+            {/* Disable 2FA: only visible when the row has 2FA enabled and is not the current session user */}
+            {params.row.totp_enabled && params.row.id !== session?.user?.id && (
+              <Tooltip title={t('twoFactor.adminDisableMenu')}>
+                <IconButton
+                  size='small'
+                  color='warning'
+                  onClick={() => handleDisable2FA(params.row)}
+                >
+                  <i className='ri-lock-unlock-line' />
+                </IconButton>
+              </Tooltip>
+            )}
+            {/* Require 2FA: only visible when the row has NO 2FA AND no pending requirement AND is not the current session user */}
+            {!params.row.totp_enabled && !params.row.require_2fa_enrollment && params.row.id !== session?.user?.id && (
+              <Tooltip title={t('twoFactor.adminRequireMenu')}>
+                <IconButton
+                  size='small'
+                  color='info'
+                  onClick={() => handleRequire2FA(params.row)}
+                >
+                  <i className='ri-shield-keyhole-line' />
+                </IconButton>
+              </Tooltip>
+            )}
+            {/* Cancel 2FA requirement: only visible when the row has a pending requirement (and no 2FA yet) */}
+            {!params.row.totp_enabled && params.row.require_2fa_enrollment && params.row.id !== session?.user?.id && (
+              <Tooltip title={t('twoFactor.adminClearRequirementMenu')}>
+                <IconButton
+                  size='small'
+                  color='inherit'
+                  onClick={() => handleClearRequire2FA(params.row)}
+                >
+                  <i className='ri-shield-cross-line' />
+                </IconButton>
+              </Tooltip>
+            )}
+            {/* Hide delete on your own row — self-delete is refused by the backend */}
+            {params.row.id !== session?.user?.id && (
+              <Tooltip title={t('common.delete')}>
+                <IconButton
+                  size='small'
+                  color='error'
+                  onClick={() => handleDelete(params.row)}
+                >
+                  <i className='ri-delete-bin-line' />
+                </IconButton>
+              </Tooltip>
+            )}
+          </Box>
+        ),
+      },
+    ],
+    [t, showRbac, showTenants, session?.user?.id, handleDisable2FA, handleRequire2FA, handleClearRequire2FA]
+  )
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+      <Card variant='outlined' sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <Tabs value={effectiveTab} onChange={(e, v) => setActiveTab(v)} sx={{ borderBottom: 1, borderColor: 'divider' }}>
+          <Tab label={t('navigation.users')} icon={<i className='ri-user-line' />} iconPosition='start' />
+          {isAdmin && (
+            <Tab label={t('sessions.adminAllTab')} icon={<i className='ri-device-line' />} iconPosition='start' />
+          )}
+        </Tabs>
+
+        <CardContent sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          {effectiveTab === 0 && (
+            <>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                <Typography variant='body2' sx={{ opacity: 0.6 }}>
+                  {users.length} {t('navigation.users').toLowerCase()}
+                </Typography>
+                <Button
+                  variant='contained'
+                  size='small'
+                  startIcon={<i className='ri-add-line' />}
+                  onClick={handleAdd}
+                >
+                  {t('common.add')}
+                </Button>
+              </Box>
+
+              {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
+
+              <Box sx={{ flex: 1, minHeight: 400 }}>
+                {!loading && users.length === 0 && !error ? (
+                  <EmptyState
+                    icon="ri-user-line"
+                    title={t('emptyState.noUsers')}
+                    description={t('emptyState.noUsersDesc')}
+                    action={{ label: t('common.add'), onClick: handleAdd, icon: 'ri-add-line' }}
+                    size="large"
+                  />
+                ) : (
+                  <DataGrid
+                    rows={users}
+                    columns={columns}
+                    loading={loading}
+                    pageSizeOptions={[10, 25, 50]}
+                    disableRowSelectionOnClick
+                    rowHeight={52}
+                    columnHeaderHeight={40}
+                    sx={{
+                      border: 'none',
+                      '& .MuiDataGrid-cell': {
+                        display: 'flex',
+                        alignItems: 'center',
+                        overflow: 'hidden',
+                      },
+                      '& .MuiDataGrid-columnHeaders': {
+                        borderBottom: '1px solid',
+                        borderColor: 'divider',
+                      },
+                    }}
+                  />
+                )}
+              </Box>
+            </>
+          )}
+          {effectiveTab === 1 && <AdminSessionsTab t={t} />}
+        </CardContent>
+      </Card>
+
+      {/* Dialogs */}
+      <UserDialog
+        open={userDialogOpen}
+        onClose={() => setUserDialogOpen(false)}
+        user={selectedUser}
+        onSave={revalidateAll}
+        rbacRoles={rbacRoles}
+        t={t}
+        showRbac={showRbac}
+        currentUserId={session?.user?.id}
+        currentSessionTenantId={session?.user?.tenantId || 'default'}
+        enableTenantMgmt={enableTenantMgmt}
+        tenantsList={tenantsList}
+      />
+
+      <DeleteDialog
+        open={deleteDialogOpen}
+        onClose={() => setDeleteDialogOpen(false)}
+        user={userToDelete}
+        onConfirm={revalidateAll}
+        currentUserId={session?.user?.id}
+        t={t}
+      />
+
+      <Disable2FADialog
+        open={disable2FADialogOpen}
+        onClose={() => setDisable2FADialogOpen(false)}
+        user={userToDisable2FA}
+        onSuccess={handle2FADisabled}
+        t={t}
+      />
+
+      <Require2FADialog
+        open={require2FADialogOpen}
+        mode={require2FADialogMode}
+        onClose={() => setRequire2FADialogOpen(false)}
+        user={userToRequire2FA}
+        onSuccess={handle2FARequirementChanged}
+        t={t}
+      />
+    </Box>
+  )
+}

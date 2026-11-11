@@ -1,0 +1,50 @@
+import { NextResponse } from "next/server"
+import { unisphereFetch } from "@/lib/esage/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+
+export const runtime = "nodejs"
+
+export async function GET(
+  _req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  const { id, node } = await ctx.params
+
+  const denied = await checkPermission(PERMISSIONS.NODE_VIEW, "connection", id)
+  if (denied) return denied
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  try {
+    // Récupérer la liste des mises à jour disponibles
+    const updates = await unisphereFetch<any[]>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/apt/update`
+    )
+
+    // Récupérer aussi la version eSage du nœud
+    const version = await unisphereFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/version`
+    )
+
+    return NextResponse.json({
+      data: {
+        updates: updates || [],
+        count: updates?.length || 0,
+        version: version?.version || null,
+        release: version?.release || null,
+      }
+    })
+  } catch (error: any) {
+    console.error(`Error fetching updates for node ${node}:`, error)
+    return NextResponse.json({ 
+      error: error.message || "Failed to fetch updates",
+      data: { updates: [], count: 0, version: null, release: null }
+    }, { status: 500 })
+  }
+}

@@ -1,0 +1,685 @@
+'use client'
+
+import { nebulaMetricColor } from '@/lib/theme/nebulaMetricColor'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { useTranslations, useLocale } from 'next-intl'
+
+import {
+  Dialog,
+  DialogContent,
+  DialogActions,
+  Button,
+  TextField,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  FormControlLabel,
+  Checkbox,
+  Box,
+  Typography,
+  Alert,
+  CircularProgress,
+  Divider,
+  Chip,
+  IconButton,
+  InputAdornment,
+  Tooltip,
+  useTheme,
+} from '@mui/material'
+
+import { formatBytes } from '@/utils/format'
+import { formatDateTime } from '@/lib/i18n/date'
+import { VM_DISK_FORMATS, vmDiskFormats } from '@/lib/esage/storage'
+import AppDialogTitle from '@/components/ui/AppDialogTitle'
+import { type NodeInfo, calculateNodeScore, formatMemory, fetchNextVmid } from './utils'
+import { useTenant } from '@/contexts/TenantContext'
+
+// ==================== CLONE VM DIALOG ====================
+type CloneVmDialogProps = {
+  open: boolean
+  onClose: () => void
+  onClone: (params: { targetNode: string; newVmid: number; name: string; targetStorage?: string; format?: string; pool?: string; full: boolean; snapname?: string }) => Promise<void>
+  connId: string
+  currentNode: string
+  vmName: string
+  vmid: string
+  vmType?: string  // 'qemu' | 'lxc' — needed to read the source snapshots
+  nextVmid: number
+  pools?: string[]
+  existingVmids?: number[]  // Liste des VMIDs déjà utilisés
+}
+
+export function CloneVmDialog({ open, onClose, onClone, connId, currentNode, vmName, vmid, vmType, nextVmid, pools = [], existingVmids = [] }: CloneVmDialogProps) {
+  const t = useTranslations()
+  const locale = useLocale()
+  const theme = useTheme()
+  const isDark = theme.palette.mode === 'dark'
+  // Tenant admins get a single-field "name only" form. Placement,
+  // storage, VMID and pool are auto-resolved server-side (clone route
+  // already calls resolveVdcForTenant + forces pool to vDC pool), so
+  // we just hide the controls and ship sensible defaults.
+  const { currentTenant, loading: tenantLoading, isFullClusterView } = useTenant()
+  const isProviderTenant = !tenantLoading && isFullClusterView
+
+  // MSP tenant VMID range (null when no enforcement applies)
+  const tenantVmidRange = useMemo(() => {
+    const start = currentTenant?.vmidRangeStart
+    const end = currentTenant?.vmidRangeEnd
+    return typeof start === 'number' && typeof end === 'number' ? { start, end } : null
+  }, [currentTenant])
+
+  const [cloning, setCloning] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const [storages, setStorages] = useState<{ storage: string; type: string; avail?: number; total?: number; shared?: number; formats?: string[]; defaultFormat?: string }[]>([])
+  const [resourcePools, setResourcePools] = useState<{ poolid: string; comment?: string }[]>([])
+  const [nodesLoading, setNodesLoading] = useState(false)
+  const [storagesLoading, setStoragesLoading] = useState(false)
+  const [poolsLoading, setPoolsLoading] = useState(false)
+
+  // Form fields
+  const [targetNode, setTargetNode] = useState(currentNode)
+  const [newVmid, setNewVmid] = useState<number | ''>('' )
+  // Once the user types a VMID by hand, the async /cluster/nextid prefill must
+  // not clobber it (the field is visible+editable in the provider view). Reset
+  // on each open.
+  const userEditedVmidRef = useRef(false)
+  const [name, setName] = useState('')
+  const [targetStorage, setTargetStorage] = useState('')
+  const [format, setFormat] = useState('qcow2')
+
+  // A full clone allocates on the target storage, so the format has to be one
+  // that storage accepts: qcow2 on a plain LVM target used to fail outright,
+  // and a UNISPHERE 9 LVM storage with snapshot-as-volume-chain does take it
+  // (issue #735). The API answers per storage; older payloads fall back to the
+  // type-based table.
+  const selectedTargetStorageObj = useMemo(
+    () => storages.find(s => s.storage === targetStorage),
+    [storages, targetStorage]
+  )
+  const supportedFormats = useMemo(
+    () => {
+      // No target storage picked yet: the Select is disabled, but its value
+      // still has to be in range or MUI warns.
+      if (!selectedTargetStorageObj) return [...VM_DISK_FORMATS]
+
+      return selectedTargetStorageObj.formats?.length
+        ? selectedTargetStorageObj.formats
+        : vmDiskFormats({ type: selectedTargetStorageObj.type }).formats
+    },
+    [selectedTargetStorageObj]
+  )
+
+  useEffect(() => {
+    if (!selectedTargetStorageObj) return
+
+    setFormat(selectedTargetStorageObj.defaultFormat || vmDiskFormats({ type: selectedTargetStorageObj.type }).defaultFormat)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetStorage, selectedTargetStorageObj])
+  const [pool, setPool] = useState('')
+  const [fullClone, setFullClone] = useState(true)
+
+  // Snapshot source — clone from a snapshot restore point (PDM parity).
+  // UNISPHERE's clone API accepts an optional `snapname`; empty = current state.
+  const [snapshots, setSnapshots] = useState<{ name: string; snaptime?: number; vmstate?: boolean }[]>([])
+  const [snapname, setSnapname] = useState('')
+  const [snapshotsLoading, setSnapshotsLoading] = useState(false)
+
+  // Suggest the cluster's next free VMID (UNISPHERE /cluster/nextid), mirroring the
+  // "New VM" screen. Region-based infras assign VMIDs sequentially, so a random
+  // id (the old behaviour) broke their scheme — see #543. Falls back to the
+  // parent's nextVmid estimate if the endpoint is unavailable.
+  const generateNextVmid = async () => {
+    const id = await fetchNextVmid(connId)
+
+    setNewVmid(id ?? (nextVmid || ''))
+  }
+
+  // Validation du VMID
+  const vmidError = useMemo(() => {
+    if (newVmid === '' || newVmid === 0) return t('hardware.vmIdRequired')
+    if (newVmid < 100) return t('hardware.vmIdMinimum')
+    if (newVmid > 999999999) return t('hardware.vmIdTooLarge')
+    if (tenantVmidRange && (newVmid < tenantVmidRange.start || newVmid > tenantVmidRange.end))
+      return t('hardware.vmIdOutOfRange', { start: tenantVmidRange.start, end: tenantVmidRange.end })
+    if (existingVmids.includes(newVmid)) return t('hardware.vmIdAlreadyUsed', { id: newVmid })
+
+    return null
+  }, [newVmid, existingVmids, t, tenantVmidRange])
+
+  // Charger les nodes du cluster
+  useEffect(() => {
+    if (!open || !connId) return
+
+    const loadNodes = async () => {
+      setNodesLoading(true)
+
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes`)
+        const json = await res.json()
+
+        if (json.data && Array.isArray(json.data)) {
+          const availableNodes = json.data
+            .filter((n: NodeInfo) => n.status === 'online')
+            .map((n: NodeInfo) => ({
+              node: n.node,
+              status: n.status,
+              cpu: n.cpu,
+              maxcpu: n.maxcpu,
+              mem: n.mem,
+              maxmem: n.maxmem
+            }))
+
+          setNodes(availableNodes)
+        }
+      } catch (e: any) {
+        console.error('Error loading nodes:', e)
+      } finally {
+        setNodesLoading(false)
+      }
+    }
+
+    loadNodes()
+  }, [open, connId])
+
+  // Charger les pools de ressources
+  useEffect(() => {
+    if (!open || !connId) return
+
+    const loadPools = async () => {
+      setPoolsLoading(true)
+
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/pools`)
+        const json = await res.json()
+
+        if (json.data && Array.isArray(json.data)) {
+          setResourcePools(json.data.map((p: any) => ({
+            poolid: p.poolid,
+            comment: p.comment
+          })))
+        }
+      } catch (e: any) {
+        console.error('Error loading pools:', e)
+
+
+        // Si l'API n'existe pas ou échoue, utiliser les pools passés en props
+        if (pools.length > 0) {
+          setResourcePools(pools.map(p => ({ poolid: p })))
+        }
+      } finally {
+        setPoolsLoading(false)
+      }
+    }
+
+    loadPools()
+  }, [open, connId, pools])
+
+  // Charger les storages du node cible
+  useEffect(() => {
+    if (!open || !connId || !targetNode) return
+
+    const loadStorages = async () => {
+      setStoragesLoading(true)
+
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(targetNode)}/storages`)
+        const json = await res.json()
+
+        if (json.data && Array.isArray(json.data)) {
+          const diskStorages = json.data
+            .filter((s: any) =>
+              s.content?.includes('images') || s.type === 'zfspool' || s.type === 'lvmthin' || s.type === 'lvm' || s.type === 'dir' || s.type === 'nfs' || s.type === 'cifs' || s.type === 'rbd'
+            )
+            .map((s: any) => ({
+              storage: s.storage,
+              type: s.type,
+              avail: s.avail,
+              total: s.total,
+              shared: s.shared,
+              formats: s.formats,
+              defaultFormat: s.defaultFormat
+            }))
+
+          setStorages(diskStorages)
+        }
+      } catch (e: any) {
+        console.error('Error loading storages:', e)
+      } finally {
+        setStoragesLoading(false)
+      }
+    }
+
+    loadStorages()
+
+    // Reset storage when node changes
+    setTargetStorage('')
+  }, [open, connId, targetNode])
+
+  // Charger les snapshots de la VM source (pour cloner depuis un point de
+  // restauration). Lus depuis le node source (currentNode), pas le node cible.
+  useEffect(() => {
+    if (!open || !connId || !vmType || !vmid || !currentNode) return
+    let cancelled = false
+
+    const loadSnapshots = async () => {
+      setSnapshotsLoading(true)
+
+      try {
+        const vmKey = `${connId}:${vmType}:${currentNode}:${vmid}`
+        const res = await fetch(`/api/v1/guests/${encodeURIComponent(vmKey)}/snapshots`, { cache: 'no-store' })
+        const json = await res.json()
+        const list = json?.data?.snapshots
+
+        if (!cancelled && Array.isArray(list)) {
+          setSnapshots(list.map((s: any) => ({
+            name: s.name,
+            snaptime: s.snaptime,
+            vmstate: s.vmstate,
+          })))
+        }
+      } catch {
+        // Tolerate — without a snapshot list we simply hide the picker.
+      } finally {
+        if (!cancelled) setSnapshotsLoading(false)
+      }
+    }
+
+    loadSnapshots()
+
+    return () => { cancelled = true }
+  }, [open, connId, vmType, vmid, currentNode])
+
+  // Reset form when dialog opens
+  useEffect(() => {
+    if (open) {
+      setTargetNode(currentNode)
+      // Seed the VMID with the caller's next-free estimate for both views; the
+      // /cluster/nextid effect below then overrides it with the authoritative
+      // cluster value. Tenants never see the field (auto-picked), providers get
+      // it pre-filled so cloning defaults to a sequential id instead of random.
+      userEditedVmidRef.current = false
+      setNewVmid(nextVmid || '')
+      setName('')
+      setTargetStorage('')
+      setFormat('qcow2')
+      setPool('')
+      setFullClone(true)
+      setSnapname('')
+      setError(null)
+    }
+  }, [open, currentNode, nextVmid])
+
+  // Both views: hit /cluster/nextid for a cluster-validated VMID instead of
+  // relying on Math.max(allVms) computed at the parent — that snapshot can be
+  // stale or local-cluster-only and would collide with VMIDs on another node
+  // we never saw. Falls back to the parent's nextVmid if the API fails (e.g.
+  // orchestrator hiccup).
+  useEffect(() => {
+    if (!open || !connId) return
+    let cancelled = false
+    ;(async () => {
+      const id = await fetchNextVmid(connId)
+
+      // Bail if the dialog closed or the user already typed their own VMID.
+      if (cancelled || userEditedVmidRef.current) return
+      if (id !== null) setNewVmid(id)
+      // Range likely exhausted (the API refused): don't substitute the
+      // parent's estimate — it can only be out of range or stale.
+      else if (tenantVmidRange) setNewVmid('')
+      else if (nextVmid) setNewVmid(nextVmid)
+    })()
+
+    return () => { cancelled = true }
+  }, [open, connId, nextVmid, tenantVmidRange])
+
+  const getRecommendedNodeLocal = (nodeList: NodeInfo[]): NodeInfo | null => {
+    if (nodeList.length === 0) return null
+
+return nodeList.reduce((best, current) => {
+      const bestScore = calculateNodeScore(best)
+      const currentScore = calculateNodeScore(current)
+
+
+return currentScore > bestScore ? current : best
+    }, nodeList[0])
+  }
+
+  const handleClone = async () => {
+    if (newVmid === '' || vmidError) {
+      setError(vmidError || t('hardware.vmIdRequired'))
+      return
+    }
+
+    setCloning(true)
+    setError(null)
+
+    try {
+      await onClone({
+        targetNode,
+        newVmid: newVmid as number,
+        name,
+        targetStorage: targetStorage || undefined,
+        format: targetStorage ? format : undefined,
+        pool: pool || undefined,
+        full: fullClone,
+        snapname: snapname || undefined
+      })
+      onClose()
+    } catch (e: any) {
+      setError(e.message || t('hardware.cloneError'))
+    } finally {
+      setCloning(false)
+    }
+  }
+
+  const recommendedNode = getRecommendedNodeLocal(nodes)
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+      <AppDialogTitle onClose={onClose} icon={<i className="ri-file-copy-line" style={{ fontSize: 24 }} />}>
+        {t('hardware.cloneTitle', { vmName, vmid })}
+      </AppDialogTitle>
+
+      <DialogContent>
+        {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+
+        {/* Clone-from-snapshot selector — only shown when the source VM has
+            snapshots. Empty value clones the current (live) state, otherwise
+            the clone is taken from the chosen snapshot's restore point. */}
+        {snapshots.length > 0 && (
+          <Box sx={{ mt: 2, mb: 2 }}>
+            <FormControl fullWidth size="small">
+              <InputLabel>Clone from</InputLabel>
+              <Select
+                value={snapname}
+                onChange={(e) => setSnapname(e.target.value)}
+                label="Clone from"
+                disabled={snapshotsLoading}
+                MenuProps={{ PaperProps: { sx: { maxHeight: 320 } } }}
+              >
+                <MenuItem value="">
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className="ri-focus-3-line" style={{ fontSize: 14, opacity: 0.7 }} />
+                    <Typography variant="body2">Current state</Typography>
+                  </Box>
+                </MenuItem>
+
+                <Divider sx={{ my: 0.5 }} />
+
+                {snapshots.map((s) => (
+                  <MenuItem key={s.name} value={s.name} sx={{ py: 0.75 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-camera-line" style={{ fontSize: 14, opacity: 0.7 }} />
+                      <Box>
+                        <Typography variant="body2" fontWeight={500}>{s.name}</Typography>
+                        {s.snaptime ? (
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.65rem' }}>
+                            {formatDateTime(s.snaptime * 1000, locale)}
+                          </Typography>
+                        ) : null}
+                      </Box>
+                    </Box>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          </Box>
+        )}
+
+        {/* Tenant view — single name field. Target node stays the source
+            node, target storage falls back to "same as source", VMID is
+            auto-picked from /cluster/nextid (passed in via nextVmid prop),
+            and the pool is forced server-side from the tenant's vDC. */}
+        {!isProviderTenant ? (
+          <Box sx={{ py: 3 }}>
+            <TextField
+              size="small"
+              fullWidth
+              label="Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t('hardware.optional')}
+              autoFocus
+            />
+          </Box>
+        ) : (
+        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mt: 1 }}>
+          {/* Target Node */}
+          <FormControl fullWidth size="small">
+            <InputLabel>Target node</InputLabel>
+            <Select
+              // The seeded currentNode is not among the options until the async
+              // /nodes fetch lands, and MUI warns loudly about an out-of-range
+              // value. Show nothing until its option exists; the field is
+              // disabled while loading, so the user cannot lose a choice.
+              value={nodes.some(n => n.node === targetNode) ? targetNode : ''}
+              onChange={(e) => setTargetNode(e.target.value)}
+              label="Target node"
+              disabled={nodesLoading}
+              MenuProps={{ PaperProps: { sx: { maxHeight: 300 } } }}
+            >
+              {nodes.map((node) => {
+                const cpuPercent = (node.cpu || 0) * 100
+                const memPercent = node.maxmem && node.mem ? (node.mem / node.maxmem) * 100 : 0
+                const isRecommended = recommendedNode?.node === node.node
+
+                return (
+                  <MenuItem key={node.node} value={node.node} sx={{ py: 1 }}>
+                    <Box sx={{ width: '100%' }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <Box sx={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: 14, height: 14, flexShrink: 0 }}>
+                            <i className="ri-server-line" aria-hidden="true" style={{ fontSize: 14, opacity: 0.8 }} />
+                            <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 7, height: 7, borderRadius: '50%', bgcolor: 'success.main', border: '1.5px solid', borderColor: 'background.paper' }} />
+                          </Box>
+                          <Typography variant="body2" fontWeight={500}>{node.node}</Typography>
+                          {isRecommended && (
+                            <Chip label="★" size="small" color="success" sx={{ height: 16, fontSize: '0.6rem', minWidth: 20, '& .MuiChip-label': { px: 0.5 } }} />
+                          )}
+                        </Box>
+                        <Typography variant="caption" sx={{ opacity: 0.6 }}>{node.maxcpu}c</Typography>
+                      </Box>
+                      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <Typography variant="caption" sx={{ fontSize: '0.65rem', opacity: 0.7, minWidth: 28 }}>CPU</Typography>
+                          <Box className="nebula-usage-track" sx={{ flex: 1, height: 3, bgcolor: 'action.hover', borderRadius: 0.5, overflow: 'hidden' }}>
+                            <Box className="nebula-usage-fill" sx={{ '--nebula-progress-color': nebulaMetricColor(cpuPercent > 80 ? 'error.main' : cpuPercent > 60 ? 'warning.main' : 'success.main', 'cpu'), height: '100%', width: `${cpuPercent}%`, bgcolor: cpuPercent > 80 ? 'error.main' : cpuPercent > 60 ? 'warning.main' : 'success.main' }} />
+                          </Box>
+                          <Typography variant="caption" sx={{ fontSize: '0.6rem', opacity: 0.6, minWidth: 24 }}>{cpuPercent.toFixed(0)}%</Typography>
+                        </Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <Typography variant="caption" sx={{ fontSize: '0.65rem', opacity: 0.7, minWidth: 28 }}>RAM</Typography>
+                          <Box className="nebula-usage-track" sx={{ flex: 1, height: 3, bgcolor: 'action.hover', borderRadius: 0.5, overflow: 'hidden' }}>
+                            <Box className="nebula-usage-fill" sx={{ '--nebula-progress-color': nebulaMetricColor(memPercent > 80 ? 'error.main' : memPercent > 60 ? 'warning.main' : 'success.main', 'memory'), height: '100%', width: `${memPercent}%`, bgcolor: memPercent > 80 ? 'error.main' : memPercent > 60 ? 'warning.main' : 'success.main' }} />
+                          </Box>
+                          <Typography variant="caption" sx={{ fontSize: '0.6rem', opacity: 0.6, minWidth: 24 }}>{memPercent.toFixed(0)}%</Typography>
+                        </Box>
+                      </Box>
+                    </Box>
+                  </MenuItem>
+                )
+              })}
+            </Select>
+          </FormControl>
+
+          {/* Target Storage */}
+          <FormControl fullWidth size="small">
+            <InputLabel>Target Storage</InputLabel>
+            <Select
+              value={targetStorage}
+              onChange={(e) => setTargetStorage(e.target.value)}
+              label="Target Storage"
+              disabled={storagesLoading}
+              MenuProps={{ PaperProps: { sx: { maxHeight: 350 } } }}
+            >
+              <MenuItem value="">
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <i className="ri-link" style={{ fontSize: 14, opacity: 0.7 }} />
+                  <Typography variant="body2">Same as source</Typography>
+                </Box>
+              </MenuItem>
+
+              {storages.length > 0 && <Divider sx={{ my: 0.5 }} />}
+
+              {storages.map((s) => {
+                const usedPercent = s.total && s.avail ? ((s.total - s.avail) / s.total) * 100 : 0
+
+                return (
+                  <MenuItem key={s.storage} value={s.storage} sx={{ py: 1 }}>
+                    <Box sx={{ width: '100%' }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <i className="ri-hard-drive-2-line" style={{ fontSize: 14, opacity: 0.7 }} />
+                          <Typography variant="body2" fontWeight={500}>{s.storage}</Typography>
+                        </Box>
+                        <Chip
+                          label={s.type}
+                          size="small"
+                          variant="outlined"
+                          sx={{ height: 16, fontSize: '0.6rem', '& .MuiChip-label': { px: 0.5 } }}
+                        />
+                      </Box>
+                      {!!s.total && (
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Box className="nebula-usage-track" sx={{ flex: 1, height: 3, bgcolor: 'action.hover', borderRadius: 0.5, overflow: 'hidden' }}>
+                            <Box className="nebula-usage-fill" sx={{ '--nebula-progress-color': nebulaMetricColor(usedPercent > 90 ? 'error.main' : usedPercent > 75 ? 'warning.main' : 'success.main', 'storage'),
+                              height: '100%',
+                              width: `${usedPercent}%`,
+                              bgcolor: usedPercent > 90 ? 'error.main' : usedPercent > 75 ? 'warning.main' : 'success.main'
+                            }} />
+                          </Box>
+                          <Typography variant="caption" sx={{ fontSize: '0.6rem', opacity: 0.7, minWidth: 100, textAlign: 'right' }}>
+                            {formatBytes(s.avail)} / {formatBytes(s.total)}
+                          </Typography>
+                        </Box>
+                      )}
+                    </Box>
+                  </MenuItem>
+                )
+              })}
+            </Select>
+          </FormControl>
+
+          {/* VM ID */}
+          <TextField
+            size="small"
+            label="VM ID"
+            type="number"
+            value={newVmid}
+            onChange={(e) => { userEditedVmidRef.current = true; setNewVmid(e.target.value === '' ? '' : (Number.parseInt(e.target.value) || 0)) }}
+            inputProps={{ min: 100, max: 999999999 }}
+            placeholder={t('hardware.vmIdPlaceholder')}
+            required
+            error={newVmid !== '' && !!vmidError}
+            helperText={newVmid !== '' ? vmidError : undefined}
+            InputProps={{
+              endAdornment: (
+                <InputAdornment position="end">
+                  <Tooltip title={t('hardware.generateVmId')}>
+                    <IconButton size="small" onClick={generateNextVmid} edge="end">
+                      <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+                    </IconButton>
+                  </Tooltip>
+                </InputAdornment>
+              )
+            }}
+          />
+
+          {/* Format */}
+          <FormControl fullWidth size="small" disabled={!targetStorage || supportedFormats.length < 2}>
+            <InputLabel>Format</InputLabel>
+            <Select value={format} onChange={(e) => setFormat(e.target.value)} label="Format">
+              {supportedFormats.map(fmt => (
+                <MenuItem key={fmt} value={fmt}>
+                  {fmt === 'qcow2' ? 'QEMU image format (qcow2)' : fmt === 'raw' ? 'Raw disk image (raw)' : 'VMware image format (vmdk)'}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          {/* Name */}
+          <TextField
+            size="small"
+            label="Name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t('hardware.optional')}
+          />
+
+          {/* Resource Pool */}
+          <FormControl fullWidth size="small">
+            <InputLabel>Resource Pool</InputLabel>
+            <Select
+              value={pool}
+              onChange={(e) => setPool(e.target.value)}
+              label="Resource Pool"
+              disabled={poolsLoading}
+            >
+              <MenuItem value="">
+                <Typography variant="body2" sx={{ opacity: 0.7 }}>{t('hardware.none')}</Typography>
+              </MenuItem>
+              {resourcePools.map((p) => (
+                <MenuItem key={p.poolid} value={p.poolid}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className="ri-folder-line" style={{ fontSize: 14, opacity: 0.7 }} />
+                    <Box>
+                      <Typography variant="body2">{p.poolid}</Typography>
+                      {p.comment && (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.65rem' }}>
+                          {p.comment}
+                        </Typography>
+                      )}
+                    </Box>
+                  </Box>
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </Box>
+        )}
+
+        {/* Mode de clonage — provider only. Tenants get a silent
+            fullClone=true (set in the reset effect) since the linked-clone
+            distinction depends on the source being a template, which is a
+            placement detail abstracted away from the tenant view. */}
+        {isProviderTenant && (
+        <Box sx={{ mt: 2 }}>
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={fullClone}
+                onChange={(e) => setFullClone(e.target.checked)}
+                size="small"
+              />
+            }
+            label={
+              <Box>
+                <Typography variant="body2">Full Clone</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {fullClone
+                    ? t('hardware.fullCopyDescription')
+                    : t('hardware.linkedCloneDescription')}
+                </Typography>
+              </Box>
+            }
+          />
+        </Box>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ px: 3, pb: 2 }}>
+        <Button onClick={onClose} disabled={cloning}>{t('hardware.cancel')}</Button>
+        <Button
+          variant="contained"
+          onClick={handleClone}
+          disabled={cloning || newVmid === '' || !!vmidError}
+          startIcon={cloning ? <CircularProgress size={16} /> : <i className="ri-file-copy-line" />}
+        >
+          {cloning ? t('hardware.cloning') : t('hardware.clone')}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}

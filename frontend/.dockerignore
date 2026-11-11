@@ -1,0 +1,44 @@
+# Dependencies
+node_modules
+.pnpm-store
+
+# Build outputs
+.next
+out
+build
+dist
+
+# Local migration references (not part of the active application)
+default
+old
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Testing
+coverage
+.nyc_output
+
+# Misc
+*.log
+*.md
+!README.md
+.DS_Store
+Thumbs.db
+
+# Environment files (will be provided via Docker)
+.env
+.env.*
+!.env.example
+
+# Data directories
+data/
+*.db
+*.db-journal

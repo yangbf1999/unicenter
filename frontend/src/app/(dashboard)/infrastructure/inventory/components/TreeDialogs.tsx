@@ -1,0 +1,1274 @@
+'use client'
+
+import React from 'react'
+import { useTranslations } from 'next-intl'
+
+import {
+  Alert,
+  Box,
+  Button,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputLabel,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
+  Select,
+  Snackbar,
+  Switch,
+  TextField,
+  Typography,
+} from '@mui/material'
+import { alpha } from '@mui/material/styles'
+
+import EntityTagManager from './EntityTagManager'
+import { MigrateVmDialog, CrossClusterMigrateParams } from '@/components/MigrateVmDialog'
+import { CloneVmDialog } from '@/components/hardware/CloneVmDialog'
+import { usedVmidsOnConnection, nextVmidOnConnection } from '@/components/hardware/utils'
+import { crossClusterMigrate } from '@/lib/migration/crossClusterMigrate'
+import { NodeIcon, ClusterIcon, StatusIcon } from './TreeIcons'
+import { useTenant } from '@/contexts/TenantContext'
+
+// RemixIcon replacements used in context menus / dialogs.
+// Rendered through Box so `sx={{ color: 'warning.main' }}` resolves against the
+// theme. A bare <i style={{ color: 'warning.main' }}> is an invalid CSS value
+// that browsers drop in silence, which is how several of these icons ended up
+// uncoloured while others carried a raw hex.
+const RemixIcon = ({ name, fontSize, sx, style }: { name: string; fontSize?: string; sx?: any; style?: React.CSSProperties }) => (
+  <Box component="i" className={name} style={style} sx={{ fontSize: fontSize === 'small' ? 18 : 20, lineHeight: 1, ...sx }} />
+)
+
+const PlayArrowIcon = (props: any) => <RemixIcon name="ri-play-fill" {...props} />
+const StopIcon = (props: any) => <RemixIcon name="ri-stop-fill" {...props} />
+const PowerSettingsNewIcon = (props: any) => <RemixIcon name="ri-shut-down-line" {...props} />
+const PauseIcon = (props: any) => <RemixIcon name="ri-pause-fill" {...props} />
+
+// One icon column for every context-menu row: a single size for all of them, and
+// a tone taken from the theme palette rather than the brighter MUI defaults the
+// menu used to mix in.
+const MenuIcon = ({ name, tone = 'text.secondary' }: { name: string; tone?: string }) => (
+  <Box
+    component="i"
+    className={name}
+    sx={{ fontSize: 16, lineHeight: 1, color: tone, width: 16, display: 'inline-flex', justifyContent: 'center', flexShrink: 0 }}
+  />
+)
+
+// Shared shell for the three context menus: inset rows with a rounded hover, one
+// exact icon gutter, and dividers that separate without cutting the card in two.
+const contextMenuPaperSx = {
+  minWidth: 232,
+  maxWidth: 320,
+  borderRadius: 2,
+  py: 0.5,
+  '& .MuiMenuItem-root': {
+    mx: 0.75,
+    px: 1,
+    py: 0.5,
+    gap: 1.25,
+    minHeight: 34,
+    borderRadius: 1,
+  },
+  '& .MuiListItemIcon-root': { minWidth: 0 },
+  '& .MuiListItemText-primary': { fontSize: '0.8125rem' },
+  '& .MuiDivider-root': { mx: 1, my: 0.5 },
+} as const
+
+// Menu title: the subject of the actions below, not another row to click. Wears
+// the theme accent so the card reads as titled, and sits on the same left edge
+// and icon gutter as the rows underneath. It carries the tint, so no divider.
+const ContextMenuHeader = ({ icon, label, hint }: { icon: React.ReactNode; label?: string; hint?: string }) => (
+  <Box
+    sx={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: 1.25,
+      mx: 0.75,
+      mb: 0.5,
+      px: 1,
+      py: 0.75,
+      borderRadius: 1,
+      bgcolor: theme => alpha(theme.palette.primary.main, 0.08),
+    }}
+  >
+    {icon}
+    <Typography
+      noWrap
+      sx={{ minWidth: 0, fontSize: '0.8125rem', fontWeight: 600, color: 'primary.main', letterSpacing: '0.01em' }}
+    >
+      {label}
+    </Typography>
+    {hint && (
+      <Typography sx={{ fontSize: '0.6875rem', color: 'primary.main', opacity: 0.65, ml: 'auto', pl: 1 }}>
+        {hint}
+      </Typography>
+    )}
+  </Box>
+)
+
+// ----- Types used by context menus / dialogs -----
+
+type VmContextMenu = {
+  mouseX: number
+  mouseY: number
+  connId: string
+  node: string
+  type: string
+  vmid: string
+  name: string
+  status?: string
+  isCluster: boolean
+  template?: boolean
+  sshEnabled?: boolean
+} | null
+
+type NodeContextMenu = {
+  mouseX: number
+  mouseY: number
+  connId: string
+  node: string
+  maintenance?: string
+  sshEnabled?: boolean
+} | null
+
+type TreeCluster = {
+  connId: string
+  name: string
+  isCluster: boolean
+  cephHealth?: string
+  sshEnabled?: boolean
+  nodes: {
+    node: string
+    status?: string
+    ip?: string
+    maintenance?: string
+    cpu?: number
+    mem?: number
+    maxmem?: number
+    vms: { type: string; vmid: string; name: string; status?: string; cpu?: number; mem?: number; maxmem?: number; disk?: number; maxdisk?: number; uptime?: number; pool?: string; tags?: string; template?: boolean; hastate?: string; hagroup?: string }[]
+  }[]
+}
+
+export interface TreeDialogsProps {
+  // VM context menu
+  contextMenu: VmContextMenu
+  handleCloseContextMenu: () => void
+  actionBusy: boolean
+  handleVmAction: (action: string) => void
+  unlocking: boolean
+
+  // VM action confirmation dialog
+  vmActionConfirm: { action: string; name: string } | null
+  setVmActionConfirm: React.Dispatch<React.SetStateAction<{ action: string; name: string } | null>>
+  executeVmAction: (action: string) => void
+
+  // VM action error dialog
+  vmActionError: string | null
+  setVmActionError: React.Dispatch<React.SetStateAction<string | null>>
+
+  // Clone
+  cloneDialogOpen: boolean
+  setCloneDialogOpen: React.Dispatch<React.SetStateAction<boolean>>
+  cloneTarget: VmContextMenu
+  setCloneTarget: React.Dispatch<React.SetStateAction<VmContextMenu>>
+  handleCloneVm: (params: { targetNode: string; newVmid: number; name: string; targetStorage?: string; format?: string; pool?: string; full: boolean }) => Promise<void>
+  allVms: { vmid: string; [key: string]: any }[]
+
+  // Template conversion
+  templateDialogOpen: boolean
+  setTemplateDialogOpen: React.Dispatch<React.SetStateAction<boolean>>
+  templateTarget: VmContextMenu
+  setTemplateTarget: React.Dispatch<React.SetStateAction<VmContextMenu>>
+  convertingTemplate: boolean
+  handleConvertToTemplate: () => Promise<void>
+
+  // Migrate
+  migrateDialogOpen: boolean
+  setMigrateDialogOpen: React.Dispatch<React.SetStateAction<boolean>>
+  migrateTarget: VmContextMenu
+  setMigrateTarget: React.Dispatch<React.SetStateAction<VmContextMenu>>
+  setReloadTick: React.Dispatch<React.SetStateAction<number>>
+
+  // Snapshot
+  snapshotDialogOpen: boolean
+  setSnapshotDialogOpen: React.Dispatch<React.SetStateAction<boolean>>
+  snapshotTarget: { connId: string; type: string; node: string; vmid: string } | null
+  setSnapshotTarget: React.Dispatch<React.SetStateAction<{ connId: string; type: string; node: string; vmid: string } | null>>
+  snapshotName: string
+  setSnapshotName: React.Dispatch<React.SetStateAction<string>>
+  snapshotDesc: string
+  setSnapshotDesc: React.Dispatch<React.SetStateAction<string>>
+  snapshotVmstate: boolean
+  setSnapshotVmstate: React.Dispatch<React.SetStateAction<boolean>>
+  creatingSnapshot: boolean
+  executeSnapshot: () => Promise<void>
+
+  // Backup
+  backupDialogOpen: boolean
+  setBackupDialogOpen: React.Dispatch<React.SetStateAction<boolean>>
+  backupTarget: { connId: string; type: string; node: string; vmid: string; name: string } | null
+  setBackupTarget: React.Dispatch<React.SetStateAction<{ connId: string; type: string; node: string; vmid: string; name: string } | null>>
+  backupStorages: any[]
+  backupStorage: string
+  setBackupStorage: React.Dispatch<React.SetStateAction<string>>
+  backupMode: string
+  setBackupMode: React.Dispatch<React.SetStateAction<string>>
+  backupCompress: string
+  setBackupCompress: React.Dispatch<React.SetStateAction<string>>
+  backupLoading: boolean
+  executeBackupNow: () => Promise<void>
+
+  // Snackbar
+  snackbar: { open: boolean; message: string; severity: 'success' | 'error' | 'info' }
+  setSnackbar: React.Dispatch<React.SetStateAction<{ open: boolean; message: string; severity: 'success' | 'error' | 'info' }>>
+
+  // Unlock error dialog
+  unlockErrorDialog: { open: boolean; error: string; hint?: string }
+  setUnlockErrorDialog: React.Dispatch<React.SetStateAction<{ open: boolean; error: string; hint?: string }>>
+
+  // Shell dialog
+  shellDialog: { open: boolean; connId: string; node: string; loading: boolean; data: any | null; error: string | null }
+  setShellDialog: React.Dispatch<React.SetStateAction<{ open: boolean; connId: string; node: string; loading: boolean; data: any | null; error: string | null }>>
+
+  // Tag management dialog
+  tagDialog: { type: 'connection' | 'host'; entityId: string; connId?: string; node?: string; name: string; nodeStatus?: string; nodeMaintenance?: string; clusterNodes?: { status?: string }[] } | null
+  setTagDialog: React.Dispatch<React.SetStateAction<{ type: 'connection' | 'host'; entityId: string; connId?: string; node?: string; name: string; nodeStatus?: string; nodeMaintenance?: string; clusterNodes?: { status?: string }[] } | null>>
+  tagDialogTags: string[]
+  setTagDialogTags: React.Dispatch<React.SetStateAction<string[]>>
+
+  // Cluster context menu
+  clusterContextMenu: { mouseX: number; mouseY: number; connId: string; name: string; nodes: { status?: string }[] } | null
+  setClusterContextMenu: React.Dispatch<React.SetStateAction<{ mouseX: number; mouseY: number; connId: string; name: string; nodes: { status?: string }[] } | null>>
+  openTagDialog: (type: 'connection' | 'host', entityId: string, name: string, connId?: string, node?: string, extra?: { nodeStatus?: string; nodeMaintenance?: string; clusterNodes?: { status?: string }[] }) => void
+
+  // Node context menu
+  nodeContextMenu: NodeContextMenu
+  handleCloseNodeContextMenu: () => void
+  handleMaintenanceClick: () => void
+  handleBulkActionClick: (action: 'start-all' | 'shutdown-all' | 'migrate-all') => void
+  handleOpenShell: (connId: string, node: string) => void
+  onCreateVm?: (connId: string, node: string) => void
+  onCreateLxc?: (connId: string, node: string) => void
+  onNodeAction?: (connId: string, node: string, action: 'reboot' | 'shutdown') => void
+  clusters: TreeCluster[]
+
+  // Maintenance dialog
+  maintenanceBusy: boolean
+  maintenanceTarget: { connId: string; node: string; maintenance?: string } | null
+  setMaintenanceTarget: React.Dispatch<React.SetStateAction<{ connId: string; node: string; maintenance?: string } | null>>
+  maintenanceError: string | null
+  handleMaintenanceConfirm: () => Promise<void>
+  getNodeVms: (connId: string, nodeName: string) => any[]
+  getOtherNodes: (connId: string, nodeName: string) => string[]
+
+  // RBAC
+  isAdmin: boolean
+
+  // Bulk action dialog
+  bulkActionDialog: { open: boolean; action: 'start-all' | 'shutdown-all' | 'migrate-all' | null; connId: string; node: string; targetNode: string }
+  setBulkActionDialog: React.Dispatch<React.SetStateAction<{ open: boolean; action: 'start-all' | 'shutdown-all' | 'migrate-all' | null; connId: string; node: string; targetNode: string }>>
+  bulkActionBusy: boolean
+  handleBulkActionConfirm: () => Promise<void>
+
+  // Snapshot handler
+  handleTakeSnapshot: () => void
+  // Backup handler
+  handleBackupNow: () => Promise<void>
+  // Console handler
+  handleOpenConsole: () => void
+  // Unlock handler
+  handleUnlock: () => Promise<void>
+}
+
+export default function TreeDialogs(props: TreeDialogsProps) {
+  const t = useTranslations()
+  // Migration is allowed for provider AND MSP tenants (full-cluster view).
+  // vDC / iaas tenants cannot migrate (placement is the provider's job).
+  // MSP users only see connections they own; the backend enforces ownership.
+  const { loading: tenantLoading, isFullClusterView } = useTenant()
+
+  const {
+    contextMenu, handleCloseContextMenu, actionBusy, handleVmAction, unlocking,
+    vmActionConfirm, setVmActionConfirm, executeVmAction,
+    vmActionError, setVmActionError,
+    cloneDialogOpen, setCloneDialogOpen, cloneTarget, setCloneTarget, handleCloneVm, allVms,
+    templateDialogOpen, setTemplateDialogOpen, templateTarget, setTemplateTarget, convertingTemplate, handleConvertToTemplate,
+    migrateDialogOpen, setMigrateDialogOpen, migrateTarget, setMigrateTarget, setReloadTick,
+    snapshotDialogOpen, setSnapshotDialogOpen, snapshotTarget, setSnapshotTarget,
+    snapshotName, setSnapshotName, snapshotDesc, setSnapshotDesc, snapshotVmstate, setSnapshotVmstate,
+    creatingSnapshot, executeSnapshot,
+    backupDialogOpen, setBackupDialogOpen, backupTarget, setBackupTarget,
+    backupStorages, backupStorage, setBackupStorage, backupMode, setBackupMode,
+    backupCompress, setBackupCompress, backupLoading, executeBackupNow,
+    snackbar, setSnackbar,
+    unlockErrorDialog, setUnlockErrorDialog,
+    shellDialog, setShellDialog,
+    tagDialog, setTagDialog, tagDialogTags, setTagDialogTags,
+    clusterContextMenu, setClusterContextMenu, openTagDialog,
+    nodeContextMenu, handleCloseNodeContextMenu, handleMaintenanceClick, handleBulkActionClick, handleOpenShell,
+    onCreateVm, onCreateLxc, onNodeAction, clusters, isAdmin,
+    maintenanceBusy, maintenanceTarget, setMaintenanceTarget, maintenanceError,
+    handleMaintenanceConfirm, getNodeVms, getOtherNodes,
+    bulkActionDialog, setBulkActionDialog, bulkActionBusy, handleBulkActionConfirm,
+    handleTakeSnapshot, handleBackupNow, handleOpenConsole, handleUnlock,
+  } = props
+
+  return (
+    <>
+      {/* Menu contextuel VM */}
+      <Menu
+        open={contextMenu !== null}
+        onClose={handleCloseContextMenu}
+        anchorReference="anchorPosition"
+        anchorPosition={
+          contextMenu !== null
+            ? { top: contextMenu.mouseY, left: contextMenu.mouseX }
+            : undefined
+        }
+        slotProps={{ paper: { sx: contextMenuPaperSx } }}
+      >
+        {/* Header du menu: le VMID à droite, l'identifiant que porte l'arbre */}
+        <ContextMenuHeader
+          // Same status-dotted icon as the tree row the menu was opened from.
+          icon={contextMenu ? (
+            <StatusIcon
+              type="vm"
+              vmType={contextMenu.type}
+              template={contextMenu.template}
+              status={contextMenu.status}
+              size={16}
+            />
+          ) : null}
+          label={contextMenu?.name}
+          hint={contextMenu?.vmid}
+        />
+
+        {/* Menu pour TEMPLATE */}
+        {contextMenu?.template && (
+          <MenuItem
+            onClick={() => {
+              setCloneTarget(contextMenu)
+              setCloneDialogOpen(true)
+              handleCloseContextMenu()
+            }}
+            disabled={actionBusy}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-file-copy-line" tone="primary.main" />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.clone')}</ListItemText>
+          </MenuItem>
+        )}
+
+        {/* Actions de contrôle pour VM normale */}
+        {!contextMenu?.template && [
+          /* --- Power actions --- */
+          <MenuItem
+            key="start"
+            onClick={() => handleVmAction('start')}
+            disabled={actionBusy || contextMenu?.status === 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-play-fill" tone="success.main" />
+            </ListItemIcon>
+            <ListItemText>{contextMenu?.status === 'paused' ? t('vmActions.resume') : t('audit.actions.start')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="pause"
+            onClick={() => handleVmAction('suspend')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-pause-fill" tone="info.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.pause')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="hibernate"
+            onClick={() => handleVmAction('hibernate')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-zzz-line" tone="info.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.hibernate')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="shutdown"
+            onClick={() => handleVmAction('shutdown')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-shut-down-line" tone="warning.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventoryPage.shutdownClean')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="stop"
+            onClick={() => handleVmAction('stop')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-stop-fill" tone="error.main" />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.stop')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="reboot"
+            onClick={() => handleVmAction('reboot')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-restart-line" tone="warning.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.reboot')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="reset"
+            onClick={() => handleVmAction('reset')}
+            disabled={actionBusy || contextMenu?.status !== 'running'}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-loop-left-line" tone="error.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.reset')}</ListItemText>
+          </MenuItem>,
+
+          <Divider key="divider1" />,
+
+          /* --- Clone / Template --- */
+          <MenuItem
+            key="clone"
+            onClick={() => {
+              setCloneTarget(contextMenu)
+              setCloneDialogOpen(true)
+              handleCloseContextMenu()
+            }}
+            disabled={actionBusy}
+          >
+            <ListItemIcon>
+              <MenuIcon name="ri-file-copy-line" />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.clone')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem key="template" onClick={() => {
+            setTemplateTarget(contextMenu)
+            setTemplateDialogOpen(true)
+            handleCloseContextMenu()
+          }} disabled={actionBusy || contextMenu?.status === 'running'}>
+            <ListItemIcon>
+              <MenuIcon name="ri-file-copy-fill" />
+            </ListItemIcon>
+            <ListItemText>{t('templates.convertToTemplate')}</ListItemText>
+          </MenuItem>,
+
+          <Divider key="divider2" />,
+
+          /* --- Snapshot / Backup --- */
+          <MenuItem key="snapshot" onClick={handleTakeSnapshot} disabled={actionBusy}>
+            <ListItemIcon>
+              <MenuIcon name="ri-camera-line" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.takeSnapshot')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem key="backup" onClick={handleBackupNow} disabled={actionBusy}>
+            <ListItemIcon>
+              <MenuIcon name="ri-save-line" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.backupNow')}</ListItemText>
+          </MenuItem>,
+
+          <Divider key="divider3" />,
+
+          /* --- Console / Migrate / Unlock --- */
+          contextMenu?.isCluster && !tenantLoading && isFullClusterView ? (
+            <MenuItem
+              key="migrate"
+              onClick={() => {
+                setMigrateTarget(contextMenu)
+                setMigrateDialogOpen(true)
+                handleCloseContextMenu()
+              }}
+              disabled={actionBusy}
+            >
+              <ListItemIcon>
+                <MenuIcon name="ri-exchange-line" />
+              </ListItemIcon>
+              <ListItemText>{t('audit.actions.migrate')}</ListItemText>
+            </MenuItem>
+          ) : null,
+
+          <MenuItem key="console" onClick={handleOpenConsole} disabled={actionBusy}>
+            <ListItemIcon>
+              <MenuIcon name="ri-terminal-box-line" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.console')}</ListItemText>
+          </MenuItem>,
+
+          contextMenu?.sshEnabled ? (
+            <MenuItem key="unlock" onClick={handleUnlock} disabled={actionBusy || unlocking}>
+              <ListItemIcon>
+                <MenuIcon name="ri-lock-unlock-line" tone="warning.main" />
+              </ListItemIcon>
+              <ListItemText>{t('inventory.unlock')}</ListItemText>
+            </MenuItem>
+          ) : null
+        ]}
+      </Menu>
+
+      {/* Menu contextuel Cluster */}
+      <Menu
+        open={clusterContextMenu !== null}
+        onClose={() => setClusterContextMenu(null)}
+        anchorReference="anchorPosition"
+        anchorPosition={
+          clusterContextMenu !== null
+            ? { top: clusterContextMenu.mouseY, left: clusterContextMenu.mouseX }
+            : undefined
+        }
+        slotProps={{ paper: { sx: contextMenuPaperSx } }}
+      >
+        <ContextMenuHeader
+          icon={<ClusterIcon nodes={clusterContextMenu?.nodes || []} size={16} />}
+          label={clusterContextMenu?.name}
+        />
+        <MenuItem onClick={() => {
+          if (clusterContextMenu) openTagDialog('connection', clusterContextMenu.connId, clusterContextMenu.name, undefined, undefined, { clusterNodes: clusterContextMenu.nodes })
+          setClusterContextMenu(null)
+        }}>
+          <ListItemIcon>
+            <MenuIcon name="ri-price-tag-3-line" />
+          </ListItemIcon>
+          <ListItemText>{t('inventory.manageTags', { defaultMessage: 'Manage Tags' })}</ListItemText>
+        </MenuItem>
+      </Menu>
+
+      {/* Menu contextuel Node (maintenance) */}
+      <Menu
+        open={nodeContextMenu !== null}
+        onClose={handleCloseNodeContextMenu}
+        anchorReference="anchorPosition"
+        anchorPosition={
+          nodeContextMenu !== null
+            ? { top: nodeContextMenu.mouseY, left: nodeContextMenu.mouseX }
+            : undefined
+        }
+        slotProps={{ paper: { sx: contextMenuPaperSx } }}
+      >
+        <ContextMenuHeader
+          icon={<NodeIcon status={(() => {
+            if (!nodeContextMenu) return 'online'
+            const clu = clusters.find(c => c.connId === nodeContextMenu.connId)
+            const n = clu?.nodes.find(n => n.node === nodeContextMenu.node)
+            return n?.status || 'online'
+          })()} maintenance={nodeContextMenu?.maintenance} size={16} />}
+          label={nodeContextMenu?.node}
+        />
+        {onCreateVm && (
+          <MenuItem onClick={() => {
+            if (nodeContextMenu) onCreateVm(nodeContextMenu.connId, nodeContextMenu.node)
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-computer-line" tone="info.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.createVm.title')}</ListItemText>
+          </MenuItem>
+        )}
+        {onCreateLxc && (
+          <MenuItem onClick={() => {
+            if (nodeContextMenu) onCreateLxc(nodeContextMenu.connId, nodeContextMenu.node)
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-instance-line" tone="primary.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.createLxc.title')}</ListItemText>
+          </MenuItem>
+        )}
+        {isAdmin && [
+          <MenuItem key="shell" onClick={() => {
+            if (nodeContextMenu) handleOpenShell(nodeContextMenu.connId, nodeContextMenu.node)
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-terminal-box-line" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.tabShell')}</ListItemText>
+          </MenuItem>,
+          <Divider key="d-bulk" />,
+          <MenuItem key="bulk-start" onClick={() => handleBulkActionClick('start-all')}>
+            <ListItemIcon>
+              <MenuIcon name="ri-play-fill" tone="success.main" />
+            </ListItemIcon>
+            <ListItemText>{t('bulkActions.startAllVms')}</ListItemText>
+          </MenuItem>,
+          <MenuItem key="bulk-shutdown" onClick={() => handleBulkActionClick('shutdown-all')}>
+            <ListItemIcon>
+              <MenuIcon name="ri-shut-down-line" tone="warning.main" />
+            </ListItemIcon>
+            <ListItemText>{t('bulkActions.shutdownAllVms')}</ListItemText>
+          </MenuItem>,
+          !tenantLoading && isFullClusterView ? (
+            <MenuItem key="bulk-migrate" onClick={() => handleBulkActionClick('migrate-all')}>
+              <ListItemIcon>
+                <MenuIcon name="ri-exchange-line" />
+              </ListItemIcon>
+              <ListItemText>{t('bulkActions.migrateAllVms')}</ListItemText>
+            </MenuItem>
+          ) : null,
+          <Divider key="d-power" />,
+          <MenuItem key="reboot" onClick={() => {
+            if (nodeContextMenu) onNodeAction?.(nodeContextMenu.connId, nodeContextMenu.node, 'reboot')
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-restart-line" tone="warning.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.nodeReboot')}</ListItemText>
+          </MenuItem>,
+          <MenuItem key="shutdown" onClick={() => {
+            if (nodeContextMenu) onNodeAction?.(nodeContextMenu.connId, nodeContextMenu.node, 'shutdown')
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-shut-down-line" tone="error.main" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.nodeShutdown')}</ListItemText>
+          </MenuItem>,
+          <Divider key="d-maint" />,
+          <MenuItem
+            key="maintenance"
+            onClick={nodeContextMenu?.sshEnabled ? handleMaintenanceClick : undefined}
+            disabled={maintenanceBusy || !nodeContextMenu?.sshEnabled}
+          >
+            <ListItemIcon>
+              <MenuIcon
+                name={nodeContextMenu?.maintenance ? 'ri-play-circle-line' : 'ri-tools-fill'}
+                tone={nodeContextMenu?.maintenance ? 'success.main' : 'warning.main'}
+              />
+            </ListItemIcon>
+            <ListItemText>
+              {nodeContextMenu?.maintenance ? t('inventory.exitMaintenance') : t('inventory.enterMaintenance')}
+            </ListItemText>
+          </MenuItem>,
+          !nodeContextMenu?.sshEnabled ? (
+            <Box key="ssh-hint" sx={{ display: 'flex', alignItems: 'center', gap: 0.75, px: 1.75, pt: 0.25, pb: 1 }}>
+              <Box component="i" className="ri-ssh-line" sx={{ fontSize: 13, color: 'text.disabled' }} />
+              <Typography sx={{ fontSize: '0.6875rem', color: 'text.disabled' }}>
+                {t('inventory.maintenanceRequiresSsh')}
+              </Typography>
+            </Box>
+          ) : null,
+          <Divider key="d-tags" />,
+          <MenuItem key="tags" onClick={() => {
+            if (nodeContextMenu) {
+              const clu = clusters.find(c => c.connId === nodeContextMenu.connId)
+              const n = clu?.nodes.find(n => n.node === nodeContextMenu.node)
+              openTagDialog('host', '', nodeContextMenu.node, nodeContextMenu.connId, nodeContextMenu.node, { nodeStatus: n?.status, nodeMaintenance: nodeContextMenu.maintenance })
+            }
+            handleCloseNodeContextMenu()
+          }}>
+            <ListItemIcon>
+              <MenuIcon name="ri-price-tag-3-line" />
+            </ListItemIcon>
+            <ListItemText>{t('inventory.manageTags', { defaultMessage: 'Manage Tags' })}</ListItemText>
+          </MenuItem>,
+        ]}
+      </Menu>
+
+      {/* Dialog confirmation maintenance */}
+      {(() => {
+        const entering = maintenanceTarget && !maintenanceTarget.maintenance
+        const mSshEnabled = !!clusters.find(c => c.connId === maintenanceTarget?.connId)?.sshEnabled
+        return (
+        <Dialog
+          open={maintenanceTarget !== null}
+          onClose={() => { if (!maintenanceBusy) setMaintenanceTarget(null) }}
+          maxWidth="sm"
+          fullWidth
+        >
+          <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+            <Box sx={{
+              width: 40, height: 40, borderRadius: 2,
+              bgcolor: maintenanceTarget?.maintenance ? 'rgba(76,175,80,0.12)' : 'rgba(255,152,0,0.12)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center'
+            }}>
+              <i
+                className={maintenanceTarget?.maintenance ? 'ri-play-circle-line' : 'ri-tools-fill'}
+                style={{ fontSize: 22, color: maintenanceTarget?.maintenance ? '#4caf50' : '#ff9800' }}
+              />
+            </Box>
+            {maintenanceTarget?.maintenance ? t('inventory.exitMaintenance') : t('inventory.enterMaintenance')}
+          </DialogTitle>
+          <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <DialogContentText>
+              {maintenanceTarget?.maintenance
+                ? t('inventory.confirmExitMaintenance')
+                : t('inventory.confirmEnterMaintenance')}
+            </DialogContentText>
+
+            {/* Non-HA guests are not evacuated by node-maintenance; operator handles them */}
+            {entering && (
+              <Alert severity="warning" icon={<i className="ri-information-line" style={{ fontSize: 20 }} />}>
+                <Typography variant="body2">
+                  {t('inventory.maintenanceNonHaNote')}
+                </Typography>
+              </Alert>
+            )}
+
+            {!mSshEnabled && (
+              <Alert severity="warning" icon={<i className="ri-ssh-line" style={{ fontSize: 18 }} />}>
+                <Typography variant="body2">{t('inventory.maintenanceRequiresSsh')}</Typography>
+              </Alert>
+            )}
+
+            {maintenanceError && (
+              <Alert severity="error">{maintenanceError}</Alert>
+            )}
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
+            <Button
+              onClick={() => setMaintenanceTarget(null)}
+              color="inherit"
+              disabled={maintenanceBusy}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              onClick={handleMaintenanceConfirm}
+              variant="contained"
+              color={maintenanceTarget?.maintenance ? 'success' : 'warning'}
+              disabled={maintenanceBusy || !mSshEnabled}
+              startIcon={maintenanceBusy ? <CircularProgress size={16} /> : undefined}
+            >
+              {t('common.confirm')}
+            </Button>
+          </DialogActions>
+        </Dialog>
+        )
+      })()}
+
+      {/* Dialog confirmation bulk action */}
+      <Dialog
+        open={bulkActionDialog.open}
+        onClose={() => setBulkActionDialog({ open: false, action: null, connId: '', node: '', targetNode: '' })}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+          <Box sx={{
+            width: 40, height: 40, borderRadius: 2,
+            bgcolor: bulkActionDialog.action === 'start-all' ? 'rgba(76,175,80,0.12)' : bulkActionDialog.action === 'migrate-all' ? 'rgba(33,150,243,0.12)' : 'rgba(255,152,0,0.12)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}>
+            {bulkActionDialog.action === 'start-all' && <PlayArrowIcon fontSize="small" sx={{ color: 'success.main' }} />}
+            {bulkActionDialog.action === 'shutdown-all' && <PowerSettingsNewIcon fontSize="small" sx={{ color: 'warning.main' }} />}
+            {bulkActionDialog.action === 'migrate-all' && <RemixIcon name="ri-exchange-line" fontSize="small" sx={{ color: 'info.main' }} />}
+          </Box>
+          {bulkActionDialog.action === 'start-all' && t('bulkActions.startAllVms')}
+          {bulkActionDialog.action === 'shutdown-all' && t('bulkActions.shutdownAllVms')}
+          {bulkActionDialog.action === 'migrate-all' && t('bulkActions.migrateAllVms')}
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {bulkActionDialog.action === 'start-all' && t('bulkActions.confirmStartAll')}
+            {bulkActionDialog.action === 'shutdown-all' && t('bulkActions.confirmShutdownAll')}
+            {bulkActionDialog.action === 'migrate-all' && t('bulkActions.confirmMigrateAll')}
+          </DialogContentText>
+          <Typography variant="body2" fontWeight={600} sx={{ mt: 1.5 }}>
+            {t('inventory.node')}: {bulkActionDialog.node}
+          </Typography>
+          {bulkActionDialog.action === 'start-all' && (
+            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.6 }}>
+              {getNodeVms(bulkActionDialog.connId, bulkActionDialog.node).filter(v => v.status === 'stopped').length} VMs
+            </Typography>
+          )}
+          {bulkActionDialog.action === 'shutdown-all' && (
+            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.6 }}>
+              {getNodeVms(bulkActionDialog.connId, bulkActionDialog.node).filter(v => v.status === 'running').length} VMs
+            </Typography>
+          )}
+          {bulkActionDialog.action === 'migrate-all' && (
+            <FormControl fullWidth sx={{ mt: 2 }}>
+              <InputLabel size="small">{t('bulkActions.targetNode')}</InputLabel>
+              <Select
+                size="small"
+                value={bulkActionDialog.targetNode}
+                label={t('bulkActions.targetNode')}
+                onChange={(e) => setBulkActionDialog(prev => ({ ...prev, targetNode: e.target.value }))}
+              >
+                {getOtherNodes(bulkActionDialog.connId, bulkActionDialog.node).map(n => (
+                  <MenuItem key={n} value={n}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <NodeIcon status="online" size={14} />
+                      {n}
+                    </Box>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button
+            onClick={() => setBulkActionDialog({ open: false, action: null, connId: '', node: '', targetNode: '' })}
+            color="inherit"
+          >
+            {t('common.cancel')}
+          </Button>
+          <Button
+            onClick={handleBulkActionConfirm}
+            variant="contained"
+            color={bulkActionDialog.action === 'start-all' ? 'success' : bulkActionDialog.action === 'migrate-all' ? 'primary' : 'warning'}
+            disabled={bulkActionBusy || (bulkActionDialog.action === 'migrate-all' && !bulkActionDialog.targetNode)}
+            startIcon={bulkActionBusy ? <CircularProgress size={16} /> : undefined}
+          >
+            {t('common.confirm')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Dialog de clonage */}
+      {cloneTarget && (
+        <CloneVmDialog
+          open={cloneDialogOpen}
+          onClose={() => {
+            setCloneDialogOpen(false)
+            setCloneTarget(null)
+          }}
+          onClone={handleCloneVm}
+          connId={cloneTarget.connId}
+          currentNode={cloneTarget.node}
+          vmName={cloneTarget.name || `VM ${cloneTarget.vmid}`}
+          vmid={cloneTarget.vmid}
+          vmType={cloneTarget.type}
+          nextVmid={nextVmidOnConnection(allVms, cloneTarget.connId)}
+          existingVmids={usedVmidsOnConnection(allVms, cloneTarget.connId)}
+          pools={[]}
+        />
+      )}
+
+      {/* Dialog de conversion en template */}
+      <Dialog
+        open={templateDialogOpen}
+        onClose={() => !convertingTemplate && setTemplateDialogOpen(false)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <RemixIcon name="ri-file-copy-fill" sx={{ fontSize: 24, color: 'text.secondary' }} />
+          {t('templates.convertToTemplate')}
+        </DialogTitle>
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            {t('templates.convertWarning')}
+          </Alert>
+          {templateTarget && (
+            <Box sx={{ p: 2, bgcolor: 'action.hover', borderRadius: 2 }}>
+              <Typography variant="body2" sx={{ opacity: 0.7 }}>VM:</Typography>
+              <Typography variant="subtitle1" fontWeight={700}>
+                {templateTarget.name} <Typography component="span" variant="body2" sx={{ opacity: 0.6 }}>(ID: {templateTarget.vmid})</Typography>
+              </Typography>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setTemplateDialogOpen(false); setTemplateTarget(null) }} disabled={convertingTemplate}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleConvertToTemplate}
+            disabled={convertingTemplate}
+            startIcon={convertingTemplate ? <CircularProgress size={16} /> : null}
+          >
+            {convertingTemplate ? t('common.loading') : t('templates.convert')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Dialog de migration */}
+      {migrateTarget && (
+        <MigrateVmDialog
+          open={migrateDialogOpen}
+          onClose={() => {
+            setMigrateDialogOpen(false)
+            setMigrateTarget(null)
+          }}
+          connId={migrateTarget.connId}
+          currentNode={migrateTarget.node}
+          vmName={migrateTarget.name}
+          vmid={migrateTarget.vmid}
+          vmStatus={migrateTarget.status || 'unknown'}
+          vmType={migrateTarget.type as 'qemu' | 'lxc'}
+          onMigrate={async (targetNode, online, targetStorage, withLocalDisks) => {
+            // Migration intra-cluster
+            const { connId, node, type, vmid } = migrateTarget
+            const res = await fetch(
+              `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/migrate`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: targetNode, online, targetstorage: targetStorage, 'with-local-disks': withLocalDisks })
+              }
+            )
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}))
+              throw new Error(err?.error || res.statusText)
+            }
+            setMigrateDialogOpen(false)
+            setMigrateTarget(null)
+            setReloadTick(x => x + 1)
+          }}
+          onCrossClusterMigrate={async (params: CrossClusterMigrateParams) => {
+            const { connId, node, type, vmid } = migrateTarget
+            await crossClusterMigrate({ connId, node, type, vmid }, params)
+            setMigrateDialogOpen(false)
+            setMigrateTarget(null)
+            setReloadTick(x => x + 1)
+          }}
+        />
+      )}
+
+      {/* Dialog de confirmation action VM */}
+      <Dialog
+        open={vmActionConfirm !== null}
+        onClose={() => setVmActionConfirm(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          {vmActionConfirm?.action === 'stop' && <StopIcon sx={{ fontSize: 24, color: 'error.main' }} />}
+          {vmActionConfirm?.action === 'reset' && <i className="ri-loop-left-line" style={{ fontSize: 24, color: 'var(--mui-palette-error-main)' }} />}
+          {vmActionConfirm?.action === 'shutdown' && <PowerSettingsNewIcon sx={{ fontSize: 24, color: 'warning.main' }} />}
+          {vmActionConfirm?.action === 'reboot' && <i className="ri-restart-line" style={{ fontSize: 24, color: 'var(--mui-palette-warning-main)' }} />}
+          {vmActionConfirm?.action === 'suspend' && <PauseIcon sx={{ fontSize: 24, color: 'info.main' }} />}
+          {vmActionConfirm?.action === 'hibernate' && <i className="ri-zzz-line" style={{ fontSize: 24, color: 'var(--mui-palette-info-main)' }} />}
+          {t('common.confirm')}
+        </DialogTitle>
+        <DialogContent>
+          <Alert
+            severity={['stop', 'reset'].includes(vmActionConfirm?.action || '') ? 'error' : ['shutdown', 'reboot'].includes(vmActionConfirm?.action || '') ? 'warning' : 'info'}
+            sx={{ mb: 2 }}
+          >
+            {vmActionConfirm?.action?.toUpperCase()} — <strong>{vmActionConfirm?.name}</strong>
+          </Alert>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setVmActionConfirm(null); handleCloseContextMenu() }}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="contained"
+            color={['stop', 'reset'].includes(vmActionConfirm?.action || '') ? 'error' : ['shutdown', 'reboot'].includes(vmActionConfirm?.action || '') ? 'warning' : 'info'}
+            onClick={() => vmActionConfirm && executeVmAction(vmActionConfirm.action)}
+            disabled={actionBusy}
+            startIcon={actionBusy ? <CircularProgress size={16} /> : null}
+          >
+            {vmActionConfirm?.action?.toUpperCase()}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Dialog d'erreur action VM */}
+      <Dialog
+        open={vmActionError !== null}
+        onClose={() => setVmActionError(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-error-warning-line" style={{ fontSize: 24, color: '#ef4444' }} />
+          {t('common.error')}
+        </DialogTitle>
+        <DialogContent>
+          <Alert severity="error">{vmActionError}</Alert>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setVmActionError(null)}>{t('common.close')}</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Dialog snapshot */}
+      <Dialog
+        open={snapshotDialogOpen}
+        onClose={() => { setSnapshotDialogOpen(false); setSnapshotTarget(null) }}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-camera-line" style={{ fontSize: 24 }} />
+          {t('inventory.takeSnapshot')}
+        </DialogTitle>
+        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
+          <TextField
+            label={t('common.name')}
+            value={snapshotName}
+            onChange={e => setSnapshotName(e.target.value)}
+            size="small"
+            required
+            autoFocus
+          />
+          <TextField
+            label={t('common.description')}
+            value={snapshotDesc}
+            onChange={e => setSnapshotDesc(e.target.value)}
+            size="small"
+            multiline
+            rows={2}
+          />
+          {snapshotTarget?.type === 'qemu' && (
+          <FormControlLabel
+            control={<Switch checked={snapshotVmstate} onChange={e => setSnapshotVmstate(e.target.checked)} size="small" />}
+            label={t('inventory.includeRamState')}
+          />
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setSnapshotDialogOpen(false); setSnapshotTarget(null) }}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={executeSnapshot}
+            disabled={creatingSnapshot || !snapshotName.trim()}
+            startIcon={creatingSnapshot ? <CircularProgress size={16} /> : null}
+          >
+            {t('inventory.takeSnapshot')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Dialog backup */}
+      <Dialog
+        open={backupDialogOpen}
+        onClose={() => { setBackupDialogOpen(false); setBackupTarget(null) }}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-save-line" style={{ fontSize: 24 }} />
+          {t('inventory.backupNow')} — {backupTarget?.name}
+        </DialogTitle>
+        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
+          <FormControl size="small" fullWidth>
+            <InputLabel>{t('inventory.backupStorage')}</InputLabel>
+            <Select
+              value={backupStorage}
+              label={t('inventory.backupStorage')}
+              onChange={e => setBackupStorage(e.target.value)}
+            >
+              {backupStorages.map((s: any) => (
+                <MenuItem key={s.storage} value={s.storage}>{s.storage}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl size="small" fullWidth>
+            <InputLabel>{t('inventory.backupMode')}</InputLabel>
+            <Select
+              value={backupMode}
+              label={t('inventory.backupMode')}
+              onChange={e => setBackupMode(e.target.value)}
+            >
+              <MenuItem value="snapshot">Snapshot</MenuItem>
+              <MenuItem value="suspend">Suspend</MenuItem>
+              <MenuItem value="stop">Stop</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl size="small" fullWidth>
+            <InputLabel>{t('inventory.backupCompress')}</InputLabel>
+            <Select
+              value={backupCompress}
+              label={t('inventory.backupCompress')}
+              onChange={e => setBackupCompress(e.target.value)}
+            >
+              <MenuItem value="zstd">ZSTD</MenuItem>
+              <MenuItem value="lzo">LZO</MenuItem>
+              <MenuItem value="gzip">GZIP</MenuItem>
+              <MenuItem value="0">{t('common.none')}</MenuItem>
+            </Select>
+          </FormControl>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setBackupDialogOpen(false); setBackupTarget(null) }}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={executeBackupNow}
+            disabled={backupLoading || !backupStorage}
+            startIcon={backupLoading ? <CircularProgress size={16} /> : null}
+          >
+            {t('inventory.backupNow')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Snackbar */}
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={4000}
+        onClose={() => setSnackbar(s => ({ ...s, open: false }))}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+      >
+        <Alert
+          onClose={() => setSnackbar(s => ({ ...s, open: false }))}
+          severity={snackbar.severity}
+          variant="filled"
+        >
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
+
+      {/* Dialog d'erreur Unlock */}
+      {unlockErrorDialog.open && (
+        <Dialog
+          open={true}
+          onClose={() => setUnlockErrorDialog({ open: false, error: '' })}
+          maxWidth="sm"
+          fullWidth
+        >
+          <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <i className="ri-error-warning-line" style={{ fontSize: 24, color: '#f59e0b' }} />
+            {t('inventory.unlockError')}
+          </DialogTitle>
+          <DialogContent>
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {unlockErrorDialog.error}
+            </Alert>
+            {unlockErrorDialog.hint && (
+              <Box sx={{
+                bgcolor: 'action.hover',
+                borderRadius: 1,
+                p: 2,
+                fontFamily: 'monospace',
+                fontSize: 14
+              }}>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                  {t('inventory.unlockHint')}
+                </Typography>
+                <code style={{
+                  backgroundColor: 'rgba(0,0,0,0.3)',
+                  padding: '4px 8px',
+                  borderRadius: 4,
+                  userSelect: 'all'
+                }}>
+                  {unlockErrorDialog.hint}
+                </code>
+              </Box>
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setUnlockErrorDialog({ open: false, error: '' })}>
+              {t('common.close')}
+            </Button>
+          </DialogActions>
+        </Dialog>
+      )}
+
+      {/* Node Shell Dialog */}
+      <Dialog
+        open={shellDialog.open}
+        onClose={() => setShellDialog({ open: false, connId: '', node: '', loading: false, data: null, error: null })}
+        maxWidth="lg"
+        fullWidth
+        PaperProps={{ sx: { height: '80vh', bgcolor: 'background.default' } }}
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1.5, bgcolor: 'background.paper', color: 'text.primary', py: 1.5 }}>
+          <i className="ri-terminal-box-line" style={{ fontSize: 20 }} />
+          <Typography variant="subtitle1" fontWeight={700} sx={{ flex: 1 }}>
+            {t('inventory.tabShell')} — {shellDialog.node}
+          </Typography>
+          <IconButton size="small" onClick={() => setShellDialog({ open: false, connId: '', node: '', loading: false, data: null, error: null })} sx={{ color: 'text.secondary' }}>
+            <i className="ri-close-line" style={{ fontSize: 18 }} />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ p: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {shellDialog.loading ? (
+            <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <CircularProgress size={32} sx={{ color: 'text.secondary' }} />
+              <Typography sx={{ ml: 2, color: 'text.secondary' }}>{t('inventory.connecting')}...</Typography>
+            </Box>
+          ) : shellDialog.error ? (
+            <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 2 }}>
+              <i className="ri-error-warning-line" style={{ fontSize: 48, color: 'var(--mui-palette-error-main)' }} />
+              <Typography color="error">{shellDialog.error}</Typography>
+              <Button variant="outlined" color="error" onClick={() => setShellDialog({ open: false, connId: '', node: '', loading: false, data: null, error: null })}>
+                {t('common.close')}
+              </Button>
+            </Box>
+          ) : shellDialog.data ? (
+            <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+              {(() => {
+                const XTermShell = require('@/components/xterm/XTermShell').default
+                return (
+                  <XTermShell
+                    sessionId={shellDialog.data.sessionId}
+                    host={shellDialog.data.host}
+                    onDisconnect={() => setShellDialog(prev => ({ ...prev, data: null, error: 'Disconnected' }))}
+                  />
+                )
+              })()}
+            </Box>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      {/* Tag management dialog */}
+      <Dialog open={tagDialog !== null} onClose={() => setTagDialog(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ pb: 1 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            {tagDialog?.type === 'connection' ? (
+              <ClusterIcon nodes={tagDialog?.clusterNodes || []} size={18} />
+            ) : (
+              <NodeIcon status={tagDialog?.nodeStatus} maintenance={tagDialog?.nodeMaintenance} size={18} />
+            )}
+            <Typography variant="subtitle1" fontWeight={700}>{tagDialog?.name}</Typography>
+            <Typography variant="caption" sx={{ opacity: 0.4, ml: 'auto' }}>
+              {tagDialog?.type === 'connection' ? 'Cluster' : 'Node'}
+            </Typography>
+          </Box>
+        </DialogTitle>
+        <Divider />
+        <DialogContent>
+          {tagDialog && (
+            <Box sx={{ pt: 1.5 }}>
+              <Typography variant="caption" sx={{ opacity: 0.6, fontWeight: 600, textTransform: 'uppercase', fontSize: 10, display: 'block', mb: 1 }}>
+                Tags
+              </Typography>
+              <EntityTagManager
+                tags={tagDialogTags}
+                entityType={tagDialog.type}
+                entityId={tagDialog.entityId}
+                connectionId={tagDialog.connId}
+                nodeName={tagDialog.node}
+                onTagsChange={setTagDialogTags}
+              />
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTagDialog(null)}>{t('common.close')}</Button>
+        </DialogActions>
+      </Dialog>
+    </>
+  )
+}

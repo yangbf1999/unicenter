@@ -1,0 +1,48 @@
+import { NextResponse } from "next/server"
+
+import { unisphereFetch } from "@/lib/esage/client"
+import { readRepoErrors, readStandardRepos } from "@/lib/esage/aptRepositories"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildNodeResourceId, PERMISSIONS } from "@/lib/rbac"
+
+export const runtime = "nodejs"
+
+/**
+ * GET /api/v1/connections/[id]/nodes/[node]/apt/repositories
+ * Returns repository configuration for a node (standard_repos and errors)
+ *
+ * eSage API: GET /nodes/{node}/apt/repositories
+ */
+export async function GET(
+  _req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  try {
+    const { id, node } = await ctx.params
+
+    const resourceId = buildNodeResourceId(id, node)
+    const denied = await checkPermission(PERMISSIONS.NODE_VIEW, "node", resourceId)
+
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+
+    const result = await unisphereFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/apt/repositories`,
+      { method: "GET" }
+    )
+
+    // UNISPHERE answers with the HYPHENATED key `standard-repos`; reading
+    // `standard_repos` here returned an empty list on every node, which
+    // silently disabled the enterprise-repository pre-flight check.
+    return NextResponse.json({
+      data: {
+        standard_repos: readStandardRepos(result),
+        errors: readRepoErrors(result),
+      },
+    })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

@@ -1,0 +1,400 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+
+vi.mock('@/lib/demo/demo-api', () => ({
+  demoResponse: vi.fn<(...args: any[]) => Response | null>(),
+}))
+
+vi.mock('@/lib/tenant', () => ({
+  getSessionPrisma: vi.fn<() => Promise<any>>(),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: vi.fn<(...args: any[]) => Promise<Response | null>>(),
+  PERMISSIONS: {
+    STORAGE_VIEW: 'storage.view',
+  },
+}))
+
+vi.mock('@/lib/connections/getConnection', () => ({
+  getConnectionById: vi.fn<(id: string) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/esage/client', () => ({
+  unisphereFetch: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/db/prisma', () => ({
+  prisma: {
+    connection: { findMany: vi.fn<() => Promise<any[]>>() },
+    tenant: { findMany: vi.fn<() => Promise<any[]>>() },
+    vdc: { findMany: vi.fn<() => Promise<any[]>>() },
+  },
+}))
+
+vi.mock('@/lib/storage/fleetScope', () => ({
+  canReadFleetStorage: vi.fn<() => Promise<boolean>>(),
+}))
+
+// The guard is unit-tested on its own (routeGuard.test.ts) and exercised
+// end-to-end for a token in reusedRoutesGuard.test.ts; here it stays a
+// pass-through so this file keeps testing the handler in isolation, exactly
+// like every session call the guard already delegates immediately (no
+// Bearer pxc_ header on any request built by callRoute).
+vi.mock('@/lib/api-tokens/routeGuard', () => ({
+  withPublicApiGuard: (_entryId: string, handler: any) => handler,
+}))
+
+import { GET } from './route'
+import { demoResponse } from '@/lib/demo/demo-api'
+import { getSessionPrisma } from '@/lib/tenant'
+import { checkPermission } from '@/lib/rbac'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { unisphereFetch } from '@/lib/esage/client'
+import { prisma as globalPrisma } from '@/lib/db/prisma'
+import { canReadFleetStorage } from '@/lib/storage/fleetScope'
+
+const demoResponseMock = demoResponse as any
+const getSessionPrismaMock = getSessionPrisma as any
+const checkPermissionMock = checkPermission as any
+const getConnectionByIdMock = getConnectionById as any
+const unisphereFetchMock = unisphereFetch as any
+const globalPrismaMock = globalPrisma as any
+const canReadFleetStorageMock = canReadFleetStorage as any
+
+const TiB = 1024 ** 4
+
+// Two UNISPHERE clusters, each with a storage named "local-lvm" but different sizes.
+// UNISPHERE-1 also exposes a shared NFS storage on two nodes (within-cluster merge case).
+const RESOURCES: Record<string, any[]> = {
+  'conn-1': [
+    { type: 'storage', storage: 'local-lvm', node: 'unisphere1-n1', status: 'available', disk: 45 * TiB, maxdisk: 90 * TiB },
+    { type: 'storage', storage: 'nfs-shared', node: 'unisphere1-n1', status: 'available', disk: 5 * TiB, maxdisk: 20 * TiB },
+    { type: 'storage', storage: 'nfs-shared', node: 'unisphere1-n2', status: 'available', disk: 5 * TiB, maxdisk: 20 * TiB },
+  ],
+  'conn-2': [
+    { type: 'storage', storage: 'local-lvm', node: 'unisphere2-n1', status: 'available', disk: 3 * TiB, maxdisk: 15 * TiB },
+  ],
+}
+
+const CONFIGS: Record<string, any[]> = {
+  'conn-1': [
+    { storage: 'local-lvm', type: 'lvmthin', content: 'images,rootdir', disable: 0 },
+    { storage: 'nfs-shared', type: 'nfs', shared: 1, content: 'images,iso', server: '10.0.0.1', export: '/data' },
+  ],
+  'conn-2': [
+    { storage: 'local-lvm', type: 'lvmthin', content: 'images,rootdir', disable: 0 },
+  ],
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  demoResponseMock.mockReturnValue(null)
+  checkPermissionMock.mockResolvedValue(null)
+  getConnectionByIdMock.mockImplementation((id: string) => Promise.resolve({ id }))
+  getSessionPrismaMock.mockResolvedValue({
+    connection: {
+      findMany: vi.fn().mockResolvedValue([
+        { id: 'conn-1', name: 'UNISPHERE-1', tenantId: 'tenant-a' },
+        { id: 'conn-2', name: 'UNISPHERE-2', tenantId: 'tenant-a' },
+      ]),
+    },
+  })
+  unisphereFetchMock.mockImplementation((connData: any, path: string) => {
+    if (path === '/cluster/resources') return Promise.resolve(RESOURCES[connData.id] || [])
+    if (path === '/storage') return Promise.resolve(CONFIGS[connData.id] || [])
+    return Promise.resolve([])
+  })
+  canReadFleetStorageMock.mockResolvedValue(false)
+  globalPrismaMock.connection.findMany.mockResolvedValue([
+    { id: 'conn-1', name: 'UNISPHERE-1', tenantId: 'tenant-a' },
+    { id: 'conn-2', name: 'UNISPHERE-2', tenantId: 'tenant-b' },
+  ])
+  globalPrismaMock.tenant.findMany.mockResolvedValue([
+    { id: 'default', name: 'Provider' },
+    { id: 'tenant-a', name: 'Alpha' },
+    { id: 'tenant-b', name: 'Bravo' },
+    // Owns nothing and holds no vDC: an MSP tenant with no connection declared
+    // yet, which legitimately shows a zero in the selector.
+    { id: 'tenant-empty', name: 'Empty' },
+    // Reaches storage only through a vDC on a provider-owned cluster, so it must
+    // NOT be offered in the selector.
+    { id: 'tenant-vdc', name: 'Vdc only' },
+  ])
+  globalPrismaMock.vdc.findMany.mockResolvedValue([{ tenantId: 'tenant-vdc' }])
+})
+
+describe('GET /api/v1/storage', () => {
+  it('keeps same-named storages on different clusters as separate rows (issue #569)', async () => {
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+
+    const localLvm = body.data.filter((s: any) => s.storage === 'local-lvm')
+
+    // Two clusters -> two distinct rows, NOT one merged row
+    expect(localLvm).toHaveLength(2)
+
+    const unisphere1 = localLvm.find((s: any) => s.connId === 'conn-1')
+    const unisphere2 = localLvm.find((s: any) => s.connId === 'conn-2')
+
+    expect(unisphere1).toBeDefined()
+    expect(unisphere2).toBeDefined()
+
+    // Each row carries its own cluster's capacity (no cross-cluster max)
+    expect(unisphere1.total).toBe(90 * TiB)
+    expect(unisphere1.used).toBe(45 * TiB)
+    expect(unisphere1.usedPct).toBe(50)
+    expect(unisphere1.connections).toEqual([{ id: 'conn-1', name: 'UNISPHERE-1' }])
+
+    expect(unisphere2.total).toBe(15 * TiB)
+    expect(unisphere2.used).toBe(3 * TiB)
+    expect(unisphere2.usedPct).toBe(20)
+    expect(unisphere2.connections).toEqual([{ id: 'conn-2', name: 'UNISPHERE-2' }])
+  })
+
+  it('uses connId:storage as the row id so rows are unique per cluster', async () => {
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    const ids = body.data.filter((s: any) => s.storage === 'local-lvm').map((s: any) => s.id).sort()
+
+    expect(ids).toEqual(['conn-1:local-lvm', 'conn-2:local-lvm'])
+  })
+
+  it('still merges a shared storage seen from multiple nodes of the same cluster', async () => {
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    const nfs = body.data.filter((s: any) => s.storage === 'nfs-shared')
+
+    expect(nfs).toHaveLength(1)
+    expect(nfs[0].shared).toBe(true)
+    expect(nfs[0].allNodes.sort()).toEqual(['unisphere1-n1', 'unisphere1-n2'])
+    expect(nfs[0].total).toBe(20 * TiB)
+    expect(nfs[0].nodeBreakdown).toHaveLength(1)
+  })
+
+  it('sums a local storage across nodes and exposes nodeBreakdown', async () => {
+    // Override conn-1 to expose local-lvm on two nodes
+    unisphereFetchMock.mockImplementation((connData: any, path: string) => {
+      if (connData.id === 'conn-1' && path === '/cluster/resources') {
+        return Promise.resolve([
+          { type: 'storage', storage: 'local-lvm', node: 'unisphere1-n1', status: 'available', disk: 45 * TiB, maxdisk: 90 * TiB },
+          { type: 'storage', storage: 'local-lvm', node: 'unisphere1-n2', status: 'available', disk: 15 * TiB, maxdisk: 30 * TiB },
+        ])
+      }
+      if (connData.id === 'conn-1' && path === '/storage') {
+        return Promise.resolve([{ storage: 'local-lvm', type: 'lvmthin', content: 'images', disable: 0 }])
+      }
+      return Promise.resolve([])
+    })
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+    const row = body.data.find((s: any) => s.id === 'conn-1:local-lvm')
+
+    expect(row.total).toBe(120 * TiB)
+    expect(row.used).toBe(60 * TiB)
+    expect(row.allNodes.sort()).toEqual(['unisphere1-n1', 'unisphere1-n2'])
+    expect(row.nodeBreakdown).toHaveLength(2)
+    expect(row.connectionName).toBe('UNISPHERE-1')
+    expect(row.connections).toEqual([{ id: 'conn-1', name: 'UNISPHERE-1' }])
+  })
+
+  it('returns the demo payload when demoResponse short-circuits', async () => {
+    const demo = new Response(JSON.stringify({ data: ['demo'] }), { status: 200 })
+    demoResponseMock.mockReturnValue(demo)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res).toBe(demo)
+    expect(getSessionPrismaMock).not.toHaveBeenCalled()
+  })
+
+  it('propagates the RBAC denial without querying UNISPHERE', async () => {
+    const denied = new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res.status).toBe(403)
+    expect(unisphereFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('returns an empty list when no UNISPHERE connections exist', async () => {
+    getSessionPrismaMock.mockResolvedValue({
+      connection: { findMany: vi.fn().mockResolvedValue([]) },
+    })
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data).toEqual([])
+    expect(unisphereFetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('GET /api/v1/storage — fleet scope (issue #609)', () => {
+  it('keeps the tenant-scoped client and exposes no tenants facet when not fleet-scoped', async () => {
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(getSessionPrismaMock).toHaveBeenCalled()
+    expect(globalPrismaMock.connection.findMany).not.toHaveBeenCalled()
+    expect(body.tenants).toBeUndefined()
+    expect(body.unavailable).toEqual([])
+  })
+
+  it('lists every tenant connection through the global client when fleet-scoped', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(globalPrismaMock.connection.findMany).toHaveBeenCalled()
+    expect(getSessionPrismaMock).not.toHaveBeenCalled()
+
+    const rowA = body.data.find((s: any) => s.connId === 'conn-1')
+    const rowB = body.data.find((s: any) => s.connId === 'conn-2')
+
+    expect(rowA.tenantId).toBe('tenant-a')
+    expect(rowA.tenantName).toBe('Alpha')
+    expect(rowB.tenantId).toBe('tenant-b')
+    expect(rowB.tenantName).toBe('Bravo')
+  })
+
+  it('returns every enabled tenant in the facet, provider first, zeros included', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.tenants.map((t: any) => t.id)).toEqual(['default', 'tenant-a', 'tenant-b', 'tenant-empty'])
+
+    const empty = body.tenants.find((t: any) => t.id === 'tenant-empty')
+
+    expect(empty).toEqual({ id: 'tenant-empty', name: 'Empty', connectionCount: 0, storageCount: 0 })
+  })
+
+  it('omits a tenant whose only reach is a vDC, since its storage already shows under the cluster owner', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.tenants.map((t: any) => t.id)).not.toContain('tenant-vdc')
+  })
+
+  it('still offers a tenant that holds a vDC but also owns a UNISPHERE connection', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    globalPrismaMock.vdc.findMany.mockResolvedValue([{ tenantId: 'tenant-a' }])
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    const alpha = body.tenants.find((t: any) => t.id === 'tenant-a')
+
+    expect(alpha.connectionCount).toBe(1)
+    expect(alpha.storageCount).toBeGreaterThan(0)
+  })
+
+  it('never reads the vDC table on the tenant-scoped path', async () => {
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res.status).toBe(200)
+    expect(globalPrismaMock.vdc.findMany).not.toHaveBeenCalled()
+  })
+
+  it('exposes the owning tenant on each returned connection', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.connections).toEqual([
+      { id: 'conn-1', name: 'UNISPHERE-1', tenantId: 'tenant-a' },
+      { id: 'conn-2', name: 'UNISPHERE-2', tenantId: 'tenant-b' },
+    ])
+  })
+
+  it('reports a connection whose /cluster/resources call fails, instead of dropping it silently', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    unisphereFetchMock.mockImplementation((connData: any, path: string) => {
+      if (connData.id === 'conn-2' && path === '/cluster/resources') {
+        return Promise.reject(new Error('ETIMEDOUT'))
+      }
+      if (path === '/cluster/resources') return Promise.resolve(RESOURCES[connData.id] || [])
+      if (path === '/storage') return Promise.resolve(CONFIGS[connData.id] || [])
+
+      return Promise.resolve([])
+    })
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.unavailable).toEqual([
+      { connId: 'conn-2', connName: 'UNISPHERE-2', tenantId: 'tenant-b', tenantName: 'Bravo' },
+    ])
+    expect(body.data.some((s: any) => s.connId === 'conn-2')).toBe(false)
+    // The healthy cluster still renders.
+    expect(body.data.some((s: any) => s.connId === 'conn-1')).toBe(true)
+  })
+
+  it('does not treat a failing /storage config call as an unavailable connection', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    unisphereFetchMock.mockImplementation((connData: any, path: string) => {
+      if (path === '/cluster/resources') return Promise.resolve(RESOURCES[connData.id] || [])
+
+      return Promise.reject(new Error('500'))
+    })
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.unavailable).toEqual([])
+    expect(body.data.length).toBeGreaterThan(0)
+    expect(body.data.every((s: any) => s.type === 'unknown')).toBe(true)
+  })
+
+  it('reports a connection whose credentials cannot be resolved', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    getConnectionByIdMock.mockImplementation((id: string) =>
+      id === 'conn-2' ? Promise.reject(new Error('Connection not found: conn-2')) : Promise.resolve({ id })
+    )
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.unavailable).toEqual([
+      { connId: 'conn-2', connName: 'UNISPHERE-2', tenantId: 'tenant-b', tenantName: 'Bravo' },
+    ])
+  })
+
+  it('still carries the new keys when the fleet owns no UNISPHERE connection at all', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    globalPrismaMock.connection.findMany.mockResolvedValue([])
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+    const body = await readJson<any>(res)
+
+    expect(body.data).toEqual([])
+    expect(body.unavailable).toEqual([])
+    expect(body.tenants.map((t: any) => t.id)).toEqual(['default', 'tenant-a', 'tenant-b', 'tenant-empty'])
+    expect(unisphereFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('never widens the read when the RBAC check denies storage.view', async () => {
+    canReadFleetStorageMock.mockResolvedValue(true)
+    checkPermissionMock.mockResolvedValue(new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 }))
+
+    const res = await callRoute(GET as any, { method: 'GET' })
+
+    expect(res.status).toBe(403)
+    expect(globalPrismaMock.connection.findMany).not.toHaveBeenCalled()
+    expect(canReadFleetStorageMock).not.toHaveBeenCalled()
+  })
+})

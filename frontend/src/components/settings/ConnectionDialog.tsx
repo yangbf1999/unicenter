@@ -1,0 +1,1373 @@
+// src/components/settings/ConnectionDialog.tsx
+// Dialog pour ajouter/modifier une connexion UNISPHERE/PBS avec support SSH
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useTranslations } from 'next-intl'
+import { useTheme } from '@mui/material/styles'
+
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Alert,
+  Autocomplete,
+  Box,
+  Button,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  FormHelperText,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  MenuItem,
+  Select,
+  Switch,
+  TextField,
+  ToggleButton,
+  ToggleButtonGroup,
+  Tooltip,
+  Typography,
+} from '@mui/material'
+
+import { COUNTRIES, findCountry } from '@/lib/utils/countries'
+import { CountryFlag } from '@/components/ui/CountryFlag'
+import NumericTextField from '@/components/ui/NumericTextField'
+import { useTenant } from '@/contexts/TenantContext'
+import { useCopyToClipboard } from '@/lib/clipboard'
+
+export type ConnectionFormData = {
+  name: string
+  baseUrl: string
+  behindProxy: boolean
+  insecureTLS: boolean
+  hasCeph: boolean
+  apiToken: string
+  // VMware fields
+  subType: string
+  vmwareUser: string
+  vmwarePassword: string
+  vmwareDatacenter: string
+  hypervShareName: string
+  // Location fields
+  latitude: string
+  longitude: string
+  locationLabel: string
+  country: string // ISO-3166-1 alpha-2
+  // SSH fields
+  sshEnabled: boolean
+  sshPort: number
+  sshUser: string
+  sshAuthMethod: 'key' | 'password' | ''
+  sshKey: string
+  sshPassphrase: string
+  sshPassword: string
+  sshUseSudo: boolean
+  // Provider-only, create mode: own the connection by an MSP tenant ('' = pool)
+  ownerTenantId: string
+}
+
+type ConnectionDialogProps = {
+  open: boolean
+  onClose: () => void
+  onSave: (data: ConnectionFormData) => Promise<void>
+  type: 'unisphere' | 'pbs' | 'vmware' | 'xcpng' | 'hyperv' | 'nutanix'
+  initialData?: Partial<ConnectionFormData> & { 
+    id?: string
+    sshKeyConfigured?: boolean
+    sshPassConfigured?: boolean 
+  }
+  mode?: 'create' | 'edit'
+}
+
+const defaultFormData: ConnectionFormData = {
+  name: '',
+  baseUrl: '',
+  behindProxy: false,
+  insecureTLS: true,
+  hasCeph: false,
+  apiToken: '',
+  subType: '',
+  vmwareUser: 'root',
+  vmwarePassword: '',
+  vmwareDatacenter: '',
+  hypervShareName: 'VMs',
+  latitude: '',
+  longitude: '',
+  locationLabel: '',
+  country: '',
+  sshEnabled: false,
+  sshPort: 22,
+  sshUser: 'root',
+  sshAuthMethod: '',
+  sshKey: '',
+  sshPassphrase: '',
+  sshPassword: '',
+  sshUseSudo: false,
+  ownerTenantId: '',
+}
+
+export default function ConnectionDialog({
+  open,
+  onClose,
+  onSave,
+  type,
+  initialData,
+  mode = 'create'
+}: ConnectionDialogProps) {
+  const t = useTranslations()
+  const theme = useTheme()
+  const tooltipSlotProps = {
+    tooltip: { sx: { bgcolor: 'background.paper', color: 'text.primary', border: `1px solid ${theme.palette.divider}`, boxShadow: 3, fontSize: '0.75rem' } },
+    arrow: { sx: { color: 'background.paper' } },
+  }
+  const { isProvider } = useTenant()
+  const tokenSetupCopy = useCopyToClipboard()
+  const [form, setForm] = useState<ConnectionFormData>(defaultFormData)
+  const [mspTenants, setMspTenants] = useState<{ id: string; name: string }[]>([])
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [showSshKey, setShowSshKey] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
+  const [tokenId, setTokenId] = useState('')
+  const [tokenSecret, setTokenSecret] = useState('')
+  const [showTokenSecret, setShowTokenSecret] = useState(false)
+  const [pbsFingerprint, setPbsFingerprint] = useState<string | null>(null)
+  const [capturingFingerprint, setCapturingFingerprint] = useState(false)
+  const [fingerprintError, setFingerprintError] = useState<string | null>(null)
+  
+  // Test SSH
+  const [testingSSH, setTestingSSH] = useState(false)
+  const [sshTestResult, setSshTestResult] = useState<{
+    success: boolean
+    nodes?: { node: string; ip: string; status: string; error?: string }[]
+    error?: string
+  } | null>(null)
+
+  // Reset form when dialog opens
+  useEffect(() => {
+    if (open) {
+      if (initialData) {
+        // XCP-ng rows created before the direct-pool mode existed are XO connections,
+        // so an absent subType means "xo".
+        const editSubType = (initialData as any).subType || (type === 'xcpng' ? 'xo' : '')
+        // Default user of the mode, used only when the stored one is unavailable.
+        const defaultUser = type === 'xcpng'
+          ? (editSubType === 'xapi' ? 'root' : 'admin@admin.net')
+          : type === 'hyperv' ? 'Administrator' : type === 'nutanix' ? 'admin' : 'root'
+        setForm({
+          ...defaultFormData,
+          ...initialData,
+          behindProxy: initialData.behindProxy ?? false,
+          // Ne pas pré-remplir les secrets en mode edit
+          apiToken: '',
+          sshKey: '',
+          sshPassphrase: '',
+          sshPassword: '',
+          sshAuthMethod: initialData.sshAuthMethod || '',
+          subType: editSubType,
+          // External hypervisors keep "user:password" encrypted; the list payload
+          // hands the user back as apiUser (never the password). Without it the
+          // field would show the type default and saving would rewrite the real
+          // user of the connection.
+          vmwareUser: (initialData as any).apiUser || (initialData as any).vmwareUser || defaultUser,
+          vmwareDatacenter: (initialData as any).vmwareDatacenter || '',
+          hypervShareName: (initialData as any).hypervShareName || 'VMs',
+          // Location: convert numbers to strings for text fields
+          latitude: initialData.latitude != null ? String(initialData.latitude) : '',
+          longitude: initialData.longitude != null ? String(initialData.longitude) : '',
+          locationLabel: initialData.locationLabel || '',
+          country: ((initialData as any).country || '').toString().toUpperCase(),
+        })
+      } else {
+        setForm({
+          ...defaultFormData,
+          // A new XCP-ng connection targets the pool directly (XAPI): it is the
+          // only mode warm migration can use. XO stays available for edits and
+          // for anyone who prefers going through Xen Orchestra.
+          subType: type === 'xcpng' ? 'xapi' : '',
+          vmwareUser: type === 'xcpng' ? 'root' : type === 'hyperv' ? 'Administrator' : type === 'nutanix' ? 'admin' : 'root',
+        })
+      }
+      setError(null)
+      setSshTestResult(null)
+      setTokenId('')
+      setTokenSecret('')
+      setShowTokenSecret(false)
+      setPbsFingerprint((initialData as any)?.fingerprint ?? null)
+      setFingerprintError(null)
+    }
+  }, [open, initialData])
+
+  const handleChange = (field: keyof ConnectionFormData, value: any) => {
+    setForm(prev => ({ ...prev, [field]: value }))
+    setError(null)
+  }
+
+  // Provider-only owner selector (create mode, UNISPHERE/PBS): load the MSP tenants
+  // the connection can be created for. Anyone else never sees the selector.
+  // A provider user lacking admin.tenants gets a 403 here -> empty list ->
+  // selector hidden (graceful: they keep the create-then-assign flow via a
+  // tenants admin); picking an owner intentionally requires tenant visibility.
+  useEffect(() => {
+    if (!open || mode !== 'create' || !isProvider || (type !== 'unisphere' && type !== 'pbs')) return
+    fetch('/api/v1/tenants')
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        const list = (data?.data || []).filter(
+          (tn: any) => tn.operatingModel === 'msp' && tn.enabled !== false
+        )
+        setMspTenants(list.map((tn: any) => ({ id: tn.id, name: tn.name })))
+      })
+      .catch(() => setMspTenants([]))
+  }, [open, mode, isProvider, type])
+
+  // Reverse-geocode lat/lng → country (ISO-2) when user fills the GPS fields
+  // and the country field is still empty. Debounced 800 ms so we don't hammer
+  // Nominatim while the user is typing. The field stays editable — user can
+  // override the auto-detected value at any time.
+  useEffect(() => {
+    if (!open) return
+    const lat = Number.parseFloat(form.latitude)
+    const lng = Number.parseFloat(form.longitude)
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return
+    if (form.country) return
+    const ctrl = new AbortController()
+    const timer = setTimeout(async () => {
+      try {
+        const url = `https://nominatim.openstreetmap.org/reverse?format=json&zoom=3&lat=${lat}&lon=${lng}`
+        const r = await fetch(url, {
+          signal: ctrl.signal,
+          headers: { 'Accept-Language': 'en' },
+        })
+        if (!r.ok) return
+        const j = await r.json()
+        const code = String(j?.address?.country_code || '').toUpperCase()
+        if (code.length === 2 && findCountry(code)) {
+          setForm(prev => prev.country ? prev : { ...prev, country: code })
+        }
+      } catch {
+        // Ignore — user keeps the empty field, can pick manually.
+      }
+    }, 800)
+    return () => { clearTimeout(timer); ctrl.abort() }
+  }, [open, form.latitude, form.longitude, form.country])
+
+  const handleSshEnabledChange = (enabled: boolean) => {
+    setForm(prev => ({
+      ...prev,
+      sshEnabled: enabled,
+      // Reset SSH fields when disabled
+      ...(enabled ? {} : {
+        sshAuthMethod: '',
+        sshKey: '',
+        sshPassphrase: '',
+        sshPassword: '',
+      })
+    }))
+    setSshTestResult(null)
+  }
+
+  const handleSshAuthMethodChange = (method: 'key' | 'password' | '') => {
+    setForm(prev => ({
+      ...prev,
+      sshAuthMethod: method,
+      // Clear the other method's fields
+      sshKey: method === 'key' ? prev.sshKey : '',
+      sshPassphrase: method === 'key' ? prev.sshPassphrase : '',
+      sshPassword: method === 'password' ? prev.sshPassword : '',
+    }))
+    setSshTestResult(null)
+  }
+
+  const handleCapturePbsFingerprint = async () => {
+    if (!initialData?.id) return
+    setCapturingFingerprint(true)
+    setFingerprintError(null)
+    try {
+      const res = await fetch(
+        `/api/v1/admin/pbs-connections/${encodeURIComponent(initialData.id)}/fingerprint`,
+        { method: 'POST' },
+      )
+      const j = await res.json()
+      if (!res.ok) {
+        setFingerprintError(j.error || `HTTP ${res.status}`)
+      } else {
+        setPbsFingerprint(j.data?.fingerprint ?? null)
+      }
+    } catch (e: any) {
+      setFingerprintError(e?.message || String(e))
+    } finally {
+      setCapturingFingerprint(false)
+    }
+  }
+
+  const handleTestSSH = async () => {
+    if (!initialData?.id) return
+
+    setTestingSSH(true)
+    setSshTestResult(null)
+
+    // Send the current (possibly unsaved) form values so the user can test
+    // before saving. The API merges these with any DB-stored credentials:
+    // empty key/password/passphrase fields fall back to what's already
+    // saved.
+    const payload: Record<string, unknown> = {
+      sshEnabled: form.sshEnabled,
+      sshPort: form.sshPort,
+      sshUser: form.sshUser,
+      sshAuthMethod: form.sshAuthMethod,
+    }
+
+    if (form.sshKey.trim()) payload.sshKey = form.sshKey
+    if (form.sshPassphrase) payload.sshPassphrase = form.sshPassphrase
+    if (form.sshPassword) payload.sshPassword = form.sshPassword
+
+    try {
+      const res = await fetch(`/api/v1/connections/${initialData.id}/test-ssh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+
+      const json = await res.json()
+
+      if (res.ok) {
+        setSshTestResult(json)
+      } else {
+        setSshTestResult({ success: false, error: json.error || 'Test failed' })
+      }
+    } catch (e: any) {
+      setSshTestResult({ success: false, error: e.message || 'Connection error' })
+    } finally {
+      setTestingSSH(false)
+    }
+  }
+
+  const handleSave = async () => {
+    // Validation
+    if (!form.name.trim()) {
+      setError(t('settings.errorNameRequired'))
+      return
+    }
+    
+    if (!form.baseUrl.trim()) {
+      setError(t('settings.errorUrlRequired'))
+      return
+    }
+    
+    // Assemble API token from split fields if they were used (UNISPHERE/PBS only)
+    if (!isExternalHypervisor && tokenId.trim() && tokenSecret.trim()) {
+      const separator = type === 'pbs' ? ':' : '='
+      form.apiToken = `${tokenId.trim()}${separator}${tokenSecret.trim()}`
+    }
+
+    if (!isExternalHypervisor && mode === 'create' && !form.apiToken.trim()) {
+      setError(t('settings.errorTokenRequired'))
+      return
+    }
+
+    // VMware / XCP-ng validation
+    if (isExternalHypervisor) {
+      if (mode === 'create' && !form.vmwarePassword) {
+        setError(t('settings.errorPasswordRequired'))
+        return
+      }
+    }
+
+    // SSH Validation (UNISPHERE only)
+    if (form.sshEnabled) {
+      if (!form.sshAuthMethod) {
+        setError(t('settings.errorSshAuthMethodRequired'))
+        return
+      }
+      
+      if (form.sshAuthMethod === 'key' && !form.sshKey.trim() && !initialData?.sshKeyConfigured) {
+        setError(t('settings.errorSshKeyRequired'))
+        return
+      }
+      
+      if (form.sshAuthMethod === 'password' && !form.sshPassword.trim() && !initialData?.sshPassConfigured) {
+        setError(t('settings.errorSshPasswordRequired'))
+        return
+      }
+    }
+
+    // Auto-append default port if not specified (UNISPHERE/PBS only, external hypervisors use 443)
+    const defaultPort = isExternalHypervisor ? '443' : type === 'pbs' ? '8007' : '8006'
+    let finalForm = { ...form }
+    // For VMware, auto-prefix https://; for XCP-ng in XO mode, auto-prefix
+    // http:// (XO often runs on HTTP). A pool master reached over XAPI only
+    // answers on https, so that mode is prefixed and normalized to https.
+    const xapiTarget = isXcpng && finalForm.subType === 'xapi'
+    if (isExternalHypervisor && finalForm.baseUrl && !finalForm.baseUrl.match(/^https?:\/\//)) {
+      finalForm.baseUrl = isXcpng && !xapiTarget ? `http://${finalForm.baseUrl}` : `https://${finalForm.baseUrl}`
+    }
+    if (xapiTarget && finalForm.baseUrl) {
+      finalForm.baseUrl = finalForm.baseUrl.replace(/^http:\/\//i, 'https://')
+    }
+    // Hyper-V: strip https:// prefix since we store just the hostname for virt-v2v
+    if (isHyperv && finalForm.baseUrl) {
+      finalForm.baseUrl = finalForm.baseUrl.replace(/^https?:\/\//, '')
+    }
+    // Nutanix: auto-append :9440 if no port specified
+    if (isNutanix && finalForm.baseUrl && !finalForm.baseUrl.replace(/^https?:\/\//, '').match(/:\d+/)) {
+      try {
+        const url = new URL(finalForm.baseUrl)
+        url.port = '9440'
+        finalForm.baseUrl = url.toString().replace(/\/$/, '')
+      } catch {
+        finalForm.baseUrl = finalForm.baseUrl.replace(/\/$/, '') + ':9440'
+      }
+    }
+    // Check if user explicitly specified a port in the raw input (e.g. :443, :8006)
+    const userSpecifiedPort = finalForm.baseUrl && /:\d+/.test(finalForm.baseUrl.replace(/^https?:\/\//, ''))
+    try {
+      const url = new URL(finalForm.baseUrl)
+      if (!url.port && !isExternalHypervisor && !userSpecifiedPort) {
+        url.port = defaultPort
+        finalForm.baseUrl = url.toString().replace(/\/$/, '')
+      }
+    } catch {
+      if (finalForm.baseUrl && !finalForm.baseUrl.match(/:\d+/) && !isExternalHypervisor) {
+        finalForm.baseUrl = finalForm.baseUrl.replace(/\/$/, '') + ':' + defaultPort
+      }
+    }
+
+    setSaving(true)
+    setError(null)
+
+    try {
+      await onSave(finalForm)
+      onClose()
+    } catch (e: any) {
+      setError(e.message || 'Error saving connection')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const isPbs = type === 'pbs'
+  const isVmware = type === 'vmware'
+  const isXcpng = type === 'xcpng'
+  const isHyperv = type === 'hyperv'
+  const isNutanix = type === 'nutanix'
+  const isExternalHypervisor = isVmware || isXcpng || isHyperv || isNutanix
+  const port = isExternalHypervisor ? '443' : isPbs ? '8007' : '8006'
+  const isEdit = mode === 'edit'
+  // XCP-ng connection mode: through Xen Orchestra (legacy) or straight to the
+  // pool master over XAPI. Everything XCP-ng-specific below reads these.
+  const isXcpngXo = isXcpng && form.subType === 'xo'
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth scroll="paper">
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        {isNutanix ? (
+          <><img src="/images/nutanix-logo.svg" alt="" width={20} height={20} /> {isEdit ? 'Edit Nutanix Connection' : 'Add Nutanix Connection'}</>
+        ) : isHyperv ? (
+          <><i className="ri-microsoft-line" style={{ color: '#0078d4' }} /> {isEdit ? 'Edit Hyper-V Server' : 'Add Hyper-V Server'}</>
+        ) : isXcpng ? (
+          <><img src="/images/xcpng-logo.svg" alt="" width={20} height={20} /> {isEdit ? t('settings.editXcpngServer') : t('settings.addXcpngServer')}</>
+        ) : isVmware ? (
+          <><i className="ri-cloud-line" style={{ color: '#638C1C' }} /> {isEdit ? t('settings.editVmwareServer') : t('settings.addVmwareServer')}</>
+        ) : isPbs ? (
+          <><i className="ri-hard-drive-2-line" /> {isEdit ? t('settings.editPbsServer') : t('settings.addPbsServer')}</>
+        ) : (
+          <><i className="ri-server-line" /> {isEdit ? t('settings.editUnisphereServer') : t('settings.addUnisphereServer')}</>
+        )}
+      </DialogTitle>
+      
+      <Box
+        component="form"
+        sx={{ display: 'flex', flex: '1 1 auto', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}
+        onSubmit={event => {
+          event.preventDefault()
+          void handleSave()
+        }}
+      >
+      <DialogContent sx={{ minHeight: 0, overflowY: 'auto' }}>
+        {error && (
+          <Alert severity="error" sx={{ mb: 2, mt: 1 }}>
+            {error}
+          </Alert>
+        )}
+
+        {(isXcpngXo || isVmware) && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            {isXcpngXo
+              ? t.rich('settings.xcpngPortInfo', { b: (chunks: any) => <b>{chunks}</b> })
+              : t.rich('settings.vmwarePortInfo', { b: (chunks: any) => <b>{chunks}</b> })
+            }
+          </Alert>
+        )}
+
+        {isHyperv && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Run these commands in PowerShell as Administrator on the Hyper-V server:
+            <Box component="pre" sx={{ mt: 1, mb: 0, p: 1, bgcolor: 'action.hover', borderRadius: 1, fontSize: 11, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+              {`# Enable WinRM remote management\nEnable-PSRemoting -Force\nSet-Item -Path WSMan:\\localhost\\Service\\Auth\\Basic -Value $true\nSet-Item -Path WSMan:\\localhost\\Service\\AllowUnencrypted -Value $true\n\n# Share the VM disks folder (works in any language)\n$everyone = New-Object Security.Principal.SecurityIdentifier("S-1-1-0")\n$account = $everyone.Translate([Security.Principal.NTAccount]).Value\nNew-SmbShare -Name "${form.hypervShareName || 'VMs'}" -Path "C:\\Path\\To\\Your\\VMs" -FullAccess $account`}
+            </Box>
+          </Alert>
+        )}
+
+        {isNutanix && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Nutanix Prism Central hostname or IP (port 9440). Disks will be exported as images and converted via virt-v2v with automatic virtio driver injection.
+          </Alert>
+        )}
+
+        {isVmware && (
+          <>
+            <ToggleButtonGroup
+              value={form.subType}
+              exclusive
+              size="small"
+              onChange={(_e, value) => {
+                if (value !== null) {
+                  handleChange('subType', value)
+                  // Adjust defaults based on sub-type
+                  if (value === 'vcenter') {
+                    if (form.vmwareUser === 'root') {
+                      handleChange('vmwareUser', 'administrator@vsphere.local')
+                    }
+                    // Disable SSH for vCenter
+                    handleSshEnabledChange(false)
+                  } else if (value === 'esxi') {
+                    if (form.vmwareUser === 'administrator@vsphere.local') {
+                      handleChange('vmwareUser', 'root')
+                    }
+                  }
+                }
+              }}
+              sx={{ mt: 1, mb: 1, width: '100%' }}
+            >
+              <ToggleButton value="esxi" sx={{ flex: 1, gap: 1 }}>
+                <i className="ri-server-line" />{' '}
+                ESXi (Direct)
+              </ToggleButton>
+              <ToggleButton value="vcenter" sx={{ flex: 1, gap: 1 }}>
+                <i className="ri-cloud-line" />{' '}
+                vCenter
+              </ToggleButton>
+            </ToggleButtonGroup>
+            {/*
+              vSAN advisory: VMDK descriptors on vSAN reference data objects via
+              vsan:// URIs that only ESXi's internal vSAN filesystem layer can
+              resolve. The ESXi-direct path (SSHFS + qemu-img) reads descriptors
+              from outside the ESXi and therefore can't follow vsan://, so it
+              silently fails at disk conversion. Migrations via vCenter use the
+              NFC (HttpNfcLease) API which goes through ESXi internally and is
+              vSAN-aware (same path ovftool takes). We surface the requirement
+              up-front here so users don't discover it after a failed migration.
+              i18n: <strong> and <code> tags in the message are interpreted by
+              next-intl's t.rich() via the chunks callbacks below.
+            */}
+            <Alert severity="info" icon={<i className="ri-information-line" />} sx={{ mb: 2, mt: 0.5 }}>
+              <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                {t('settings.vmwareSubtypeNoticeTitle')}
+              </Typography>
+              <Typography variant="body2" sx={{ mb: 0.5 }}>
+                {t.rich('settings.vmwareSubtypeNoticeEsxi', {
+                  strong: (chunks: any) => <strong>{chunks}</strong>,
+                })}
+              </Typography>
+              <Typography variant="body2" sx={{ mb: 0.5 }}>
+                {t.rich('settings.vmwareSubtypeNoticeVcenter', {
+                  strong: (chunks: any) => <strong>{chunks}</strong>,
+                  code: (chunks: any) => <code>{chunks}</code>,
+                })}
+              </Typography>
+              <Typography variant="body2">
+                {t.rich('settings.vmwareSubtypeNoticeVsan', {
+                  strong: (chunks: any) => <strong>{chunks}</strong>,
+                })}
+              </Typography>
+            </Alert>
+          </>
+        )}
+
+        {isXcpng && (
+          <FormControl fullWidth sx={{ mt: 1 }}>
+            <InputLabel id='xcpng-mode-label'>{t('settings.xcpngModeLabel')}</InputLabel>
+            <Select
+              labelId='xcpng-mode-label'
+              label={t('settings.xcpngModeLabel')}
+              value={form.subType || 'xapi'}
+              renderValue={value => (value === 'xo' ? t('settings.xcpngModeXo') : t('settings.xcpngModeXapi'))}
+              onChange={e => {
+                const value = String(e.target.value)
+                handleChange('subType', value)
+                // Carry the default user of the mode the field was left on.
+                if (value === 'xapi' && form.vmwareUser === 'admin@admin.net') handleChange('vmwareUser', 'root')
+                if (value === 'xo' && form.vmwareUser === 'root') handleChange('vmwareUser', 'admin@admin.net')
+              }}
+            >
+              <MenuItem value='xapi'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                  <span>{t('settings.xcpngModeXapi')}</span>
+                  <Box sx={{ display: 'flex', gap: 0.5, ml: 'auto' }}>
+                    <Chip size='small' variant='outlined' label={t('settings.migrationBadgeOffline')} />
+                    <Chip size='small' color='success' variant='outlined' label={t('settings.migrationBadgeWarm')} />
+                  </Box>
+                </Box>
+              </MenuItem>
+              <MenuItem value='xo'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                  <span>{t('settings.xcpngModeXo')}</span>
+                  <Box sx={{ display: 'flex', gap: 0.5, ml: 'auto' }}>
+                    <Chip size='small' variant='outlined' label={t('settings.migrationBadgeOffline')} />
+                  </Box>
+                </Box>
+              </MenuItem>
+            </Select>
+            <FormHelperText>{t('settings.xcpngModeHelper')}</FormHelperText>
+          </FormControl>
+        )}
+
+        <TextField
+          fullWidth
+          label={t('settings.connectionNameLabel')}
+          value={form.name}
+          onChange={e => handleChange('name', e.target.value)}
+          sx={{ mt: 1 }}
+          required
+        />
+
+        {mode === 'create' && isProvider && (type === 'unisphere' || type === 'pbs') && mspTenants.length > 0 && (
+          <FormControl fullWidth sx={{ mt: 2 }}>
+            <InputLabel id='conn-owner-tenant-label'>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                {t('settings.connOwnerTenantLabel')}
+                <Tooltip
+                  arrow
+                  slotProps={tooltipSlotProps}
+                  title={
+                    <Box sx={{ p: 1 }}>
+                      <Typography variant='caption' sx={{ display: 'block' }}>
+                        {t('settings.connOwnerHelper')}
+                      </Typography>
+                    </Box>
+                  }
+                >
+                  <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+                    <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                  </Box>
+                </Tooltip>
+              </Box>
+            </InputLabel>
+            <Select
+              labelId='conn-owner-tenant-label'
+              label={
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  {t('settings.connOwnerTenantLabel')}
+                  <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                </Box>
+              }
+              value={form.ownerTenantId || 'default'}
+              onChange={e => handleChange('ownerTenantId', e.target.value === 'default' ? '' : e.target.value)}
+              renderValue={value => {
+                const isPool = !value || value === 'default'
+                const label = isPool
+                  ? t('settings.connOwnerPool')
+                  : (mspTenants.find(tn => tn.id === value)?.name ?? value)
+                return (
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className={isPool ? 'ri-stack-line' : 'ri-building-line'} style={{ fontSize: 16, opacity: 0.7 }} />
+                    {label}
+                  </Box>
+                )
+              }}
+            >
+              <MenuItem value='default'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <i className='ri-stack-line' style={{ fontSize: 16, opacity: 0.7 }} />
+                  {t('settings.connOwnerPool')}
+                </Box>
+              </MenuItem>
+              {mspTenants.map(tn => (
+                <MenuItem key={tn.id} value={tn.id}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className='ri-building-line' style={{ fontSize: 16, opacity: 0.7 }} />
+                    {tn.name}
+                  </Box>
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        )}
+
+        <TextField
+          fullWidth
+          label={isExternalHypervisor
+            ? (isNutanix
+              ? 'Prism Central URL'
+              : isHyperv
+              ? 'Hyper-V Host'
+              : isXcpng
+              ? (isXcpngXo ? t('settings.xcpngHostLabel') : t('settings.xcpngMasterLabel'))
+              : (form.subType === 'vcenter' ? 'vCenter URL' : t('settings.esxiHostLabel')))
+            : t('settings.baseUrlLabel', { port })
+          }
+          value={form.baseUrl}
+          onChange={e => handleChange('baseUrl', e.target.value)}
+          placeholder={isNutanix ? 'prism-central.example.com' : isHyperv ? 'hyperv-host.local' : isXcpng ? (isXcpngXo ? 'https://xo.example.com' : 'xcp-pool-master.example.com') : isVmware ? (form.subType === 'vcenter' ? 'vcenter.example.com' : 'esxi-host.example.com') : t('settings.baseUrlPlaceholder', { port })}
+          helperText={isNutanix ? 'Nutanix Prism Central hostname or IP (port 9440)' : isHyperv ? 'Hyper-V server hostname or IP' : isXcpng ? (isXcpngXo ? t('settings.xcpngHostHelper') : t('settings.xcpngMasterHelper')) : isVmware ? (form.subType === 'vcenter' ? 'vCenter server hostname or IP' : t('settings.esxiHostHelper')) : undefined}
+          sx={{ mt: 2 }}
+          required
+        />
+
+        {isVmware && form.subType === 'vcenter' && (
+          <TextField
+            fullWidth
+            label="Datacenter"
+            value={form.vmwareDatacenter}
+            onChange={e => handleChange('vmwareDatacenter', e.target.value)}
+            placeholder="Datacenter1"
+            helperText="vCenter datacenter name"
+            sx={{ mt: 2 }}
+          />
+        )}
+
+        <FormControlLabel
+          sx={{ mt: 2 }}
+          control={
+            <Switch
+              checked={form.insecureTLS}
+              onChange={e => handleChange('insecureTLS', e.target.checked)}
+            />
+          }
+          label={t('settings.ignoreTlsErrors')}
+        />
+
+        {!isExternalHypervisor && (
+          <FormControlLabel
+            sx={{ mt: 1 }}
+            control={
+              <Switch
+                checked={form.behindProxy}
+                onChange={e => handleChange('behindProxy', e.target.checked)}
+              />
+            }
+            label={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <Typography variant="body2">{t('settings.behindProxy')}</Typography>
+                <Tooltip
+                  arrow
+                  slotProps={tooltipSlotProps}
+                  title={
+                    <Box sx={{ p: 1 }}>
+                      <Typography variant='caption' sx={{ display: 'block' }}>
+                        {t('settings.behindProxyHelper')}
+                      </Typography>
+                    </Box>
+                  }
+                >
+                  <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+                    <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                  </Box>
+                </Tooltip>
+              </Box>
+            }
+          />
+        )}
+
+        <Divider sx={{ my: 3 }} />
+
+        {/* Section: Authentication */}
+        <Typography variant="subtitle2" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-key-2-line" />
+          {isExternalHypervisor ? (isNutanix ? 'Prism Central Authentication' : isHyperv ? 'Hyper-V Authentication' : isXcpng ? t('settings.xcpngAuthentication') : t('settings.vmwareAuthentication')) : t('settings.apiAuthentication')}
+        </Typography>
+
+        {isExternalHypervisor ? (
+          <>
+            <TextField
+              fullWidth
+              label={isNutanix ? 'Username' : isHyperv ? 'Username' : isXcpng ? (isXcpngXo ? t('settings.xcpngUsername') : t('settings.xapiUsername')) : t('settings.vmwareUsername')}
+              value={form.vmwareUser}
+              onChange={e => handleChange('vmwareUser', e.target.value)}
+              placeholder={isNutanix ? 'admin' : isHyperv ? 'Administrator' : isXcpng ? (isXcpngXo ? 'admin@admin.net' : 'root') : (form.subType === 'vcenter' ? 'administrator@vsphere.local' : 'root')}
+              sx={{ mt: 1 }}
+              required
+            />
+            <TextField
+              fullWidth
+              label={isHyperv ? 'Password' : isXcpng ? (isXcpngXo ? t('settings.xcpngPasswordLabel') : t('settings.xapiPasswordLabel')) : t('settings.vmwarePasswordLabel')}
+              value={form.vmwarePassword}
+              onChange={e => handleChange('vmwarePassword', e.target.value)}
+              type={showPassword ? 'text' : 'password'}
+              helperText={isEdit ? t('settings.vmwarePasswordHelperEdit') : (isHyperv ? 'Hyper-V administrator password' : isNutanix ? 'Nutanix Prism password' : isXcpng ? (isXcpngXo ? t('settings.xcpngPasswordHelper') : t('settings.xapiPasswordHelper')) : t('settings.vmwarePasswordHelper'))}
+              sx={{ mt: 1.5 }}
+              required={!isEdit}
+              slotProps={{
+                input: {
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <IconButton size="small" onClick={() => setShowPassword(!showPassword)} edge="end">
+                        <i className={showPassword ? 'ri-eye-off-line' : 'ri-eye-line'} />
+                      </IconButton>
+                    </InputAdornment>
+                  )
+                }
+              }}
+            />
+            {isHyperv && (
+              <TextField
+                fullWidth
+                size="small"
+                label="SMB Share Name"
+                value={form.hypervShareName}
+                onChange={e => setForm(f => ({ ...f, hypervShareName: e.target.value }))}
+                placeholder="VMs"
+                helperText="Name of the shared folder on the Hyper-V server containing VHDX files (New-SmbShare -Name 'VMs' -Path 'D:\VMs')"
+                sx={{ mt: 1.5 }}
+              />
+            )}
+          </>
+        ) : (
+          <>
+            <TextField
+              fullWidth
+              label={t('settings.apiTokenId')}
+              value={tokenId}
+              onChange={e => setTokenId(e.target.value)}
+              placeholder={t('settings.apiTokenIdHelper')}
+              helperText={isEdit ? t('settings.apiTokenHelperEdit') : undefined}
+              sx={{ mt: 1 }}
+              required={!isEdit}
+            />
+            <TextField
+              fullWidth
+              label={t('settings.apiTokenSecret')}
+              value={tokenSecret}
+              onChange={e => setTokenSecret(e.target.value)}
+              type={showTokenSecret ? 'text' : 'password'}
+              placeholder={t('settings.apiTokenSecretHelper')}
+              helperText={isEdit ? t('settings.apiTokenHelperEdit') : undefined}
+              sx={{ mt: 1.5 }}
+              required={!isEdit}
+              slotProps={{
+                input: {
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <IconButton size="small" onClick={() => setShowTokenSecret(!showTokenSecret)} edge="end">
+                        <i className={showTokenSecret ? 'ri-eye-off-line' : 'ri-eye-line'} />
+                      </IconButton>
+                    </InputAdornment>
+                  )
+                }
+              }}
+            />
+
+            {isPbs && isEdit && initialData?.id && (
+              <Box sx={{ mt: 2, p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                  <i className="ri-fingerprint-line" style={{ fontSize: 16, opacity: 0.7 }} />
+                  <Typography variant="body2" fontWeight={600}>TLS fingerprint (SHA256)</Typography>
+                  <Tooltip
+                    arrow
+                    slotProps={tooltipSlotProps}
+                    title={
+                      <Box sx={{ p: 1 }}>
+                        <Typography variant='caption' sx={{ display: 'block' }}>
+                          Required for UNISPHERE to trust this PBS when UniCenter injects a pbs: storage. Click Capture to fetch from the server&apos;s TLS handshake.
+                        </Typography>
+                      </Box>
+                    }
+                  >
+                    <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+                      <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                    </Box>
+                  </Tooltip>
+                </Box>
+                {pbsFingerprint ? (
+                  <Typography
+                    variant="body2"
+                    sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 11, wordBreak: 'break-all', mb: 1 }}
+                  >
+                    {pbsFingerprint}
+                  </Typography>
+                ) : (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                    Not captured yet.
+                  </Typography>
+                )}
+                {fingerprintError && (
+                  <Typography variant="caption" color="error" sx={{ display: 'block', mb: 1 }}>
+                    {fingerprintError}
+                  </Typography>
+                )}
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={handleCapturePbsFingerprint}
+                  disabled={capturingFingerprint}
+                  startIcon={<i className="ri-refresh-line" />}
+                >
+                  {capturingFingerprint ? '…' : pbsFingerprint ? 'Re-capture' : 'Capture fingerprint'}
+                </Button>
+              </Box>
+            )}
+
+            <Accordion
+              disableGutters
+              elevation={0}
+              sx={{
+                mt: 2,
+                border: '1px solid',
+                borderColor: 'info.main',
+                borderRadius: '8px !important',
+                '&::before': { display: 'none' },
+                bgcolor: 'transparent',
+              }}
+            >
+              <AccordionSummary
+                expandIcon={<i className="ri-arrow-down-s-line" style={{ fontSize: 18 }} />}
+                sx={{ minHeight: 40, '& .MuiAccordionSummary-content': { my: 0.5 } }}
+              >
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <i className="ri-terminal-line" style={{ fontSize: 16, opacity: 0.7 }} />
+                  <Typography variant="body2" fontWeight={600}>
+                    {t('settings.tokenSetupGuide')}
+                  </Typography>
+                </Box>
+              </AccordionSummary>
+              <AccordionDetails sx={{ pt: 0, pb: 1.5 }}>
+                <Typography variant="caption" sx={{ display: 'block', mb: 1, opacity: 0.7 }}>
+                  {isPbs ? t('settings.pbsTokenSetupDesc') : t('settings.unisphereTokenSetupDesc')}
+                </Typography>
+                <Box
+                  component="pre"
+                  sx={{
+                    bgcolor: 'grey.900',
+                    color: 'grey.100',
+                    p: 1.5,
+                    borderRadius: 1,
+                    fontSize: '0.75rem',
+                    fontFamily: '"JetBrains Mono", monospace',
+                    overflow: 'auto',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    position: 'relative',
+                    m: 0,
+                  }}
+                >
+                  <Tooltip
+                    arrow
+                    slotProps={tooltipSlotProps}
+                    title={tokenSetupCopy.copied ? t('common.copied') : t('common.copy')}
+                  >
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        const text = isPbs
+                          ? `esage-backup-manager user create unicenter@pbs --comment "UniCenter service account"\nesage-backup-manager user generate-token unicenter@pbs unicenter\nesage-backup-manager acl update / Admin --auth-id unicenter@pbs\nesage-backup-manager acl update / Admin --auth-id 'unicenter@pbs!unicenter'`
+                          : `pveum user add unicenter@unisphere --comment "UniCenter service account"\npveum user token add unicenter@unisphere unicenter-token --privsep=0\npveum aclmod / -user unicenter@unisphere -role PVEAdmin\npveum role add UniCenter -privs "Sys.Modify,Sys.PowerMgmt"\npveum aclmod / -user unicenter@unisphere -role UniCenter`
+                        void tokenSetupCopy.copy(text)
+                      }}
+                      sx={{
+                        position: 'absolute',
+                        top: 4,
+                        right: 4,
+                        color: 'grey.400',
+                        '&:hover': { color: 'grey.100' },
+                      }}
+                    >
+                      <i className={tokenSetupCopy.copied ? 'ri-check-line' : 'ri-file-copy-line'} style={{ fontSize: 14 }} />
+                    </IconButton>
+                  </Tooltip>
+                  {isPbs ? (
+                    <>
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.pbsStep1')}</Box>{'\n'}
+                      esage-backup-manager user create unicenter@pbs \{'\n'}
+                      {'  '}--comment &quot;UniCenter service account&quot;{'\n\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.pbsStep2')}</Box>{'\n'}
+                      esage-backup-manager user generate-token \{'\n'}
+                      {'  '}unicenter@pbs unicenter{'\n\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.pbsStep3')}</Box>{'\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># ({t('settings.pbsStep3Hint')})</Box>{'\n'}
+                      esage-backup-manager acl update / Admin \{'\n'}
+                      {'  '}--auth-id unicenter@pbs{'\n'}
+                      esage-backup-manager acl update / Admin \{'\n'}
+                      {'  '}--auth-id &apos;unicenter@pbs!unicenter&apos;
+                    </>
+                  ) : (
+                    <>
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.unisphereStep1')}</Box>{'\n'}
+                      pveum user add unicenter@unisphere \{'\n'}
+                      {'  '}--comment &quot;UniCenter service account&quot;{'\n\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.unisphereStep2')}</Box>{'\n'}
+                      pveum user token add unicenter@unisphere unicenter-token \{'\n'}
+                      {'  '}--privsep=0{'\n\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.unisphereStep3')}</Box>{'\n'}
+                      pveum aclmod / -user unicenter@unisphere -role PVEAdmin{'\n\n'}
+                      <Box component="span" sx={{ color: 'grey.500' }}># {t('settings.unisphereStep4')}</Box>{'\n'}
+                      pveum role add UniCenter -privs &quot;Sys.Modify,Sys.PowerMgmt&quot;{'\n'}
+                      pveum aclmod / -user unicenter@unisphere -role UniCenter
+                    </>
+                  )}
+                </Box>
+                {isPbs && (
+                  <Typography variant="caption" sx={{ display: 'block', mt: 1, opacity: 0.7 }}>
+                    {t('settings.pbsSetupAdminNote')}
+                  </Typography>
+                )}
+              </AccordionDetails>
+            </Accordion>
+          </>
+        )}
+
+        {!isPbs && !isXcpng && !isHyperv && !isNutanix && !(isVmware && form.subType === 'vcenter') && (
+          <>
+        <Divider sx={{ my: 3 }} />
+
+        {/* Section: SSH access (UNISPHERE + VMware/ESXi) */}
+        <Typography variant="subtitle2" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-terminal-line" />
+          {t('settings.sshAccess')}
+          <Chip label={t('common.optional')} size="small" variant="outlined" sx={{ ml: 1 }} />
+          <Tooltip
+            arrow
+            slotProps={tooltipSlotProps}
+            title={
+              <Box sx={{ p: 1 }}>
+                <Typography variant='caption' sx={{ display: 'block' }}>
+                  {t('settings.sshInfo')}
+                </Typography>
+              </Box>
+            }
+          >
+            <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+              <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+            </Box>
+          </Tooltip>
+        </Typography>
+
+        <FormControlLabel
+          control={
+            <Switch
+              checked={form.sshEnabled}
+              onChange={e => handleSshEnabledChange(e.target.checked)}
+            />
+          }
+          label={t('settings.enableSshAccess')}
+        />
+
+        <Collapse in={form.sshEnabled}>
+          <Box sx={{ mt: 2, pl: 2, borderLeft: '2px solid', borderColor: 'divider' }}>
+            <Box sx={{ display: 'flex', gap: 2 }}>
+              <NumericTextField
+                label={t('settings.sshPort')}
+                type="number"
+                value={form.sshPort}
+                onChange={port => handleChange('sshPort', port)}
+                fallback={22}
+                min={1}
+                max={65535}
+                sx={{ width: 120 }}
+                InputProps={{
+                  inputProps: { min: 1, max: 65535 }
+                }}
+              />
+              
+              <TextField
+                label={t('settings.sshUser')}
+                value={form.sshUser}
+                onChange={e => handleChange('sshUser', e.target.value)}
+                sx={{ flex: 1 }}
+                placeholder="root"
+              />
+            </Box>
+
+            <FormControl fullWidth sx={{ mt: 2 }}>
+              <InputLabel>{t('settings.sshAuthMethod')}</InputLabel>
+              <Select
+                value={form.sshAuthMethod}
+                onChange={e => handleSshAuthMethodChange(e.target.value as 'key' | 'password' | '')}
+                label={t('settings.sshAuthMethod')}
+              >
+                <MenuItem value="key">
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className="ri-key-line" />
+                    {t('settings.sshPrivateKey')}
+                  </Box>
+                </MenuItem>
+                <MenuItem value="password">
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className="ri-lock-password-line" />
+                    {t('settings.sshPasswordAuth')}
+                  </Box>
+                </MenuItem>
+              </Select>
+            </FormControl>
+
+            {/* SSH Key fields */}
+            <Collapse in={form.sshAuthMethod === 'key'}>
+              <Box sx={{ mt: 2 }}>
+                <TextField
+                  fullWidth
+                  label={t('settings.sshPrivateKey')}
+                  value={form.sshKey}
+                  onChange={e => handleChange('sshKey', e.target.value)}
+                  multiline
+                  rows={4}
+                  placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+                  helperText={
+                    initialData?.sshKeyConfigured 
+                      ? t('settings.sshKeyConfiguredHint')
+                      : t('settings.sshKeyHint')
+                  }
+                  InputProps={{
+                    sx: { fontFamily: 'monospace', fontSize: '0.85rem' },
+                    endAdornment: (
+                      <InputAdornment position="end" sx={{ alignSelf: 'flex-start', mt: 1 }}>
+                        <Tooltip title={showSshKey ? t('common.hide') : t('common.show')}>
+                          <IconButton onClick={() => setShowSshKey(!showSshKey)} size="small">
+                            <i className={showSshKey ? "ri-eye-off-line" : "ri-eye-line"} />
+                          </IconButton>
+                        </Tooltip>
+                      </InputAdornment>
+                    )
+                  }}
+                  type={showSshKey ? 'text' : 'password'}
+                />
+                
+                <TextField
+                  fullWidth
+                  label={t('settings.sshPassphrase')}
+                  value={form.sshPassphrase}
+                  onChange={e => handleChange('sshPassphrase', e.target.value)}
+                  type="password"
+                  helperText={t('settings.sshPassphraseHint')}
+                  sx={{ mt: 2 }}
+                />
+              </Box>
+            </Collapse>
+
+            {/* SSH Password field */}
+            <Collapse in={form.sshAuthMethod === 'password'}>
+              <Box sx={{ mt: 2 }}>
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  {t('settings.sshPasswordWarning')}
+                </Alert>
+                
+                <TextField
+                  fullWidth
+                  label={t('settings.sshPassword')}
+                  value={form.sshPassword}
+                  onChange={e => handleChange('sshPassword', e.target.value)}
+                  type={showPassword ? 'text' : 'password'}
+                  helperText={
+                    initialData?.sshPassConfigured 
+                      ? t('settings.sshPasswordConfiguredHint')
+                      : undefined
+                  }
+                  InputProps={{
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        <IconButton onClick={() => setShowPassword(!showPassword)} size="small">
+                          <i className={showPassword ? "ri-eye-off-line" : "ri-eye-line"} />
+                        </IconButton>
+                      </InputAdornment>
+                    )
+                  }}
+                />
+              </Box>
+            </Collapse>
+
+            {/* Use sudo for privileged commands */}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={form.sshUseSudo}
+                  onChange={e => setForm({ ...form, sshUseSudo: e.target.checked })}
+                />
+              }
+              label={
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  <Typography variant="body2">{t('settings.sshUseSudo')}</Typography>
+                  <Tooltip
+                    arrow
+                    slotProps={tooltipSlotProps}
+                    title={
+                      <Box sx={{ p: 1 }}>
+                        <Typography variant='caption' sx={{ display: 'block' }}>
+                          {t('settings.sshUseSudoHelper')}
+                        </Typography>
+                      </Box>
+                    }
+                  >
+                    <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+                      <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                    </Box>
+                  </Tooltip>
+                </Box>
+              }
+              sx={{ mt: 1, ml: 0 }}
+            />
+
+            {/* Test SSH Button (only in edit mode with existing connection) */}
+            {isEdit && initialData?.id && form.sshEnabled && (
+              <Box sx={{ mt: 2 }}>
+                <Button
+                  variant="outlined"
+                  onClick={handleTestSSH}
+                  disabled={testingSSH}
+                  startIcon={testingSSH ? <CircularProgress size={16} /> : <i className="ri-plug-line" />}
+                >
+                  {t('settings.testSshConnection')}
+                </Button>
+
+                {sshTestResult && (
+                  <Box sx={{ mt: 2 }}>
+                    <Alert severity={sshTestResult.success ? 'success' : 'error'}>
+                      <Typography variant="body2" sx={{ fontWeight: 600, mb: sshTestResult.nodes?.length ? 1 : 0 }}>
+                        {sshTestResult.success
+                          ? t('settings.sshTestSuccess')
+                          : (sshTestResult.error || t('settings.sshTestFailed'))}
+                      </Typography>
+                      {/* Always render the per-node breakdown when present, even when the
+                          overall test failed. In a cluster a single unreachable or
+                          misconfigured node fails the whole test; the user needs to see
+                          WHICH node failed and why instead of a bare "SSH test failed"
+                          (issue #492). */}
+                      {sshTestResult.nodes?.map(node => (
+                        <Box key={node.node} sx={{ display: 'flex', alignItems: 'center', gap: 1, ml: 1 }}>
+                          <i className={node.status === 'ok' ? "ri-check-line" : "ri-close-line"}
+                             style={{ color: node.status === 'ok' ? '#22c55e' : '#ef4444' }} />
+                          <Typography variant="body2">
+                            {node.node} ({node.ip})
+                          </Typography>
+                          {node.error && (
+                            <Typography variant="caption" color="error">
+                              - {node.error}
+                            </Typography>
+                          )}
+                        </Box>
+                      ))}
+                    </Alert>
+                  </Box>
+                )}
+              </Box>
+            )}
+          </Box>
+        </Collapse>
+          </>
+        )}
+
+        {!isExternalHypervisor && (
+          <>
+            <Divider sx={{ my: 3 }} />
+
+            {/* Section: Location (optionnelle) — UNISPHERE/PBS only */}
+            <Typography variant="subtitle2" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+              <i className="ri-map-pin-line" />
+              {t('settings.location')}
+              <Chip label={t('common.optional')} size="small" variant="outlined" sx={{ ml: 1 }} />
+              <Tooltip
+                arrow
+                slotProps={tooltipSlotProps}
+                title={
+                  <Box sx={{ p: 1 }}>
+                    <Typography variant='caption' sx={{ display: 'block' }}>
+                      {t('settings.locationInfo')}
+                    </Typography>
+                  </Box>
+                }
+              >
+                <Box component='span' sx={{ display: 'inline-flex', alignItems: 'center', cursor: 'default' }}>
+                  <i className='ri-information-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                </Box>
+              </Tooltip>
+            </Typography>
+
+            <Box sx={{ display: 'flex', gap: 2, mt: 1 }}>
+              <TextField
+                label={t('settings.locationLabel')}
+                value={form.locationLabel}
+                onChange={e => handleChange('locationLabel', e.target.value)}
+                placeholder="Paris DC1, Frankfurt, ..."
+                sx={{ flex: 2 }}
+              />
+              <TextField
+                label={t('settings.latitude')}
+                value={form.latitude}
+                onChange={e => handleChange('latitude', e.target.value.replaceAll(',', '.'))}
+                placeholder="48.8566"
+                sx={{ flex: 1 }}
+                InputProps={{ inputProps: { min: -90, max: 90, step: 'any' } }}
+              />
+              <TextField
+                label={t('settings.longitude')}
+                value={form.longitude}
+                onChange={e => handleChange('longitude', e.target.value.replaceAll(',', '.'))}
+                placeholder="2.3522"
+                sx={{ flex: 1 }}
+                InputProps={{ inputProps: { min: -180, max: 180, step: 'any' } }}
+              />
+            </Box>
+            <Autocomplete
+              sx={{ mt: 2 }}
+              options={COUNTRIES}
+              getOptionLabel={c => c.name}
+              isOptionEqualToValue={(a, b) => a.code === b.code}
+              value={findCountry(form.country) ?? null}
+              onChange={(_e, v) => handleChange('country', v?.code ?? '')}
+              renderOption={(props, option) => {
+                const { key, ...rest } = props as any
+                return (
+                  <Box component="li" key={option.code} {...rest} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <CountryFlag code={option.code} size={20} />
+                    <span>{option.name}</span>
+                    <Typography component="span" variant="caption" sx={{ ml: 'auto', opacity: 0.5 }}>
+                      {option.code}
+                    </Typography>
+                  </Box>
+                )
+              }}
+              renderInput={params => (
+                <TextField
+                  {...params}
+                  label={t('settings.country')}
+                  placeholder={t('settings.countryPlaceholder')}
+                  InputProps={{
+                    ...params.InputProps,
+                    startAdornment: form.country ? (
+                      <InputAdornment position="start">
+                        <CountryFlag code={form.country} size={20} />
+                      </InputAdornment>
+                    ) : undefined,
+                  }}
+                />
+              )}
+            />
+          </>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ flexShrink: 0, py: '12px !important' }}>
+        <Button onClick={onClose} disabled={saving}>
+          {t('common.cancel')}
+        </Button>
+        <Button
+          type="submit"
+          variant="contained"
+          color={isPbs ? 'secondary' : 'primary'}
+          disabled={saving || !form.name.trim() || !form.baseUrl.trim() || (!isExternalHypervisor && !isEdit && !tokenId.trim() && !tokenSecret.trim() && !form.apiToken.trim()) || (isExternalHypervisor && !isEdit && !form.vmwarePassword)}
+          startIcon={saving ? <CircularProgress size={16} /> : <i className="ri-save-line" />}
+        >
+          {t('common.save')}
+        </Button>
+      </DialogActions>
+      </Box>
+    </Dialog>
+  )
+}

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "UniCenter Classic",
+  "themeId": "vcenterClassic",
+  "source": "UniCenter 经典界面设计",
+  "version": "1.0.0",
+  "color": {
+    "header": "#1B405B",
+    "paper": "#FFFFFF",
+    "navigation": "#F7F8FA",
+    "soft": "#F4F6F8",
+    "prototypeStrip": "#EEF4F7",
+    "selected": "#DCEEF7",
+    "hover": "#E8F0F5",
+    "text": "#293741",
+    "muted": "#637785",
+    "primary": "#0079B8",
+    "primaryText": "#00669D",
+    "metric": "#006EAA",
+    "border": "#D5DCE2",
+    "rowBorder": "#E0E6EB",
+    "navDivider": "#E2E7EB",
+    "controlBorder": "#98ACB9",
+    "inputBorder": "#A8B8C4",
+    "inputBorderSecondary": "#AEBFC9",
+    "progressTrack": "#E9EDF1",
+    "progressFill": "#3294C8",
+    "success": "#348322",
+    "warning": "#A86B00",
+    "danger": "#B23427",
+    "dangerBorder": "#C9A49E",
+    "overlay": "rgba(18, 49, 74, 0.60)"
+  },
+  "typography": {
+    "fontFamily": "-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Microsoft YaHei\", sans-serif",
+    "baseSize": 13,
+    "baseLineHeight": 1.5,
+    "pageTitle": {
+      "fontSize": 23,
+      "fontWeight": 400
+    },
+    "dialogTitle": {
+      "fontSize": 17,
+      "fontWeight": 500
+    },
+    "sectionTitle": {
+      "fontSize": 14,
+      "fontWeight": 500
+    },
+    "control": {
+      "fontSize": 12,
+      "fontWeight": 400
+    },
+    "caption": {
+      "fontSize": 11,
+      "fontWeight": 400
+    },
+    "metric": {
+      "fontSize": 26,
+      "fontWeight": 400
+    },
+    "brand": {
+      "fontSize": 20,
+      "fontWeight": 400
+    }
+  },
+  "layout": {
+    "topbarMinHeight": 57,
+    "environmentStripApproxHeight": 31,
+    "shortcutStripApproxHeight": 33,
+    "referenceRootMinHeight": 780,
+    "shellMinHeight": 570,
+    "navigationWidth": 180,
+    "navigationWidthTablet": 150,
+    "contentPaddingX": 22,
+    "contentPaddingXTablet": 15,
+    "contentPaddingTop": 18,
+    "contentPaddingBottom": 23,
+    "objectTreeWidth": 185,
+    "objectTreeWidthTablet": 155,
+    "dialogWidth": 740,
+    "wizardStepWidth": 165,
+    "wizardMinHeight": 365
+  },
+  "component": {
+    "radius": 2,
+    "inputRadius": 1,
+    "borderWidth": 1,
+    "iconSize": 16,
+    "buttonMinHeight": 32,
+    "buttonPaddingY": 6,
+    "buttonPaddingX": 11,
+    "navigationItemMinHeight": 32,
+    "metricGap": 12,
+    "panelGap": 16,
+    "progressHeight": 7,
+    "tableCellPaddingY": 9,
+    "tableCellPaddingX": 11,
+    "tableCellPaddingCompactY": 6,
+    "tableCellPaddingCompactX": 9,
+    "tableCellPaddingSpaciousY": 13,
+    "tableCellPaddingSpaciousX": 14,
+    "modalShadow": "0 15px 45px rgba(0, 0, 0, 0.27)"
+  },
+  "breakpoint": {
+    "tablet": 800,
+    "mobile": 560
+  }
+}

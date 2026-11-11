@@ -1,0 +1,365 @@
+'use client'
+
+import { useEffect, useRef, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import {
+  Box,
+  Chip,
+  CircularProgress,
+  Collapse,
+  LinearProgress,
+  Typography,
+} from '@mui/material'
+
+import { useTaskDetail } from '@/hooks/useTaskDetail'
+
+interface DeploymentProgressProps {
+  deploymentId: string
+  onComplete: (status: 'completed' | 'failed', error?: string) => void
+}
+
+const STEPS = ['pending', 'downloading', 'creating', 'configuring', 'starting', 'completed'] as const
+
+function getLogType(text: string) {
+  const t = text.toLowerCase()
+  if (t.includes('error') || t.includes('failed')) return 'error'
+  if (t.includes('warning')) return 'warning'
+  if (t.includes('%') || t.includes('transferred')) return 'transfer'
+  return 'info'
+}
+
+function getLogColor(type: string) {
+  switch (type) {
+    case 'error': return '#f85149'
+    case 'warning': return '#d29922'
+    case 'transfer': return '#58a6ff'
+    default: return '#c9d1d9'
+  }
+}
+
+export default function DeploymentProgress({ deploymentId, onComplete }: DeploymentProgressProps) {
+  const t = useTranslations()
+  const [status, setStatus] = useState<string>('pending')
+  const [error, setError] = useState<string | null>(null)
+  const [connectionId, setConnectionId] = useState<string | undefined>()
+  const [node, setNode] = useState<string | undefined>()
+  const [taskUpid, setTaskUpid] = useState<string | undefined>()
+  const [showLogs, setShowLogs] = useState(false)
+  const logsEndRef = useRef<HTMLDivElement>(null)
+  const logsContainerRef = useRef<HTMLDivElement>(null)
+  const [autoScroll, setAutoScroll] = useState(true)
+
+  // UNISPHERE task detail — active when we have a UPID during downloading or creating
+  const isTaskActive = !!taskUpid && ['downloading', 'creating'].includes(status)
+  const { data: taskData } = useTaskDetail(
+    isTaskActive ? connectionId : undefined,
+    isTaskActive ? node : undefined,
+    isTaskActive ? taskUpid : undefined,
+    isTaskActive
+  )
+
+  useEffect(() => {
+    if (!deploymentId) return
+
+    let active = true
+    const poll = async () => {
+      try {
+        const url = `/api/v1/templates/deployments/${deploymentId}`
+        const res = await fetch(url)
+        const text = await res.text()
+        let data: any
+        try {
+          data = JSON.parse(text)
+        } catch {
+          console.warn('[DeploymentProgress] Non-JSON response from', url, '→', text.slice(0, 200))
+          if (active) setTimeout(poll, 5000)
+          return
+        }
+        const deployment = data.data
+        if (!active || !deployment) return
+
+        setStatus(deployment.status)
+        setError(deployment.error)
+        setConnectionId(deployment.connectionId)
+        setNode(deployment.node)
+        setTaskUpid(deployment.taskUpid || undefined)
+
+        if (deployment.status === 'completed') {
+          onComplete('completed')
+          return
+        }
+        if (deployment.status === 'failed') {
+          onComplete('failed', deployment.error)
+          return
+        }
+
+        setTimeout(poll, 2000)
+      } catch {
+        if (active) setTimeout(poll, 5000)
+      }
+    }
+
+    poll()
+    return () => { active = false }
+  }, [deploymentId, onComplete])
+
+  // Auto-scroll logs
+  useEffect(() => {
+    if (autoScroll && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [taskData?.logs?.length, autoScroll])
+
+  const handleScroll = () => {
+    if (!logsContainerRef.current) return
+    const { scrollTop, scrollHeight, clientHeight } = logsContainerRef.current
+    setAutoScroll(scrollHeight - scrollTop - clientHeight < 100)
+  }
+
+  const currentStepIndex = STEPS.indexOf(status as any)
+
+  // Step-based progress (same logic as before, always visible)
+  const stepProgress = status === 'completed'
+    ? 100
+    : status === 'failed'
+      ? 0
+      : Math.max(0, (currentStepIndex / (STEPS.length - 1)) * 100)
+
+  // UNISPHERE task data (may be null if not available)
+  const unisphereProgress = (isTaskActive && taskData?.progress != null) ? taskData.progress : null
+  const unisphereSpeed = (isTaskActive && taskData?.speed) ? taskData.speed : null
+  const unisphereEta = (isTaskActive && taskData?.eta) ? taskData.eta : null
+  const unisphereLogs = isTaskActive ? (taskData?.logs || []) : []
+  const unisphereMessage = (isTaskActive && taskData?.message) ? taskData.message : null
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3, py: 2 }}>
+      {/* Overall progress bar — always step-based */}
+      <Box>
+        <LinearProgress
+          variant={status === 'completed' || status === 'failed' ? 'determinate' : 'buffer'}
+          value={stepProgress}
+          valueBuffer={Math.min(stepProgress + 15, 100)}
+          color={status === 'failed' ? 'error' : status === 'completed' ? 'success' : 'primary'}
+          sx={{ height: 8, borderRadius: 4 }}
+        />
+      </Box>
+
+      {/* Step indicators */}
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+        {STEPS.filter(s => s !== 'pending').map((step, i) => {
+          const stepIndex = STEPS.indexOf(step)
+          const isActive = status === step
+          const isDone = currentStepIndex > stepIndex || status === 'completed'
+          const isFailed = status === 'failed' && currentStepIndex === stepIndex
+          const showUnisphereDetail = isActive && ['downloading', 'creating'].includes(step)
+
+          return (
+            <Box key={step}>
+              <Box
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1.5,
+                  opacity: isDone || isActive || isFailed ? 1 : 0.4,
+                }}
+              >
+                <Box
+                  sx={{
+                    width: 32,
+                    height: 32,
+                    borderRadius: '50%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    bgcolor: isDone
+                      ? 'success.main'
+                      : isFailed
+                        ? 'error.main'
+                        : isActive
+                          ? 'primary.main'
+                          : 'action.hover',
+                    color: isDone || isActive || isFailed ? '#fff' : 'text.secondary',
+                  }}
+                >
+                  {isActive && !isDone ? (
+                    <CircularProgress size={18} sx={{ color: '#fff' }} />
+                  ) : isDone ? (
+                    <i className="ri-check-line" style={{ fontSize: 18 }} />
+                  ) : isFailed ? (
+                    <i className="ri-close-line" style={{ fontSize: 18 }} />
+                  ) : (
+                    <Typography variant="caption" sx={{ fontWeight: 600 }}>{i + 1}</Typography>
+                  )}
+                </Box>
+                <Box sx={{ flex: 1 }}>
+                  <Typography
+                    variant="body2"
+                    sx={{ fontWeight: isActive ? 600 : 400, color: isFailed ? 'error.main' : undefined }}
+                  >
+                    {t(`templates.deploy.progress.${step}` as any)}
+                  </Typography>
+                  {isFailed && error && (
+                    <Typography variant="caption" color="error">
+                      {error}
+                    </Typography>
+                  )}
+                </Box>
+              </Box>
+
+              {/* UNISPHERE task detail — shown during downloading/creating steps */}
+              {showUnisphereDetail && (
+                <Box sx={{ ml: 5.5, mt: 1, display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  {/* Sub-progress bar: determinate when UNISPHERE data available, indeterminate otherwise */}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <LinearProgress
+                      variant={unisphereProgress != null && unisphereProgress > 0 ? 'determinate' : 'indeterminate'}
+                      value={unisphereProgress || 0}
+                      sx={{
+                        flex: 1,
+                        height: 6,
+                        borderRadius: 3,
+                        bgcolor: 'action.hover',
+                        '& .MuiLinearProgress-bar': { borderRadius: 3 },
+                      }}
+                    />
+                    {unisphereProgress != null && unisphereProgress > 0 && (
+                      <Typography variant="caption" sx={{ fontWeight: 600, minWidth: 40, textAlign: 'right' }}>
+                        {Math.round(unisphereProgress)}%
+                      </Typography>
+                    )}
+                  </Box>
+
+                  {/* Status message from UNISPHERE task */}
+                  {unisphereMessage && (
+                    <Typography variant="caption" sx={{ opacity: 0.6, fontSize: '0.7rem' }}>
+                      {unisphereMessage}
+                    </Typography>
+                  )}
+
+                  {/* Speed and ETA badges */}
+                  {(unisphereSpeed || unisphereEta) && (
+                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                      {unisphereSpeed && (
+                        <Chip
+                          icon={<i className="ri-speed-line" style={{ fontSize: 14 }} />}
+                          label={unisphereSpeed}
+                          size="small"
+                          variant="outlined"
+                          sx={{ height: 22, fontSize: '0.7rem' }}
+                        />
+                      )}
+                      {unisphereEta && (
+                        <Chip
+                          icon={<i className="ri-time-line" style={{ fontSize: 14 }} />}
+                          label={`~${unisphereEta}`}
+                          size="small"
+                          variant="outlined"
+                          sx={{ height: 22, fontSize: '0.7rem' }}
+                        />
+                      )}
+                    </Box>
+                  )}
+
+                  {/* Show/Hide logs toggle */}
+                  {isTaskActive && (
+                    <>
+                      <Box
+                        onClick={() => setShowLogs(!showLogs)}
+                        sx={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 0.5,
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                          '&:hover': { opacity: 0.8 },
+                        }}
+                      >
+                        <i
+                          className={showLogs ? 'ri-arrow-down-s-line' : 'ri-arrow-right-s-line'}
+                          style={{ fontSize: 16, opacity: 0.6 }}
+                        />
+                        <Typography variant="caption" sx={{ opacity: 0.6 }}>
+                          {showLogs
+                            ? t('templates.deploy.progress.hideLogs' as any)
+                            : t('templates.deploy.progress.showLogs' as any)}
+                        </Typography>
+                      </Box>
+
+                      {/* Collapsible log viewer */}
+                      <Collapse in={showLogs}>
+                        <Box
+                          ref={logsContainerRef}
+                          onScroll={handleScroll}
+                          sx={{
+                            maxHeight: 200,
+                            overflow: 'auto',
+                            bgcolor: '#0d1117',
+                            borderRadius: 1,
+                            fontFamily: 'monospace',
+                            fontSize: 11,
+                            lineHeight: 1.6,
+                          }}
+                        >
+                          {unisphereLogs.length > 0 ? (
+                            <Box sx={{ p: 1 }}>
+                              {unisphereLogs.map((log: any, idx: number) => {
+                                const logType = getLogType(log.t || '')
+                                const logColor = getLogColor(logType)
+                                return (
+                                  <Box
+                                    key={`${log.n}-${idx}`}
+                                    sx={{
+                                      display: 'flex',
+                                      py: 0.125,
+                                      '&:hover': { bgcolor: 'rgba(255,255,255,0.05)' },
+                                    }}
+                                  >
+                                    <Typography
+                                      component="span"
+                                      sx={{
+                                        color: 'grey.600',
+                                        minWidth: 32,
+                                        textAlign: 'right',
+                                        pr: 1,
+                                        userSelect: 'none',
+                                        fontFamily: 'inherit',
+                                        fontSize: 'inherit',
+                                      }}
+                                    >
+                                      {log.n}
+                                    </Typography>
+                                    <Typography
+                                      component="span"
+                                      sx={{
+                                        color: logColor,
+                                        fontFamily: 'inherit',
+                                        fontSize: 'inherit',
+                                        wordBreak: 'break-all',
+                                      }}
+                                    >
+                                      {log.t}
+                                    </Typography>
+                                  </Box>
+                                )
+                              })}
+                              <div ref={logsEndRef} />
+                            </Box>
+                          ) : (
+                            <Box sx={{ p: 2, textAlign: 'center', color: 'grey.500', fontSize: 11 }}>
+                              Waiting for logs...
+                            </Box>
+                          )}
+                        </Box>
+                      </Collapse>
+                    </>
+                  )}
+                </Box>
+              )}
+            </Box>
+          )
+        })}
+      </Box>
+    </Box>
+  )
+}

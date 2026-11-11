@@ -1,0 +1,823 @@
+/**
+ * XCP-ng → eSage UniSphere migration pipeline
+ *
+ * Flow:
+ * 1. Pre-flight checks (source reachable, UNISPHERE reachable, VM config, disk space)
+ * 2. Retrieve full VM config from the source (Xen Orchestra REST or direct XAPI)
+ * 3. Create empty VM shell on eSage via API
+ * 4. For each disk:
+ *    - Block storage (LVM, ZFS, RBD): download VHD → unispheresm alloc → qemu-img convert directly to device
+ *    - File-based storage (dir, NFS, CIFS): download VHD to storage path → convert →
+ *      rename into the storage (adopt), with qm disk import as fallback (#292)
+ * 5. Attach disks, configure boot order
+ * 6. Optionally start the VM
+ *
+ * Data flows source → eSage directly (not through UniCenter): curl on the UNISPHERE
+ * node pulls each VDI from XO or from the pool master export endpoint.
+ * UniCenter orchestrates via SSH commands + UNISPHERE API.
+ */
+
+import { getTenantPrisma } from "@/lib/tenant"
+import { decryptSecret } from "@/lib/crypto/secret"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { unisphereFetch } from "@/lib/esage/client"
+import { isFileBasedStorage } from "@/lib/esage/storage"
+import { executeSSH, shellEscape } from "@/lib/ssh/exec"
+import { openXcpngSource, type XcpngSource } from "@/lib/xcpng/source"
+import { mapXoToUnisphereConfig, isWindowsXoVm } from "./xcpngConfigMapper"
+import type { XoVmConfig, XoDiskInfo } from "@/lib/xcpng/client"
+import { allocateAndMapBlockVolume, nextFreeDiskName, type AllocatedVolume } from "./unispheresm-alloc"
+import { adoptImportAndAttachFileVolume } from "./adopt-file-volume"
+import { unisphereSetVmConfig, destroyUnisphereVm } from "./unisphere-vm-config"
+import { convertDisksToQcow2 } from "./qcow2-convert"
+import { startJobHeartbeat } from "./job-heartbeat"
+import { interpretPollExit, MAX_CONSECUTIVE_POLL_FAILURES } from "./poll-exit"
+import { startSessionKeepAlive } from "./warm/session-keepalive"
+
+type MigrationStatus = "pending" | "preflight" | "creating_vm" | "transferring" | "configuring" | "converting_disks" | "completed" | "failed" | "cancelled"
+
+interface MigrationConfig {
+  sourceConnectionId: string
+  sourceVmId: string
+  targetConnectionId: string
+  targetNode: string
+  targetStorage: string
+  networkBridge: string
+  /**
+   * Optional 802.1Q VLAN tag (1-4094) appended to net0 as `tag=N`. Empty/undefined
+   * means access port on the bridge's native VLAN. XCP-ng VIF VLAN is not
+   * imported automatically — the user picks the tag in the migration dialog.
+   */
+  vlanTag?: number
+  startAfterMigration: boolean
+  /**
+   * Convert the migrated data disks to qcow2 after the migration (one `move_disk`
+   * per disk on the same storage), so they can take eSage snapshots on a
+   * snapshot-as-volume-chain LVM storage (#595). Opt-in, default false; the
+   * conversion can never fail the migration.
+   */
+  convertDisksToQcow2?: boolean
+  migrationType?: "cold"
+  // User-selected scratch directory on the UNISPHERE node for VHD download +
+  // qemu-img conversion. When set, overrides the default heuristic that picks
+  // the target storage's images dir (file-based) or /var/lib/vz/tmp (block).
+  tempStorage?: string
+  // User-supplied target VMID. When set, used directly instead of
+  // `/cluster/nextid`; UNISPHERE rejects the create call if it's already taken.
+  targetVmid?: number
+}
+
+interface LogEntry {
+  ts: string
+  msg: string
+  level: "info" | "success" | "warn" | "error"
+}
+
+let cancelledJobs = new Set<string>()
+const jobPrisma = new Map<string, any>()
+
+/**
+ * Attempts allowed for one VDI download. A transfer that fails (curl error, empty
+ * file) is restarted from scratch instead of failing the whole migration (#804).
+ */
+const DOWNLOAD_ATTEMPTS = 3
+
+/**
+ * Result of watching one curl download to completion. A string discriminant, not a
+ * boolean: this project compiles with `strict: false`, where `if (outcome.ok)` does
+ * NOT narrow a `true | false` union.
+ */
+type DownloadOutcome =
+  | { state: "done"; bytes: number; time: number; speed: string }
+  | { state: "failed"; message: string }
+
+function getPrismaForJob(jobId: string) {
+  return jobPrisma.get(jobId)
+}
+
+export function cancelXcpngMigrationJob(jobId: string) {
+  cancelledJobs.add(jobId)
+}
+
+async function updateJob(id: string, status: MigrationStatus, extra: Record<string, any> = {}) {
+  const prisma = getPrismaForJob(id)
+  const data: any = {
+    status,
+    currentStep: status,
+    ...(status === "completed" ? { completedAt: new Date() } : {}),
+    ...extra,
+  }
+  await prisma.migrationJob.update({ where: { id }, data })
+}
+
+async function appendLog(id: string, msg: string, level: LogEntry["level"] = "info") {
+  const prisma = getPrismaForJob(id)
+  const job = await prisma.migrationJob.findUnique({ where: { id }, select: { logs: true, progress: true } })
+  const logs: LogEntry[] = (job?.logs as LogEntry[] | null) ?? []
+  logs.push({ ts: new Date().toISOString(), msg, level, progress: job?.progress ?? 0 } as any)
+  await prisma.migrationJob.update({ where: { id }, data: { logs } })
+}
+
+function isCancelled(jobId: string): boolean {
+  return cancelledJobs.has(jobId)
+}
+
+/** Wait for a UNISPHERE task to complete */
+async function waitForUnisphereTask(
+  conn: { baseUrl: string; apiToken: string; insecureDev: boolean; id: string },
+  node: string,
+  upid: string,
+  timeoutMs = 300000
+): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const status = await unisphereFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/tasks/${encodeURIComponent(upid)}/status`
+    )
+    if (status?.status === "stopped") {
+      if (status.exitstatus === "OK") return
+      throw new Error(`UNISPHERE task failed: ${status.exitstatus || "unknown error"}`)
+    }
+    await new Promise(r => setTimeout(r, 3000))
+  }
+  throw new Error(`UNISPHERE task timed out after ${timeoutMs / 1000}s`)
+}
+
+/**
+ * Find the IP address of a eSage node for SSH access.
+ */
+async function getNodeIp(db: any, connectionId: string, nodeName: string, baseUrl: string): Promise<string> {
+  const host = await db.managedHost.findFirst({
+    where: { connectionId, node: nodeName, enabled: true },
+    select: { ip: true, sshAddress: true },
+  })
+  if (host?.sshAddress) return host.sshAddress
+  if (host?.ip) return host.ip
+
+  try {
+    const url = new URL(baseUrl)
+    return url.hostname
+  } catch {
+    throw new Error(`Cannot determine IP for node ${nodeName}`)
+  }
+}
+
+/**
+ * executeSSH with configurable timeout for long-running operations.
+ */
+async function executeSSHWithTimeout(
+  db: any,
+  connectionId: string,
+  nodeIp: string,
+  command: string,
+  timeoutMs: number
+): Promise<{ success: boolean; output?: string; error?: string }> {
+  const connection = await db.connection.findUnique({
+    where: { id: connectionId },
+    select: {
+      sshEnabled: true, sshPort: true, sshUser: true,
+      sshAuthMethod: true, sshKeyEnc: true, sshPassEnc: true, sshUseSudo: true,
+    },
+  })
+
+  if (!connection?.sshEnabled) {
+    return { success: false, error: "SSH not enabled for this connection" }
+  }
+
+  const { Client } = await import("ssh2")
+  const port = connection.sshPort || 22
+  const user = connection.sshUser || "root"
+
+  let key: string | undefined
+  let password: string | undefined
+  let passphrase: string | undefined
+
+  const authMethod = connection.sshAuthMethod || (connection.sshKeyEnc ? "key" : "password")
+  if (authMethod === "key" && connection.sshKeyEnc) {
+    key = decryptSecret(connection.sshKeyEnc)
+    if (connection.sshPassEnc) try { passphrase = decryptSecret(connection.sshPassEnc) } catch {}
+  } else if (connection.sshPassEnc) {
+    password = decryptSecret(connection.sshPassEnc)
+  }
+
+  const finalCommand = connection.sshUseSudo ? `sudo ${command}` : command
+
+  return new Promise((resolve) => {
+    const conn = new Client()
+    const timeout = setTimeout(() => {
+      conn.end()
+      resolve({ success: false, error: `SSH timeout after ${timeoutMs / 1000}s` })
+    }, timeoutMs)
+
+    conn.on("ready", () => {
+      conn.exec(finalCommand, (err, stream) => {
+        if (err) { clearTimeout(timeout); conn.end(); resolve({ success: false, error: err.message }); return }
+
+        let stdout = ""
+        let stderr = ""
+        stream.on("data", (data: Buffer) => { stdout += data.toString() })
+        stream.stderr.on("data", (data: Buffer) => { stderr += data.toString() })
+        stream.on("close", (code: number) => {
+          clearTimeout(timeout)
+          conn.end()
+          if (code === 0 || code === null) {
+            resolve({ success: true, output: stdout.trim() })
+          } else {
+            resolve({ success: false, error: stderr.trim() || `Exit code ${code}` })
+          }
+        })
+      })
+    })
+
+    conn.on("error", (err) => { clearTimeout(timeout); resolve({ success: false, error: err.message }) })
+
+    const connectConfig: Record<string, unknown> = {
+      host: nodeIp, port, username: user, readyTimeout: 30_000,
+      keepaliveInterval: 10000, keepaliveCountMax: 999,
+    }
+    if (key) { connectConfig.privateKey = key; if (passphrase) connectConfig.passphrase = passphrase }
+    else if (password) { connectConfig.password = password }
+
+    conn.connect(connectConfig as any)
+  })
+}
+
+/**
+ * Main XCP-ng migration pipeline — runs async after HTTP response
+ */
+export async function runXcpngMigrationPipeline(jobId: string, config: MigrationConfig, tenantId = 'default'): Promise<void> {
+  const prisma = getTenantPrisma(tenantId)
+  jobPrisma.set(jobId, prisma)
+
+  let targetVmid: number | null = null
+  /**
+   * True only once UNISPHERE accepted the create call. `targetVmid` is set earlier
+   * (reserved via /cluster/nextid, or taken from the user's pick), so gating the
+   * cleanup on it alone could destroy a VM this job never created: with a
+   * user-supplied VMID that is already taken, the create fails with "already
+   * exists" and the cleanup would then purge the pre-existing VM holding that id
+   * (#738, same class as the misleading "failed to destroy partial VM" warning).
+   */
+  let vmCreated = false
+  let storageTempDir = ''
+  // Kept open for the whole job: cold downloads run for hours and an XAPI export
+  // URL is only valid while its session is.
+  let source: XcpngSource | null = null
+  let stopSourceKeepAlive: () => void = () => {}
+
+  // Liveness signal for the orphan sweep (#608): bump updatedAt while the job
+  // runs so a long silent step (#606) is never mistaken for a dead process.
+  const stopHeartbeat = startJobHeartbeat({ jobId, prisma })
+
+  try {
+    // ── STEP 0: Pre-flight ──
+    await updateJob(jobId, "preflight")
+    await appendLog(jobId, "Starting pre-flight checks...")
+
+    // Open the source (XO REST or direct XAPI session)
+    const src = await openXcpngSource(config.sourceConnectionId, prisma)
+    source = src
+    // An XAPI session idles out while curl streams for hours on the UNISPHERE node and the
+    // export URL dies with it: ping the pool every 5 minutes. XO needs nothing.
+    if (src.kind === "xapi") stopSourceKeepAlive = startSessionKeepAlive(() => src.keepAlive(), 5 * 60_000)
+    await appendLog(jobId, `Connecting to ${src.kind === "xapi" ? "XCP-ng pool" : "Xen Orchestra"} at ${src.displayUrl}...`)
+
+    // Get XO connection name
+    const xoConn = await prisma.connection.findUnique({
+      where: { id: config.sourceConnectionId },
+      select: { name: true },
+    })
+
+    // Get UNISPHERE connection
+    const unisphereConn = await getConnectionById(config.targetConnectionId)
+    await appendLog(jobId, `${src.kind === "xapi" ? "XCP-ng pool" : "XO"} and UNISPHERE connections verified`, "success")
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 1: Get VM config from the source ──
+    await appendLog(jobId, `Retrieving VM configuration for "${config.sourceVmId}"...`)
+    const vmConfig = await src.getVmConfig(config.sourceVmId)
+
+    await appendLog(
+      jobId,
+      `VM config: ${vmConfig.numCPU} vCPU, ${(vmConfig.memoryMB / 1024).toFixed(1)} GB RAM, ${vmConfig.disks.length} disk(s), firmware=${vmConfig.firmware}`,
+      "success"
+    )
+
+    const totalDiskBytes = vmConfig.disks.reduce((sum, d) => sum + d.sizeBytes, 0)
+
+    await updateJob(jobId, "preflight", {
+      sourceVmName: vmConfig.name,
+      totalDisks: vmConfig.disks.length,
+      totalBytes: BigInt(totalDiskBytes),
+    })
+
+    // This pipeline is offline only: the VM must be powered off.
+    if (vmConfig.powerState === "Running" || vmConfig.powerState === "running") {
+      throw new Error(
+        "VM is powered on. Please power off the VM before migration. " +
+        "Offline migration requires the VM to be shut down."
+      )
+    }
+
+    // Check snapshots
+    if (vmConfig.snapshotCount > 0) {
+      await appendLog(jobId, `Warning: VM has ${vmConfig.snapshotCount} snapshot(s). Only current state will be migrated.`, "warn")
+    }
+
+    if (vmConfig.disks.length === 0) {
+      throw new Error("VM has no disks to migrate")
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // Verify UNISPHERE SSH connectivity
+    const nodeIp = await getNodeIp(prisma, config.targetConnectionId, config.targetNode, unisphereConn.baseUrl)
+    await appendLog(jobId, `Testing SSH to eSage node ${config.targetNode} (${nodeIp})...`)
+    const sshTest = await executeSSH(config.targetConnectionId, nodeIp, "echo ok")
+    if (!sshTest.success) {
+      throw new Error(`SSH to eSage node failed: ${sshTest.error}`)
+    }
+    await appendLog(jobId, "SSH connectivity OK", "success")
+
+    // Check target storage space
+    const storageStatus = await unisphereFetch<any>(
+      unisphereConn,
+      `/nodes/${encodeURIComponent(config.targetNode)}/storage/${encodeURIComponent(config.targetStorage)}/status`
+    )
+    const freeBytes = storageStatus?.avail || 0
+    await appendLog(jobId, `Target storage "${config.targetStorage}": ${(freeBytes / 1073741824).toFixed(1)} GB free, need ${(totalDiskBytes / 1073741824).toFixed(1)} GB`)
+    if (freeBytes < totalDiskBytes * 1.1) {
+      throw new Error(`Insufficient disk space on "${config.targetStorage}": ${(freeBytes / 1073741824).toFixed(1)} GB free, need ${(totalDiskBytes / 1073741824).toFixed(1)} GB`)
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 2: Allocate VMID & Create VM shell on eSage ──
+    await updateJob(jobId, "creating_vm")
+    if (config.targetVmid !== undefined) {
+      targetVmid = config.targetVmid
+      await appendLog(jobId, `Using user-specified VMID ${targetVmid}`)
+    } else {
+      await appendLog(jobId, "Allocating VMID on eSage cluster...")
+      targetVmid = Number(await unisphereFetch<number | string>(unisphereConn, "/cluster/nextid"))
+      await appendLog(jobId, `Allocated VMID ${targetVmid}`)
+    }
+    await updateJob(jobId, "creating_vm", { targetVmid })
+
+    const unisphereParams = mapXoToUnisphereConfig(vmConfig, targetVmid, config.targetStorage, config.networkBridge, config.vlanTag)
+    await appendLog(jobId, `Creating VM: ${unisphereParams.name} (${unisphereParams.ostype}, ${unisphereParams.bios}, ${unisphereParams.scsihw})...`)
+
+    const createBody = new URLSearchParams({
+      vmid: String(unisphereParams.vmid),
+      name: unisphereParams.name,
+      ostype: unisphereParams.ostype,
+      cores: String(unisphereParams.cores),
+      sockets: String(unisphereParams.sockets),
+      memory: String(unisphereParams.memory),
+      cpu: unisphereParams.cpu,
+      scsihw: unisphereParams.scsihw,
+      bios: unisphereParams.bios,
+      machine: unisphereParams.machine,
+      net0: unisphereParams.net0,
+      agent: unisphereParams.agent,
+      serial0: "socket",
+    })
+    if (unisphereParams.efidisk0) {
+      createBody.set("efidisk0", unisphereParams.efidisk0)
+    }
+
+    const createResult = await unisphereFetch<any>(
+      unisphereConn,
+      `/nodes/${encodeURIComponent(config.targetNode)}/qemu`,
+      { method: "POST", body: createBody }
+    )
+    // Set before waiting on the task: UNISPHERE accepted the create, so a config may
+    // already exist and the cleanup path must know about it even if the task fails.
+    vmCreated = true
+    if (createResult) {
+      await waitForUnisphereTask(unisphereConn, config.targetNode, String(createResult))
+    }
+    await appendLog(jobId, `VM ${targetVmid} created on ${config.targetNode}`, "success")
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 3: Transfer & import disks ──
+    await updateJob(jobId, "transferring", { progress: 0 })
+
+    // Determine storage type for import strategy
+    const storageConfig = await unisphereFetch<any>(unisphereConn, `/storage/${encodeURIComponent(config.targetStorage)}`)
+    const storageType = storageConfig?.type || "dir"
+    const isFileBased = isFileBasedStorage(storageType)
+    const importFormat = isFileBased ? "qcow2" : "raw"
+
+    // Resolve temp directory for VHD downloads.
+    // Priority: user-selected tempStorage from the migration dialog.
+    // Falls back to the auto-pick heuristic when nothing is set.
+    // File-based fallback: use target storage path (plenty of space).
+    // Block fallback: use /var/lib/vz/tmp (VHD is converted directly to the
+    // block device, then the scratch file is removed).
+    const userTempStorage = config.tempStorage?.trim().replace(/\/+$/, '') || ''
+    if (userTempStorage) {
+      storageTempDir = `${userTempStorage}/unicenter-xcpng-migration/${targetVmid}`
+    } else if (isFileBased) {
+      const storagePath = storageConfig?.path || '/var/lib/vz'
+      storageTempDir = `${storagePath}/images/${targetVmid}`
+    } else {
+      storageTempDir = `/var/lib/vz/tmp`
+    }
+    await executeSSH(config.targetConnectionId, nodeIp, `mkdir -p "${storageTempDir}"`)
+    await appendLog(jobId, `Temp directory: ${storageTempDir}`)
+
+    // The storage's own volume directory, where a converted image must sit to
+    // be adopted by rename (#292). NOT storageTempDir: the operator may have
+    // picked a temp storage on another filesystem — the adoption module then
+    // refuses the rename and the disk goes through a converting `qm disk import`
+    // instead, which is the wanted fallback.
+    const targetImagesDir = `${storageConfig?.path || '/var/lib/vz'}/images/${targetVmid}`
+
+    // Track allocated block volumes (for cleanup on error)
+    const allocatedVolumes: AllocatedVolume[] = []
+    // File volumes turned into UNISPHERE volumes by rename during this run (#292).
+    // Name reservation only, so two disks never claim the same
+    // vm-<vmid>-disk-<N>. Deliberately NOT in allocatedVolumes: that registry is
+    // unispheresm-freed on failure, and the pre-#292 behaviour on a late failure was
+    // to leave an unused disk behind, never to delete the converted image.
+    const adoptedVolumes: AllocatedVolume[] = []
+
+    // Allocate a raw volume on block storage and return the device path
+    async function allocateBlockVolume(sizeBytes: number): Promise<{ volumeId: string, devicePath: string, rbdMapped?: boolean }> {
+      const vmConf = await unisphereFetch<Record<string, any>>(unisphereConn, `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/config`)
+      const volName = nextFreeDiskName(vmConf, allocatedVolumes, targetVmid)
+      // See allocateAndMapBlockVolume for the raw format, the Ceph mapping and why
+      // the volume is registered for cleanup before the allocation runs (#587).
+      return allocateAndMapBlockVolume({
+        allocatedVolumes, nodeIp, targetVmid, volName,
+        connectionId: config.targetConnectionId, targetStorage: config.targetStorage,
+        sizeKB: Math.ceil(sizeBytes / 1024), onLog: (m) => appendLog(jobId, m),
+      })
+    }
+
+    // Attach a pre-allocated block volume to a SCSI slot
+    async function attachBlockDisk(i: number, volumeId: string) {
+      // sata0 for Windows/EFI boot disks (#653), SCSI for data disks.
+      const scsiSlot = i === 0 ? unisphereParams.bootDiskSlot : `scsi${i}`
+      const attachBody = new URLSearchParams({ [scsiSlot]: volumeId })
+      try {
+        await unisphereSetVmConfig(unisphereConn, config.targetNode, targetVmid!, attachBody)
+        await appendLog(jobId, `Disk ${i + 1} attached as ${scsiSlot} (${volumeId})`, "success")
+      } catch (attachErr: any) {
+        await appendLog(jobId, `Warning: Could not auto-attach ${scsiSlot}: ${attachErr.message}`, "warn")
+      }
+    }
+
+    // Convert VHD directly to a pre-allocated block device (no qm disk import needed)
+    async function convertToBlockDevice(i: number, devicePath: string) {
+      const tmpFile = `${storageTempDir}/unicenter-mig-${jobId}-disk${i}`
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Converting VHD directly to block device...`)
+      await updateJob(jobId, "transferring", { currentStep: `converting_disk_${i + 1}` })
+
+      const convertResult = await executeSSHWithTimeout(
+        prisma, config.targetConnectionId, nodeIp,
+        `qemu-img convert -f vpc -O raw "${tmpFile}.vhd" "${devicePath}" 2>&1 && echo CONVERT_OK`,
+        14400000
+      )
+      // Clean up VHD regardless of result
+      await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vhd"`)
+
+      if (!convertResult.success || !convertResult.output?.includes("CONVERT_OK")) {
+        throw new Error(`Conversion to block device failed: ${convertResult.error || convertResult.output}`)
+      }
+      await appendLog(jobId, `Conversion to block device complete`, "success")
+
+      // Unmap RBD if needed
+      const allocVol = allocatedVolumes.find(v => v.devicePath === devicePath)
+      if (allocVol?.rbdMapped) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rbd unmap "${devicePath}" 2>/dev/null`).catch(() => {})
+      }
+    }
+
+    // Helper: download a single VDI from the source via curl on the UNISPHERE node.
+    // The source hands out the URL and the curl headers/TLS flag for its mode as a
+    // curl config file: the XO Basic auth header and the XAPI session ref must not
+    // be readable through `ps` on the node, so the command line carries neither.
+    async function downloadDisk(i: number, disk: XoDiskInfo) {
+      const diskSizeGB = (disk.sizeBytes / 1073741824).toFixed(1)
+      const dl = await src.diskDownload(disk, "vhd")
+      const tmpFile = `${storageTempDir}/unicenter-mig-${jobId}-disk${i}`
+      const pidFile = `${tmpFile}.pid`
+      const statsFile = `${tmpFile}.stats`
+      const curlrcFile = `${tmpFile}.curlrc`
+      const cleanup = () =>
+        executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vhd" "${pidFile}" "${pidFile}.exit" "${statsFile}" "${curlrcFile}"`).catch(() => {})
+
+      // Watch one curl run to completion. An unreadable poll (orchestrator timeout,
+      // dropped SSH session) is NOT a curl failure: the remote download keeps going,
+      // so the poll is retried and the transfer is only declared lost after
+      // MAX_CONSECUTIVE_POLL_FAILURES in a row. Reading such a poll as "curl exit 1"
+      // is what deleted healthy downloads (#804).
+      async function monitorDownload(curlPid: string): Promise<DownloadOutcome> {
+        let downloadSpeed = ""
+        let downloadTime = 0
+        let pollFailures = 0
+        const startTime = Date.now()
+
+        while (true) {
+          if (isCancelled(jobId)) {
+            await executeSSH(config.targetConnectionId, nodeIp, `pkill -P ${curlPid} 2>/dev/null; kill ${curlPid} 2>/dev/null`).catch(() => {})
+            await cleanup()
+            throw new Error("Migration cancelled")
+          }
+
+          await new Promise(r => setTimeout(r, 3000))
+
+          const exitCheck = await executeSSH(config.targetConnectionId, nodeIp, `cat "${pidFile}.exit" 2>/dev/null || echo RUNNING`)
+          const poll = interpretPollExit(exitCheck)
+          if (poll.state === "unknown") {
+            pollFailures++
+            if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+              await executeSSH(config.targetConnectionId, nodeIp, `pkill -P ${curlPid} 2>/dev/null; kill ${curlPid} 2>/dev/null`).catch(() => {})
+              await cleanup()
+              throw new Error(`Lost contact with the eSage node while monitoring the download (${pollFailures} consecutive SSH failures, last: ${poll.reason})`)
+            }
+            if (pollFailures === 1) {
+              // Only the first failure of a streak is logged: one poll every 3s over a flaky
+              // link would otherwise rewrite the job log hundreds of times per hour. The
+              // give-up throw above carries the final count and the last reason.
+              await appendLog(jobId, `Progress poll failed (${poll.reason}); retrying (up to ${MAX_CONSECUTIVE_POLL_FAILURES} times)`, "warn")
+            }
+            continue
+          }
+          pollFailures = 0
+
+          const sizeResult = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vhd" 2>/dev/null || echo 0`)
+          const currentSize = Number.parseInt(sizeResult.output?.trim() || "0", 10) || 0
+
+          const elapsed = (Date.now() - startTime) / 1000
+          const speedBps = elapsed > 0 ? currentSize / elapsed : 0
+          downloadSpeed = speedBps > 1048576 ? `${(speedBps / 1048576).toFixed(1)} MB/s` : `${(speedBps / 1024).toFixed(0)} KB/s`
+
+          const diskProgress = disk.sizeBytes > 0 ? Math.min(Math.round((currentSize / disk.sizeBytes) * 100), 99) : 0
+          const overallProgress = Math.round((i / vmConfig.disks.length) * 100 + (diskProgress / vmConfig.disks.length))
+
+          await updateJob(jobId, "transferring", {
+            bytesTransferred: BigInt(currentSize),
+            transferSpeed: downloadSpeed,
+            progress: overallProgress,
+          })
+
+          if (poll.state === "running") continue
+          const exitCode = poll.exitCode
+
+          // Parse curl stats before checking exit code (for http_code in error messages)
+          const statsContent = await executeSSH(config.targetConnectionId, nodeIp, `cat "${statsFile}" 2>/dev/null`)
+          const curlStats = statsContent.output?.match(/\{[^}]+\}/)
+          let httpCode = 0
+          if (curlStats) {
+            try {
+              const stats = JSON.parse(curlStats[0])
+              downloadSpeed = stats.speed > 1048576 ? `${(stats.speed / 1048576).toFixed(1)} MB/s` : `${(stats.speed / 1024).toFixed(0)} KB/s`
+              downloadTime = stats.time || elapsed
+              httpCode = stats.http_code || 0
+            } catch {}
+          } else {
+            downloadTime = elapsed
+          }
+          const httpInfo = httpCode ? ` (HTTP ${httpCode})` : ""
+
+          if (exitCode !== 0) {
+            // curl runs with -sS, so its own diagnostic sits in the stats file just
+            // before the -w JSON: surface its last lines instead of a bare code.
+            const statsTail = (statsContent.output || "").replace(/\{[^}]*\}/g, "").trim().split("\n").slice(-3).join(" | ").slice(0, 300)
+            return { state: "failed", message: `Download failed (curl exit ${exitCode}${httpInfo})${statsTail ? `: ${statsTail}` : ""}` }
+          }
+
+          // Validate that the downloaded file is not empty
+          const fileSizeCheck = await executeSSH(config.targetConnectionId, nodeIp, `stat -c %s "${tmpFile}.vhd" 2>/dev/null || echo 0`)
+          const actualFileSize = Number.parseInt(fileSizeCheck.output?.trim() || "0", 10) || 0
+          if (actualFileSize === 0) {
+            return { state: "failed", message: `Downloaded VHD is empty (0 bytes)${httpInfo}; the XO REST API may have returned an error or the VDI is not accessible` }
+          }
+          return { state: "done", bytes: actualFileSize, time: downloadTime, speed: downloadSpeed }
+        }
+      }
+
+      for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+        await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Downloading "${disk.label}" (${diskSizeGB} GB, VHD format)${attempt > 1 ? ` (attempt ${attempt}/${DOWNLOAD_ATTEMPTS})` : ""}...`)
+
+        await updateJob(jobId, "transferring", {
+          currentStep: `downloading_disk_${i + 1}`,
+          currentDisk: i,
+          bytesTransferred: BigInt(0),
+          totalBytes: BigInt(disk.sizeBytes),
+        })
+
+        // The leading rm is not cosmetic: a cleanup() whose SSH call failed would leave the
+        // previous attempt's exit file behind, and this attempt's first poll would read that
+        // stale code, declare failure and delete the .vhd from under a running curl.
+        const startDl = await executeSSH(
+          config.targetConnectionId, nodeIp,
+          `rm -f "${pidFile}.exit" "${statsFile}"; (umask 077; printf '%s\\n' ${shellEscape(dl.curlConfig)} > "${curlrcFile}"); nohup bash -c 'curl -sS --fail -K "${curlrcFile}" -o "${tmpFile}.vhd" -w '"'"'{"speed":%{speed_download},"size":%{size_download},"time":%{time_total},"http_code":%{http_code}}'"'"' > "${statsFile}" 2>&1; echo $? > "${pidFile}.exit"' > /dev/null 2>&1 & echo $!`
+        )
+        if (!startDl.success || !startDl.output?.trim()) {
+          throw new Error(`Failed to start download: ${startDl.error}`)
+        }
+        const curlPid = startDl.output.trim()
+        await executeSSH(config.targetConnectionId, nodeIp, `echo ${curlPid} > "${pidFile}"`)
+
+        const outcome = await monitorDownload(curlPid)
+        if (outcome.state === "done") {
+          await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${pidFile}" "${pidFile}.exit" "${statsFile}" "${curlrcFile}"`)
+          await updateJob(jobId, "transferring", {
+            bytesTransferred: BigInt(outcome.bytes),
+            transferSpeed: outcome.speed,
+          })
+          await appendLog(jobId, `Download complete: ${(outcome.bytes / 1073741824).toFixed(1)} GB in ${outcome.time.toFixed(0)}s (${outcome.speed})`, "success")
+          return
+        }
+
+        // The partial file is unusable: drop it before another attempt.
+        await cleanup()
+        if (attempt < DOWNLOAD_ATTEMPTS) {
+          await appendLog(jobId, `${outcome.message}; retrying the download (${attempt}/${DOWNLOAD_ATTEMPTS} attempts used)`, "warn")
+          continue
+        }
+        throw new Error(`${outcome.message} (after ${DOWNLOAD_ATTEMPTS} attempts)`)
+      }
+    }
+
+    // Helper: convert + import + attach a single disk
+    async function convertAndImportDisk(i: number) {
+      const tmpFile = `${storageTempDir}/unicenter-mig-${jobId}-disk${i}`
+      // sata0 for Windows/EFI boot disks (#653), SCSI for data disks.
+      const scsiSlot = i === 0 ? unisphereParams.bootDiskSlot : `scsi${i}`
+
+      await appendLog(jobId, `[Disk ${i + 1}/${vmConfig.disks.length}] Converting VHD to ${importFormat} format...`)
+      await updateJob(jobId, "transferring", { currentStep: `converting_disk_${i + 1}` })
+
+      const convertResult = await executeSSHWithTimeout(
+        prisma, config.targetConnectionId, nodeIp,
+        `qemu-img convert -f vpc -O ${importFormat} "${tmpFile}.vhd" "${tmpFile}.${importFormat}" 2>&1 && echo CONVERT_OK`,
+        14400000
+      )
+      if (!convertResult.success || !convertResult.output?.includes("CONVERT_OK")) {
+        await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vhd" "${tmpFile}.${importFormat}"`)
+        throw new Error(`Conversion failed: ${convertResult.error || convertResult.output}`)
+      }
+      await appendLog(jobId, `Conversion to ${importFormat} complete`, "success")
+      await executeSSH(config.targetConnectionId, nodeIp, `rm -f "${tmpFile}.vhd"`)
+
+      if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+      // Import disk into eSage storage
+      const importFile = `${tmpFile}.${importFormat}`
+      await appendLog(jobId, `Adding disk to storage "${config.targetStorage}"...`)
+      await updateJob(jobId, "transferring", { currentStep: `importing_disk_${i + 1}` })
+
+      // Rename-or-import (#292): the shared helper adopts the converted image by
+      // rename when it already sits on the target storage's filesystem (the
+      // default temp dir IS its images/<vmid> directory), imports it otherwise,
+      // and attaches the result. See adoptImportAndAttachFileVolume.
+      const { volumeId: diskVolume, adopted } = await adoptImportAndAttachFileVolume({
+        unisphereConn,
+        targetNode: config.targetNode,
+        connectionId: config.targetConnectionId,
+        nodeIp,
+        sourcePath: importFile,
+        targetStorage: config.targetStorage,
+        imagesDir: targetImagesDir,
+        targetVmid: targetVmid!,
+        format: importFormat,
+        slot: scsiSlot,
+        driveOpts: isFileBased ? ",discard=on" : "",
+        diskLabel: `Disk ${i + 1}`,
+        taken: adoptedVolumes,
+        onLog: (m, level) => appendLog(jobId, m, level),
+      })
+      if (adopted) adoptedVolumes.push({ volumeId: diskVolume, devicePath: "" })
+    }
+
+    // ── Cold mode: sequential download → convert → import per disk ──
+    for (let i = 0; i < vmConfig.disks.length; i++) {
+      await updateJob(jobId, "transferring", { currentDisk: i, progress: Math.round((i / vmConfig.disks.length) * 100) })
+      await downloadDisk(i, vmConfig.disks[i])
+      if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+      if (isFileBased) {
+        await convertAndImportDisk(i)
+      } else {
+        // Block storage: allocate volume, convert VHD directly to device
+        const vol = await allocateBlockVolume(vmConfig.disks[i].sizeBytes)
+        await convertToBlockDevice(i, vol.devicePath)
+        if (isCancelled(jobId)) throw new Error("Migration cancelled")
+        await attachBlockDisk(i, vol.volumeId)
+      }
+      await updateJob(jobId, "transferring", {
+        currentDisk: i + 1,
+        progress: Math.round(((i + 1) / vmConfig.disks.length) * 100),
+      })
+    }
+
+    if (isCancelled(jobId)) throw new Error("Migration cancelled")
+
+    // ── STEP 4: Configure VM ──
+    await updateJob(jobId, "configuring", { progress: 90 })
+    await appendLog(jobId, "Configuring VM (boot order, agent)...")
+
+    await unisphereSetVmConfig(unisphereConn, config.targetNode, targetVmid!, new URLSearchParams({ boot: `order=${unisphereParams.bootDiskSlot}` }))
+
+    if (isWindowsXoVm(vmConfig)) {
+      await appendLog(jobId, "Windows VM detected — boot disk on SATA + e1000 NIC (built-in Windows drivers). Install VirtIO drivers for better performance and to bring up any VirtIO SCSI data disks.", "warn")
+    }
+
+    await appendLog(jobId, "VM configuration complete", "success")
+
+    // ── STEP 5: Optionally start ──
+    if (config.startAfterMigration) {
+      await appendLog(jobId, "Starting VM on eSage...")
+      await unisphereFetch<any>(
+        unisphereConn,
+        `/nodes/${encodeURIComponent(config.targetNode)}/qemu/${targetVmid}/status/start`,
+        { method: "POST" }
+      )
+      await appendLog(jobId, "VM started", "success")
+    }
+
+    // ── STEP 6: Optional qcow2 conversion (#595) ──
+    // After the disks are attached and after the optional start: on a running
+    // VM UNISPHERE does move_disk as a live drive-mirror, no extra downtime. The
+    // helper gates itself (opt-in, storage default format, free space) and
+    // NEVER throws: a conversion problem leaves the disks raw, not the
+    // migration failed.
+    await convertDisksToQcow2({
+      enabled: config.convertDisksToQcow2 === true,
+      conn: unisphereConn, node: config.targetNode, vmid: targetVmid!,
+      targetStorage: config.targetStorage, volumes: allocatedVolumes,
+      log: (m, l) => appendLog(jobId, m, l),
+      setPhase: p => updateJob(jobId, "converting_disks", { progress: p }),
+    })
+
+    // ── DONE ──
+    await updateJob(jobId, "completed", {
+      progress: 100,
+      bytesTransferred: BigInt(totalDiskBytes),
+      totalBytes: BigInt(totalDiskBytes),
+    })
+    // Non-fatal: a failing log append after the terminal write must not throw
+    // us into the catch, which would flip a completed job to "failed" (#608).
+    await appendLog(jobId, `Migration completed successfully! VM ${targetVmid} is ready on ${config.targetNode}.`, "success").catch(() => {})
+
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "create",
+      category: "migration",
+      resourceType: "vm",
+      resourceId: String(targetVmid),
+      resourceName: vmConfig.name,
+      details: {
+        source: `XCP-ng ${xoConn?.name || config.sourceConnectionId}/${config.sourceVmId}`,
+        target: `${config.targetNode}/${config.targetStorage}`,
+      },
+      status: "success",
+    })
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err)
+    // Terminal status first, and nothing may prevent it — a throwing appendLog
+    // or DB hiccup here would leave the row non-terminal forever (#608). The
+    // cleanup below must also run even if these writes fail.
+    await updateJob(jobId, "failed", { error: errorMsg }).catch(() => {})
+    await appendLog(jobId, `Migration failed: ${errorMsg}`, "error").catch(() => {})
+
+    // Cleanup: remove temp files
+    try {
+      const nodeIp = await getNodeIp(prisma, config.targetConnectionId, config.targetNode,
+        (await getConnectionById(config.targetConnectionId)).baseUrl)
+      if (storageTempDir) {
+        await executeSSH(config.targetConnectionId, nodeIp,
+          `rm -f "${storageTempDir}"/unicenter-mig-${jobId}-disk*.vhd "${storageTempDir}"/unicenter-mig-${jobId}-disk*.qcow2 "${storageTempDir}"/unicenter-mig-${jobId}-disk*.raw "${storageTempDir}"/unicenter-mig-${jobId}-disk*.curlrc`)
+      }
+    } catch {
+      // Best effort cleanup
+    }
+
+    // Cleanup: only when this job actually created the VM. Before that the VMID
+    // is just a reservation (or the user's pick, possibly pointing at somebody
+    // else's VM), and destroying it would delete data we never wrote.
+    if (vmCreated && targetVmid && config.targetConnectionId) {
+      try {
+        const unisphereConn = await getConnectionById(config.targetConnectionId)
+        await destroyUnisphereVm(unisphereConn, config.targetNode, targetVmid)
+        await appendLog(jobId, `Cleaned up partial VM ${targetVmid}`, "warn")
+      } catch {
+        // Cleanup failed — leave for manual intervention
+      }
+    }
+  } finally {
+    stopSourceKeepAlive()
+    await source?.close().catch(() => {})
+    stopHeartbeat()
+    cancelledJobs.delete(jobId)
+    jobPrisma.delete(jobId)
+  }
+}
