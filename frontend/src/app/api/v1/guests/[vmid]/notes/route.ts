@@ -1,0 +1,143 @@
+import { NextResponse } from "next/server"
+
+import { unisphereFetch } from "@/lib/esage/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+
+export const runtime = "nodejs"
+
+type Params = {
+  vmid: string // Format: connId:type:node:vmid
+}
+
+function parseVmKey(vmKey: string) {
+  const parts = vmKey.split(':')
+
+  if (parts.length !== 4) {
+    throw new Error('Invalid vmKey format. Expected connId:type:node:vmid')
+  }
+
+
+return {
+    connId: parts[0],
+    type: parts[1],
+    node: parts[2],
+    vmid: parts[3],
+  }
+}
+
+/**
+ * GET /api/v1/guests/[vmid]/notes
+ * Récupère les notes (description) d'une VM depuis eSage
+ */
+export async function GET(
+  req: Request,
+  ctx: { params: Promise<Params> }
+) {
+  try {
+    const params = await ctx.params
+    const { connId, type, node, vmid } = parseVmKey(params.vmid)
+
+    // RBAC: vm.view, checked BEFORE the connection is resolved. That
+    // resolution decrypts the eSage API token, so it must never run for a
+    // caller who has no right to this guest.
+    const denied = await checkPermission(
+      PERMISSIONS.VM_VIEW,
+      "vm",
+      buildVmResourceId(connId, node, type, vmid)
+    )
+
+    if (denied) return denied
+
+    // Use the shared resolver so tenants can reach connections they only
+    // access via vDC assignment (not only the ones they own).
+    let conn
+    try {
+      conn = await getConnectionById(connId)
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    const apiPath = `/nodes/${encodeURIComponent(node)}/${type}/${vmid}/config`
+    const config = await unisphereFetch<any>(conn, apiPath)
+
+    const description = config?.description || ''
+
+    return NextResponse.json({
+      data: {
+        content: description,
+      }
+    })
+  } catch (e: any) {
+    console.error("Get notes error:", e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+/**
+ * PUT /api/v1/guests/[vmid]/notes
+ * Met à jour les notes (description) d'une VM dans eSage
+ * Body: { content: string }
+ */
+export async function PUT(
+  req: Request,
+  ctx: { params: Promise<Params> }
+) {
+  try {
+    const params = await ctx.params
+    const { connId, type, node, vmid } = parseVmKey(params.vmid)
+
+    // RBAC: vm.config. This writes the guest's description on eSage.
+    // Checked before the body is read and before the connection is resolved.
+    const denied = await checkPermission(
+      PERMISSIONS.VM_CONFIG,
+      "vm",
+      buildVmResourceId(connId, node, type, vmid)
+    )
+
+    if (denied) return denied
+
+    const body = await req.json()
+
+    const { content } = body
+
+    if (typeof content !== 'string') {
+      return NextResponse.json({ error: "Content must be a string" }, { status: 400 })
+    }
+
+    // Use the shared resolver so tenants can reach connections they only
+    // access via vDC assignment (not only the ones they own).
+    let conn
+    try {
+      conn = await getConnectionById(connId)
+    } catch {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    const apiPath = `/nodes/${encodeURIComponent(node)}/${type}/${vmid}/config`
+    
+    const formData = new URLSearchParams()
+
+    formData.append('description', content)
+    
+    await unisphereFetch<any>(conn, apiPath, {
+      method: 'PUT',
+      body: formData.toString(),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    })
+
+    return NextResponse.json({
+      data: {
+        success: true,
+        content,
+      }
+    })
+  } catch (e: any) {
+    console.error("Update notes error:", e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

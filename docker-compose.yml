@@ -1,0 +1,115 @@
+# ============================================
+# UniCenter Community Edition
+# Frontend only - No orchestrator required
+# ============================================
+
+services:
+  # ========================================
+  # Frontend (Next.js + WebSocket Proxy)
+  # ========================================
+  frontend:
+    image: ${DEPLOY_IMAGE_NAME:-unicenter-frontend:local}
+    container_name: unicenter-frontend-esage
+    restart: unless-stopped
+    ports:
+      - "3001:3000"  # Unified HTTP + WebSocket
+    # Load project .env into the container. `environment` below overrides
+    # env_file for values that must differ inside
+    # the container (service DNS, NODE_ENV, instance id defaults).
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      # Always use the compose-network postgres hostname (host .env may point
+      # at a published IP / localhost for tooling).
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-unicenter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-unicenter}?schema=public
+      # Derive public origin from Host / X-Forwarded-* unless NEXTAUTH_URL is set
+      # (OIDC/SSO or fixed HTTPS). Do not default these to localhost — that breaks
+      # production redirects when .env leaves them empty.
+      - AUTH_TRUST_HOST=${AUTH_TRUST_HOST:-true}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-}
+      - APP_URL=${APP_URL:-}
+      - NEXT_PUBLIC_GITHUB_REPO=${NEXT_PUBLIC_GITHUB_REPO:-yangbf1999/unicenter}
+      - UNICENTER_INSTANCE_ID=${UNICENTER_INSTANCE_ID:-unicenter-frontend-esage}
+      # Current v1.0 Community deployment has no external orchestrator.
+      #
+      # Docker Secrets support (Swarm / file-based): set *_FILE in .env, e.g.
+      # APP_SECRET_FILE=/run/secrets/app_secret
+    volumes:
+      - unicenter_data:/app/data
+    # secrets:
+    #   - app_secret
+    #   - nextauth_secret
+    networks:
+      - unicenter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      # Let deploy.sh observe a newly started frontend promptly while keeping
+      # the runtime health-check traffic modest.
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ========================================
+  # Postgres (application database)
+  # ========================================
+  # Single source of truth for UniCenter data. The frontend connects to this
+  # instance over the internal network.
+  postgres:
+    image: postgres:16-alpine
+    container_name: unicenter-postgres-esage
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-unicenter}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (see .env.example)}
+      - POSTGRES_DB=${POSTGRES_DB:-unicenter}
+      # Performance + correctness: stop the server if a write fails on disk
+      # rather than silently corrupting the WAL. Defaults are fine but we
+      # pin them to avoid surprises across postgres image versions.
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # postgres still bound on :5432. App traffic uses the internal
+    # `unicenter` network hostname `postgres`, not this host port.
+    ports:
+      - "5432:5432"
+    networks:
+      - unicenter
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-unicenter} -d ${POSTGRES_DB:-unicenter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# ========================================
+# Networks
+# ========================================
+networks:
+  unicenter:
+    driver: bridge
+    name: unicenter-esage
+
+# ========================================
+# Volumes
+# ========================================
+# ========================================
+# Secrets (uncomment for Docker Swarm)
+# ========================================
+# secrets:
+#   app_secret:
+#     
+#   nextauth_secret:
+#     
+
+volumes:
+  unicenter_data:
+    name: unicenter_data_esage
+    
+  postgres_data:
+    name: postgres_data_esage
+    

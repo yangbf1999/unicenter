@@ -1,0 +1,552 @@
+'use client'
+
+import { useState, useEffect, useRef, useCallback } from 'react'
+import {
+  Box, Card, CardContent, Typography, TextField, Button, Switch,
+  FormControlLabel, Alert, CircularProgress, Divider, IconButton,
+  Tooltip, alpha, useTheme
+} from '@mui/material'
+import { useTranslations } from 'next-intl'
+import { useBranding } from '@/contexts/BrandingContext'
+import ColorPicker from '@/components/common/ColorPicker'
+import { isHexColor, normalizeHexColor } from '@/lib/theme/hexColor'
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5MB
+
+export default function WhiteLabelTab() {
+  const t = useTranslations()
+  const theme = useTheme()
+  const { branding, refresh } = useBranding()
+
+  const [config, setConfig] = useState({
+    enabled: false,
+    appName: '',
+    logoUrl: '',
+    faviconUrl: '',
+    loginLogoUrl: '',
+    primaryColor: '',
+    footerText: '',
+    browserTitle: '',
+    poweredByVisible: true,
+    showWhatsNew: true,
+    showAbout: true,
+    showSubscription: true,
+    loginTagline: '',
+    loginHighlights: [
+      { icon: '', text: '' },
+      { icon: '', text: '' },
+      { icon: '', text: '' },
+    ],
+    docsUrl: '',
+    supportUrl: '',
+    changelogUrl: '',
+    hideVersion: false,
+  })
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [uploading, setUploading] = useState('')
+  const [success, setSuccess] = useState('')
+  const [error, setError] = useState('')
+
+  const logoInputRef = useRef(null)
+  const faviconInputRef = useRef(null)
+  const loginLogoInputRef = useRef(null)
+
+  // #754: the primary colour ends up in MUI's lighten()/darken() for the whole
+  // application, login page included, so a value that cannot be parsed used to
+  // take the tenant down with a 500 and no UI left to revert it. An empty field
+  // means "no override" and stays valid; anything else has to be a hex colour.
+  const primaryColorInvalid = config.primaryColor !== '' && !isHexColor(config.primaryColor)
+
+  // Load settings
+  useEffect(() => {
+    fetch('/api/v1/settings/branding')
+      .then(r => r.json())
+      .then(data => {
+        if (!data.error) setConfig(prev => ({ ...prev, ...data }))
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  const handleSave = useCallback(async () => {
+    setSaving(true)
+    setError('')
+    setSuccess('')
+    try {
+      const cleanedHighlights = (config.loginHighlights || [])
+        .filter(h => h && h.icon && h.text && h.icon.trim() !== '' && h.text.trim() !== '')
+        .slice(0, 3)
+      // A missing '#' is what an administrator meant, not what they typed, so
+      // it is added here rather than refused (#754).
+      const payload = {
+        ...config,
+        primaryColor: config.primaryColor ? (normalizeHexColor(config.primaryColor) ?? '') : '',
+        loginHighlights: cleanedHighlights,
+      }
+
+      if (config.primaryColor && !payload.primaryColor) {
+        throw new Error('Invalid primary colour: use a hex value such as #00ECB2')
+      }
+
+      const res = await fetch('/api/v1/settings/branding', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      setSuccess('Branding settings saved successfully')
+      await refresh()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }, [config, refresh])
+
+  const handleUpload = useCallback(async (file, type) => {
+    if (!file) return
+    if (file.size > MAX_FILE_SIZE) {
+      setError('File too large (max 5MB)')
+      return
+    }
+
+    setUploading(type)
+    setError('')
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('type', type)
+
+      const res = await fetch('/api/v1/settings/branding/logo', {
+        method: 'POST',
+        body: formData,
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+
+      const urlField = type === 'favicon' ? 'faviconUrl' : type === 'loginLogo' ? 'loginLogoUrl' : 'logoUrl'
+      setConfig(prev => ({ ...prev, [urlField]: data.imageUrl }))
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setUploading('')
+    }
+  }, [])
+
+  const handleRemoveImage = useCallback(async (type) => {
+    setError('')
+    try {
+      await fetch('/api/v1/settings/branding/logo', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type }),
+      })
+      const urlField = type === 'favicon' ? 'faviconUrl' : type === 'loginLogo' ? 'loginLogoUrl' : 'logoUrl'
+      setConfig(prev => ({ ...prev, [urlField]: '' }))
+    } catch (e) {
+      setError(e.message)
+    }
+  }, [])
+
+  const handleReset = useCallback(() => {
+    setConfig({
+      enabled: false,
+      appName: 'UniCenter',
+      logoUrl: '',
+      faviconUrl: '',
+      loginLogoUrl: '',
+      primaryColor: '',
+      footerText: '',
+      browserTitle: '',
+      poweredByVisible: true,
+      loginTagline: '',
+      loginHighlights: [
+        { icon: '', text: '' },
+        { icon: '', text: '' },
+        { icon: '', text: '' },
+      ],
+      docsUrl: '',
+      supportUrl: '',
+      changelogUrl: '',
+      hideVersion: false,
+    })
+  }, [])
+
+  if (loading) {
+    return <Box sx={{ p: 4, textAlign: 'center' }}><CircularProgress size={32} /></Box>
+  }
+
+  return (
+    <Box sx={{ p: 3, maxWidth: 800 }}>
+      <Typography variant="h6" sx={{ mb: 0.5, fontWeight: 700 }}>
+        <i className="ri-pantone-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+        White Label / Branding
+      </Typography>
+      <Typography variant="body2" sx={{ mb: 3, opacity: 0.6 }}>
+        Customize your organization&apos;s application name, logos, metadata and footer. Legacy color values remain editable for compatibility.
+      </Typography>
+
+      {error && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>{error}</Alert>}
+      {success && <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess('')}>{success}</Alert>}
+
+      {/* Master Switch */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 2, '&:last-child': { pb: 2 } }}>
+          <Box>
+            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+              <i className="ri-toggle-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+              Enable White Label
+            </Typography>
+            <Typography variant="caption" sx={{ opacity: 0.6 }}>
+              When enabled, your custom branding replaces the default UniCenter branding across the entire application.
+            </Typography>
+          </Box>
+          <Switch
+            checked={config.enabled}
+            onChange={e => setConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+          />
+        </CardContent>
+      </Card>
+
+      <Box sx={{ opacity: config.enabled ? 1 : 0.4, pointerEvents: config.enabled ? 'auto' : 'none', transition: 'opacity 0.3s' }}>
+      {/* Application Name */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-text" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Application Name
+          </Typography>
+          <TextField
+            fullWidth
+            size="small"
+            label="App Name"
+            placeholder="UniCenter"
+            value={config.appName}
+            onChange={e => setConfig(prev => ({ ...prev, appName: e.target.value }))}
+            helperText="Displayed in sidebar, login page, footer, and browser title"
+          />
+          <TextField
+            fullWidth
+            size="small"
+            label="Browser Tab Title"
+            placeholder="UNICENTER"
+            value={config.browserTitle}
+            onChange={e => setConfig(prev => ({ ...prev, browserTitle: e.target.value }))}
+            sx={{ mt: 2 }}
+            helperText="Text shown in the browser tab. Leave empty to use the app name."
+          />
+        </CardContent>
+      </Card>
+
+      {/* Logos */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-image-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Logos
+          </Typography>
+
+          {/* Sidebar Logo */}
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="body2" sx={{ mb: 1, fontWeight: 500 }}>Sidebar Logo</Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <Box sx={{
+                width: 120, height: 48, border: '1px dashed', borderColor: 'divider',
+                borderRadius: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                bgcolor: alpha(theme.palette.background.paper, 0.5), overflow: 'hidden',
+              }}>
+                {config.logoUrl ? (
+                  <img src={config.logoUrl} alt="Logo" style={{ maxHeight: 40, maxWidth: 110, objectFit: 'contain' }} />
+                ) : (
+                  <Typography variant="caption" sx={{ opacity: 0.4 }}>Default</Typography>
+                )}
+              </Box>
+              <Button size="small" variant="outlined" onClick={() => logoInputRef.current?.click()}
+                disabled={uploading === 'logo'} startIcon={uploading === 'logo' ? <CircularProgress size={14} /> : <i className="ri-upload-line" />}>
+                Upload
+              </Button>
+              {config.logoUrl && (
+                <Tooltip title="Remove">
+                  <IconButton size="small" color="error" onClick={() => handleRemoveImage('logo')}>
+                    <i className="ri-delete-bin-line" />
+                  </IconButton>
+                </Tooltip>
+              )}
+              <input ref={logoInputRef} type="file" hidden accept="image/png,image/jpeg,image/svg+xml,image/webp"
+                onChange={e => handleUpload(e.target.files?.[0], 'logo')} />
+            </Box>
+            <Typography variant="caption" sx={{ opacity: 0.5, mt: 0.5, display: 'block' }}>
+              Recommended: 200x50px, PNG or SVG with transparent background
+            </Typography>
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+
+          {/* Login Logo */}
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="body2" sx={{ mb: 1, fontWeight: 500 }}>Login Page Logo</Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <Box sx={{
+                width: 120, height: 48, border: '1px dashed', borderColor: 'divider',
+                borderRadius: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                bgcolor: alpha(theme.palette.background.paper, 0.5), overflow: 'hidden',
+              }}>
+                {config.loginLogoUrl ? (
+                  <img src={config.loginLogoUrl} alt="Login Logo" style={{ maxHeight: 40, maxWidth: 110, objectFit: 'contain' }} />
+                ) : (
+                  <Typography variant="caption" sx={{ opacity: 0.4 }}>Same as sidebar</Typography>
+                )}
+              </Box>
+              <Button size="small" variant="outlined" onClick={() => loginLogoInputRef.current?.click()}
+                disabled={uploading === 'loginLogo'} startIcon={uploading === 'loginLogo' ? <CircularProgress size={14} /> : <i className="ri-upload-line" />}>
+                Upload
+              </Button>
+              {config.loginLogoUrl && (
+                <Tooltip title="Remove">
+                  <IconButton size="small" color="error" onClick={() => handleRemoveImage('loginLogo')}>
+                    <i className="ri-delete-bin-line" />
+                  </IconButton>
+                </Tooltip>
+              )}
+              <input ref={loginLogoInputRef} type="file" hidden accept="image/png,image/jpeg,image/svg+xml,image/webp"
+                onChange={e => handleUpload(e.target.files?.[0], 'loginLogo')} />
+            </Box>
+            <Typography variant="caption" sx={{ opacity: 0.5, mt: 0.5, display: 'block' }}>
+              Optional. If not set, the sidebar logo is used on the login page.
+            </Typography>
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+
+          {/* Favicon */}
+          <Box>
+            <Typography variant="body2" sx={{ mb: 1, fontWeight: 500 }}>Favicon</Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <Box sx={{
+                width: 40, height: 40, border: '1px dashed', borderColor: 'divider',
+                borderRadius: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                bgcolor: alpha(theme.palette.background.paper, 0.5), overflow: 'hidden',
+              }}>
+                {config.faviconUrl ? (
+                  <img src={config.faviconUrl} alt="Favicon" style={{ width: 32, height: 32, objectFit: 'contain' }} />
+                ) : (
+                  <Typography variant="caption" sx={{ opacity: 0.4, fontSize: 10 }}>Default</Typography>
+                )}
+              </Box>
+              <Button size="small" variant="outlined" onClick={() => faviconInputRef.current?.click()}
+                disabled={uploading === 'favicon'} startIcon={uploading === 'favicon' ? <CircularProgress size={14} /> : <i className="ri-upload-line" />}>
+                Upload
+              </Button>
+              {config.faviconUrl && (
+                <Tooltip title="Remove">
+                  <IconButton size="small" color="error" onClick={() => handleRemoveImage('favicon')}>
+                    <i className="ri-delete-bin-line" />
+                  </IconButton>
+                </Tooltip>
+              )}
+              <input ref={faviconInputRef} type="file" hidden accept="image/png,image/svg+xml,image/x-icon,image/vnd.microsoft.icon"
+                onChange={e => handleUpload(e.target.files?.[0], 'favicon')} />
+            </Box>
+            <Typography variant="caption" sx={{ opacity: 0.5, mt: 0.5, display: 'block' }}>
+              Recommended: 32x32px or 48x48px, PNG or ICO
+            </Typography>
+          </Box>
+        </CardContent>
+      </Card>
+
+      {/* Primary Color */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-palette-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Primary Color
+          </Typography>
+          <ColorPicker
+            value={config.primaryColor}
+            onChange={hex => setConfig(prev => ({ ...prev, primaryColor: hex }))}
+            label="Hex Color"
+            placeholder="#7C4DFF"
+            fallback={theme.palette.primary.main}
+            onReset={() => setConfig(prev => ({ ...prev, primaryColor: '' }))}
+            error={primaryColorInvalid}
+          />
+          {primaryColorInvalid ? (
+            <Typography variant="caption" color="error" sx={{ mt: 1, display: 'block' }}>
+              Enter a hex colour such as #00ECB2. The leading # is added for you if you leave it out.
+            </Typography>
+          ) : (
+            <Typography variant="caption" sx={{ opacity: 0.5, mt: 1, display: 'block' }}>
+              Saved for branding compatibility. The current fixed Nebula theme keeps its application palette at #2563EB.
+            </Typography>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Footer */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-layout-bottom-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Footer
+          </Typography>
+          <TextField
+            fullWidth
+            size="small"
+            label="Footer Text"
+            placeholder={`© ${new Date().getFullYear()} ${config.appName || 'UniCenter'}`}
+            value={config.footerText}
+            onChange={e => setConfig(prev => ({ ...prev, footerText: e.target.value }))}
+            helperText="Custom footer text. Leave empty for default."
+          />
+          <FormControlLabel
+            control={
+              <Switch
+                checked={config.poweredByVisible}
+                onChange={e => setConfig(prev => ({ ...prev, poweredByVisible: e.target.checked }))}
+              />
+            }
+            label={
+              <Typography variant="body2">
+                Show &quot;Powered by UniCenter&quot; in footer
+              </Typography>
+            }
+            sx={{ mt: 1.5 }}
+          />
+        </CardContent>
+      </Card>
+
+      {/* UI Elements Visibility */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-eye-off-line" style={{ marginRight: 8, opacity: 0.7 }} />
+            {t('settings.whiteLabel.uiVisibility')}
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            {t('settings.whiteLabel.uiVisibilityDesc')}
+          </Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+            <FormControlLabel
+              control={<Switch checked={config.showWhatsNew} onChange={e => setConfig(c => ({ ...c, showWhatsNew: e.target.checked }))} />}
+              label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-megaphone-line" style={{ fontSize: 16, opacity: 0.6 }} /><Typography variant="body2">{t('settings.whiteLabel.showWhatsNew')}</Typography></Box>}
+            />
+            <FormControlLabel
+              control={<Switch checked={config.showAbout} onChange={e => setConfig(c => ({ ...c, showAbout: e.target.checked }))} />}
+              label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-information-line" style={{ fontSize: 16, opacity: 0.6 }} /><Typography variant="body2">{t('settings.whiteLabel.showAbout')}</Typography></Box>}
+            />
+            <FormControlLabel
+              control={<Switch checked={config.showSubscription} onChange={e => setConfig(c => ({ ...c, showSubscription: e.target.checked }))} />}
+              label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-vip-crown-line" style={{ fontSize: 16, opacity: 0.6 }} /><Typography variant="body2">{t('settings.whiteLabel.showSubscription')}</Typography></Box>}
+            />
+          </Box>
+        </CardContent>
+      </Card>
+
+      {/* Preview */}
+      <Card variant="outlined" sx={{ mb: 2, bgcolor: alpha(theme.palette.primary.main, 0.03) }}>
+        <CardContent>
+          <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+            <i className="ri-eye-line" style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Preview
+          </Typography>
+          <Box sx={{
+            p: 2, borderRadius: 1, bgcolor: 'background.paper', border: '1px solid', borderColor: 'divider',
+          }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2 }}>
+              {config.logoUrl ? (
+                <img src={config.logoUrl} alt="" style={{ height: 28, objectFit: 'contain' }} />
+              ) : (
+                <Box sx={{ width: 28, height: 22, bgcolor: 'primary.main', borderRadius: 0.5, opacity: 0.7 }} />
+              )}
+              <Typography variant="subtitle1" sx={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                {config.appName || 'UniCenter'}
+              </Typography>
+            </Box>
+            <Divider sx={{ my: 1.5 }} />
+            <Typography variant="caption" sx={{ opacity: 0.5 }}>
+              {config.footerText || `© ${new Date().getFullYear()} ${config.appName || 'UniCenter'}`}
+              {config.poweredByVisible && config.appName && config.appName !== 'UniCenter' && (
+                <span style={{ marginLeft: 8, opacity: 0.6 }}>Powered by UniCenter</span>
+              )}
+            </Typography>
+          </Box>
+        </CardContent>
+      </Card>
+
+      {/* Login page customization */}
+      <Card variant='outlined' sx={{ mb: 2 }}>
+        <CardContent>
+          <Typography variant='subtitle2' sx={{ mb: 2, fontWeight: 600 }}>
+            <i className='ri-login-circle-line' style={{ marginRight: 8, opacity: 0.7 }} />{' '}
+            Login page
+          </Typography>
+          <Typography variant='caption' sx={{ display: 'block', mb: 2, opacity: 0.6 }}>
+            Customize the brand panel of the login page. Leave fields empty to fall back to defaults.
+          </Typography>
+
+          <TextField
+            fullWidth
+            size='small'
+            label='Tagline'
+            value={config.loginTagline}
+            onChange={e => setConfig(prev => ({ ...prev, loginTagline: e.target.value }))}
+            helperText='One short sentence shown next to the logo on the login page.'
+            sx={{ mb: 2 }}
+          />
+
+          <Divider sx={{ my: 2 }} />
+
+          <TextField
+            fullWidth size='small' label='Docs URL'
+            placeholder='https://docs.example.com'
+            value={config.docsUrl}
+            onChange={e => setConfig(prev => ({ ...prev, docsUrl: e.target.value }))}
+            sx={{ mb: 2 }}
+            helperText='Shown in the login footer. Hidden if empty.'
+          />
+          <TextField
+            fullWidth size='small' label='Support URL'
+            placeholder='https://support.example.com'
+            value={config.supportUrl}
+            onChange={e => setConfig(prev => ({ ...prev, supportUrl: e.target.value }))}
+            sx={{ mb: 2 }}
+            helperText='Shown in the login footer. Hidden if empty.'
+          />
+          <TextField
+            fullWidth size='small' label='Changelog URL'
+            placeholder='https://example.com/changelog'
+            value={config.changelogUrl}
+            onChange={e => setConfig(prev => ({ ...prev, changelogUrl: e.target.value }))}
+            sx={{ mb: 2 }}
+            helperText='Makes the version label clickable in the footer. Hidden if empty.'
+          />
+
+          <FormControlLabel
+            control={
+              <Switch
+                checked={config.hideVersion}
+                onChange={e => setConfig(prev => ({ ...prev, hideVersion: e.target.checked }))}
+              />
+            }
+            label='Hide version label in the login footer'
+          />
+        </CardContent>
+      </Card>
+
+      </Box>
+
+      {/* Actions */}
+      <Box sx={{ display: 'flex', gap: 2, justifyContent: 'flex-end' }}>
+        <Button variant="outlined" color="secondary" onClick={handleReset} startIcon={<i className="ri-refresh-line" />}>
+          Reset to Default
+        </Button>
+        <Button variant="contained" onClick={handleSave} disabled={saving || primaryColorInvalid}
+          startIcon={saving ? <CircularProgress size={16} color="inherit" /> : <i className="ri-save-line" />}>
+          Save Changes
+        </Button>
+      </Box>
+    </Box>
+  )
+}

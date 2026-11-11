@@ -1,0 +1,757 @@
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useTranslations } from 'next-intl'
+
+import {
+  Alert, Box, Button, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle,
+  FormControlLabel, IconButton, LinearProgress, MenuItem, Select, Stack, Switch, TextField, Tooltip, Typography
+} from '@mui/material'
+
+import { ScreenshotPreviewDialog, useExecutionScreenshots, type ScreenshotMeta } from './ExecutionScreenshots'
+
+import { formatBytes } from '@/utils/format'
+
+import type {
+  RecoveryPlan, RecoveryExecution, RecoveryVMResult, PlanRestorePoints, TestFailoverOptions
+} from '@/lib/orchestrator/site-recovery.types'
+
+// Boot-screenshot stabilization delay offered for a test failover, mirroring
+// the orchestrator's own default and cap (DefaultScreenshotStabilizeDelay /
+// MaxScreenshotStabilizeDelaySeconds): a slow guest needs more than the
+// default to reach a login screen, and the cap keeps a mistyped value from
+// parking the test for hours.
+export const DEFAULT_SCREENSHOT_DELAY_SECONDS = 45
+export const MAX_SCREENSHOT_DELAY_SECONDS = 600
+// Floor of 5s rather than 0: the orchestrator reads 0 as "take the product
+// default" (which is what every execution recorded before the option
+// existed reads back as), so a 0 typed here would wait 45s instead of capturing at
+// once. Offering it would be a trap.
+export const MIN_SCREENSHOT_DELAY_SECONDS = 5
+
+// ── Main Component ─────────────────────────────────────────────────────
+
+interface FailoverDialogProps {
+  open: boolean
+  onClose: () => void
+  plan: RecoveryPlan | null
+  type: 'test' | 'failover' | 'failback'
+  onConfirm: (options?: TestFailoverOptions) => void
+  onCleanup?: () => void
+  cleanupLoading?: boolean
+  cleanupResult?: { vms_stopped: number; disks_rolled: number; jobs_resumed: number; errors: string[] } | null
+  execution: RecoveryExecution | null
+  errorMessage?: string | null
+  targetConnId?: string
+  connections?: { id: string; name: string }[]
+  vmNameMap?: Record<number, string>
+  restorePoints?: PlanRestorePoints | null
+  restorePointsLoading?: boolean
+  restorePointsError?: boolean
+  onFailbackCutover?: (planId: string) => void
+  onFailbackCancel?: (planId: string) => void
+}
+
+export default function FailoverDialog({ open, onClose, plan, type, onConfirm, onCleanup, cleanupLoading, cleanupResult, execution, errorMessage, targetConnId, connections, vmNameMap, restorePoints, restorePointsLoading, restorePointsError, onFailbackCutover, onFailbackCancel }: FailoverDialogProps) {
+  const t = useTranslations()
+  const [confirmText, setConfirmText] = useState('')
+  const [selectedPoints, setSelectedPoints] = useState<Record<number, string>>({})
+  const screenshots = useExecutionScreenshots(execution && type === 'test' ? execution.id : null)
+  const [screenshotPreview, setScreenshotPreview] = useState<ScreenshotMeta | null>(null)
+  const isDestructive = type === 'failover' || type === 'failback'
+  const isExecuting = !!execution && execution.status === 'running'
+  const [stabilizeRemainingSeconds, setStabilizeRemainingSeconds] = useState<number | null>(null)
+  const [confirmCancelFailback, setConfirmCancelFailback] = useState(false)
+  const [confirmCutover, setConfirmCutover] = useState(false)
+  // Test-failover options, editable until the run starts.
+  const [networkIsolated, setNetworkIsolated] = useState(true)
+  const [screenshotDelay, setScreenshotDelay] = useState(String(DEFAULT_SCREENSHOT_DELAY_SECONDS))
+
+  useEffect(() => {
+    if (!open) {
+      setConfirmText('')
+      setSelectedPoints({})
+      setConfirmCancelFailback(false)
+      setConfirmCutover(false)
+      setNetworkIsolated(true)
+      setScreenshotDelay(String(DEFAULT_SCREENSHOT_DELAY_SECONDS))
+    }
+  }, [open])
+
+  // Live countdown for the 'stabilizing' phase, ticking every second while
+  // it's active — so the ~45-60s post-boot wait shows a deadline instead of
+  // an indefinite spinner.
+  useEffect(() => {
+    if (execution?.phase !== 'stabilizing' || !execution.phase_ends_at) {
+      setStabilizeRemainingSeconds(null)
+      return
+    }
+    const endsAt = new Date(execution.phase_ends_at).getTime()
+    const tick = () => setStabilizeRemainingSeconds(Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [execution?.phase, execution?.phase_ends_at])
+
+  if (!plan) return null
+
+  const confirmRequired = isDestructive ? plan.name : null
+  // A test failover started before this page load has no in-memory
+  // `execution` yet — the rehydration fetch on open is still in flight or
+  // failed. Block a second test-failover attempt until it resolves.
+  const testActiveUnresolved = type === 'test' && !!plan.active_test_execution_id && !execution
+  // Empty or non-integer input is a typo, not a request for the default:
+  // refuse the run rather than silently sending something else.
+  const screenshotDelayInvalid = type === 'test'
+    && (!/^\d+$/.test(screenshotDelay.trim())
+      || Number(screenshotDelay) < MIN_SCREENSHOT_DELAY_SECONDS
+      || Number(screenshotDelay) > MAX_SCREENSHOT_DELAY_SECONDS)
+  const canConfirm = (!isDestructive || confirmText === confirmRequired) && !testActiveUnresolved && !screenshotDelayInvalid
+  // The two-phase failback flow: while reverse replication converges, the
+  // dialog shows a dedicated per-VM sync table (not the generic progress
+  // rows) and its own Cutover/Cancel actions instead of the default ones.
+  const isReverseSyncPhase = type === 'failback' && !!execution && execution.phase === 'reverse_sync'
+  // Cutover must never fence a VM that has not completed even one reverse
+  // sync yet (backend guard: ExecuteFailbackCutover refuses it outright) —
+  // disable the button rather than let the operator hit that failure.
+  const cutoverNotReady = isReverseSyncPhase
+    && (execution?.vm_results || []).some(vm => vm.status !== 'completed' && !vm.last_reverse_sync_at)
+  // Endpoint labels for the reverse-sync flow banner: DR (plan's target
+  // cluster) on the left, source on the right — the reverse of
+  // CreateJobDialog's source→target connector, since failback copies data
+  // back from the DR site to the original source.
+  const drClusterName = connections?.find(c => c.id === plan.target_cluster)?.name || 'DR'
+  const sourceClusterName = connections?.find(c => c.id === plan.source_cluster)?.name || t('siteRecovery.protection.source')
+
+  const typeConfig = {
+    test: {
+      title: t('siteRecovery.failover.testTitle'),
+      description: t('siteRecovery.failover.testDescription'),
+      color: 'info' as const,
+      icon: 'ri-test-tube-line',
+      severity: 'info' as const
+    },
+    failover: {
+      title: t('siteRecovery.failover.failoverTitle'),
+      description: t('siteRecovery.failover.failoverDescription'),
+      color: 'warning' as const,
+      icon: 'ri-shield-star-line',
+      severity: 'warning' as const
+    },
+    failback: {
+      title: t('siteRecovery.failover.failbackTitle'),
+      description: t('siteRecovery.failover.failbackDescription'),
+      color: 'warning' as const,
+      icon: 'ri-arrow-go-back-line',
+      severity: 'warning' as const
+    }
+  }
+
+  const config = typeConfig[type]
+
+  return (
+    <Dialog open={open} onClose={isExecuting && !isReverseSyncPhase ? undefined : onClose} maxWidth='sm' fullWidth>
+      <DialogTitle sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className={config.icon} />
+        {config.title}
+      </DialogTitle>
+      <DialogContent>
+        <Stack spacing={2}>
+          <Alert severity={config.severity}>{config.description}</Alert>
+
+          {restorePointsError && !execution && type !== 'failback' && (
+            <Alert severity='info'>{t('siteRecovery.failover.restorePointsLoadFailed')}</Alert>
+          )}
+
+          {testActiveUnresolved && (
+            <Alert severity='warning'>
+              {t('siteRecovery.failover.testActiveBanner', {
+                date: plan.last_test ? new Date(plan.last_test).toLocaleString() : ''
+              })}
+            </Alert>
+          )}
+
+          {/* Test options, editable until the run starts: network isolation
+              (on by default) and the post-boot screenshot delay. */}
+          {type === 'test' && !execution && (
+            <Box sx={{ p: 1.5, borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
+              <Stack spacing={1.5}>
+                <Box>
+                  <FormControlLabel
+                    sx={{ ml: 0 }}
+                    control={
+                      <Switch
+                        size='small'
+                        checked={networkIsolated}
+                        onChange={e => setNetworkIsolated(e.target.checked)}
+                        sx={{ mr: 1 }}
+                      />
+                    }
+                    label={
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                        <Box
+                          component='i'
+                          className={networkIsolated ? 'ri-wifi-off-line' : 'ri-wifi-line'}
+                          sx={{ fontSize: 16, color: networkIsolated ? 'info.main' : 'warning.main' }}
+                        />
+                        <Typography variant='body2' sx={{ fontWeight: 500 }}>
+                          {t('siteRecovery.failover.networkIsolation')}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                  <Typography variant='caption' sx={{ color: 'text.secondary', display: 'block' }}>
+                    {t('siteRecovery.failover.networkIsolationHelp')}
+                  </Typography>
+                </Box>
+                {!networkIsolated && (
+                  <Alert severity='warning'>{t('siteRecovery.failover.networkConnectedWarning')}</Alert>
+                )}
+                <TextField
+                  size='small'
+                  type='number'
+                  label={t('siteRecovery.failover.screenshotDelayLabel')}
+                  value={screenshotDelay}
+                  onChange={e => setScreenshotDelay(e.target.value)}
+                  error={screenshotDelayInvalid}
+                  helperText={screenshotDelayInvalid
+                    ? t('siteRecovery.failover.screenshotDelayInvalid', {
+                      min: MIN_SCREENSHOT_DELAY_SECONDS,
+                      max: MAX_SCREENSHOT_DELAY_SECONDS
+                    })
+                    : t('siteRecovery.failover.screenshotDelayHelp', { seconds: DEFAULT_SCREENSHOT_DELAY_SECONDS })}
+                  InputProps={{ endAdornment: <Typography variant='caption' sx={{ color: 'text.secondary' }}>s</Typography> }}
+                  inputProps={{ min: MIN_SCREENSHOT_DELAY_SECONDS, max: MAX_SCREENSHOT_DELAY_SECONDS, step: 5 }}
+                  sx={{ maxWidth: 280 }}
+                />
+              </Stack>
+            </Box>
+          )}
+          {type === 'test' && execution && (
+            <Chip
+              size='small'
+              icon={<i className={execution.network_isolated === false ? 'ri-wifi-line' : 'ri-wifi-off-line'} />}
+              label={execution.network_isolated === false
+                ? t('siteRecovery.failover.networkConnected')
+                : t('siteRecovery.failover.networkIsolated')}
+              color={execution.network_isolated === false ? 'warning' : 'info'}
+              variant='outlined'
+              sx={{ mt: -0.5 }}
+            />
+          )}
+
+          {/* Plan Summary — VM list with per-VM status + noVNC console button */}
+          <Box sx={{ p: 1, borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
+            {/* VM list with per-VM status + noVNC console button */}
+            {(() => {
+              const resultsByVMID: Record<number, RecoveryVMResult> = {}
+              for (const r of (execution?.vm_results || [])) resultsByVMID[r.vm_id] = r
+              const sortedVMs = [...plan.vms].sort((a, b) => (a.boot_order || 0) - (b.boot_order || 0))
+              const showRestoreSelector = !execution && type !== 'failback'
+              return (
+                <Stack spacing={0.5} sx={{ maxHeight: 260, overflow: 'auto' }}>
+                  {sortedVMs.map(vm => {
+                    const res = resultsByVMID[vm.vm_id]
+                    const statusIcon = res
+                      ? res.status === 'completed' ? { icon: 'ri-check-line', color: 'success.main' }
+                        : res.status === 'failed' ? { icon: 'ri-close-line', color: 'error.main' }
+                        : res.status === 'running' ? { icon: 'ri-loader-4-line', color: 'primary.main' }
+                        : { icon: 'ri-time-line', color: 'text.disabled' }
+                      : null
+                    const canConsole = type === 'test'
+                      && targetConnId
+                      && res
+                      && res.target_node
+                      && res.target_vmid != null
+                      && (res.status === 'running' || res.status === 'completed')
+                    return (
+                      <Box key={vm.vm_id} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.5, px: 0.75, borderRadius: 0.5, '&:hover': { bgcolor: 'action.hover' } }}>
+                        {statusIcon && (
+                          <Box sx={{ width: 16, textAlign: 'center', color: statusIcon.color, fontSize: 14, display: 'inline-flex', justifyContent: 'center' }}>
+                            <i className={statusIcon.icon} style={{ animation: statusIcon.icon === 'ri-loader-4-line' ? 'spin 1.5s linear infinite' : 'none' }} />
+                            <Box sx={{ '@keyframes spin': { '0%': { transform: 'rotate(0deg)' }, '100%': { transform: 'rotate(360deg)' } } }} />
+                          </Box>
+                        )}
+                        <Chip
+                          size='small'
+                          label={`T${vm.tier}`}
+                          color={vm.tier === 1 ? 'error' : vm.tier === 2 ? 'warning' : 'default'}
+                          variant='outlined'
+                          sx={{ height: 18, fontSize: '0.6rem', minWidth: 32 }}
+                        />
+                        <i className='ri-computer-line' style={{ fontSize: 14, opacity: 0.65 }} />
+                        <Typography variant='body2' sx={{ fontWeight: 500, fontSize: '0.8rem', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {vmNameMap?.[vm.vm_id] || (vm.vm_name && !vm.vm_name.startsWith('VM ') ? vm.vm_name : `VM ${vm.vm_id}`)}
+                        </Typography>
+                        {showRestoreSelector && !restorePointsError && (
+                          restorePointsLoading ? (
+                            <CircularProgress size={14} />
+                          ) : (() => {
+                            const vmRestore = restorePoints?.vms.find(v => v.vm_id === vm.vm_id)
+                            if (!vmRestore || vmRestore.error || vmRestore.restore_points.length === 0) {
+                              return (
+                                <Typography variant='caption' sx={{ color: 'text.disabled', fontSize: '0.65rem', minWidth: 170, textAlign: 'right' }}>
+                                  {t('siteRecovery.failover.restorePointsNone')}
+                                </Typography>
+                              )
+                            }
+                            return (
+                              <>
+                                <Typography variant='caption' sx={{ color: 'text.secondary', fontSize: '0.65rem' }}>
+                                  {t('siteRecovery.failover.restorePointChoose')}
+                                </Typography>
+                                <Select
+                                  size='small'
+                                  displayEmpty
+                                  value={selectedPoints[vm.vm_id] || ''}
+                                  onChange={e => {
+                                    const val = e.target.value
+                                    setSelectedPoints(prev => {
+                                      const next = { ...prev }
+                                      if (val) next[vm.vm_id] = val
+                                      else delete next[vm.vm_id]
+                                      return next
+                                    })
+                                  }}
+                                  sx={{ minWidth: 170, fontSize: '0.75rem' }}
+                                >
+                                  <MenuItem value=''>{t('siteRecovery.failover.restorePointLatest')}</MenuItem>
+                                  {vmRestore.restore_points.map(rp => (
+                                    <MenuItem key={rp.snapshot} value={rp.snapshot}>
+                                      <i className='ri-camera-line' style={{ fontSize: 13, marginRight: 6, opacity: 0.7 }} />
+                                      {new Date(rp.created_iso).toLocaleString()}
+                                    </MenuItem>
+                                  ))}
+                                </Select>
+                              </>
+                            )
+                          })()
+                        )}
+                        {canConsole && (
+                          <Tooltip title={t('siteRecovery.failover.openConsole')} arrow>
+                            <IconButton
+                              size='small'
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                window.open(
+                                  `/novnc/console.html?connId=${encodeURIComponent(targetConnId!)}&type=qemu&node=${encodeURIComponent(res!.target_node!)}&vmid=${res!.target_vmid}`,
+                                  `console-dr-${res!.target_vmid}`,
+                                  'width=1024,height=768,menubar=no,toolbar=no,location=no,status=no'
+                                )
+                              }}
+                              sx={{ color: 'primary.main', p: 0.5 }}
+                            >
+                              <i className='ri-terminal-box-line' style={{ fontSize: 14 }} />
+                            </IconButton>
+                          </Tooltip>
+                        )}
+                        {type === 'test' && (() => {
+                          const shot = screenshots.find(s => s.vm_id === vm.vm_id)
+                          if (!shot) return null
+                          return (
+                            <Tooltip title={t('siteRecovery.screenshots.view')}>
+                              <IconButton size='small' onClick={() => setScreenshotPreview(shot)} sx={{ color: 'text.secondary' }}>
+                                <i className='ri-camera-line' />
+                              </IconButton>
+                            </Tooltip>
+                          )
+                        })()}
+                      </Box>
+                    )
+                  })}
+                </Stack>
+              )
+            })()}
+          </Box>
+
+          {type === 'failover' && Object.keys(selectedPoints).length > 0 && (
+            <Alert severity='warning'>{t('siteRecovery.failover.restorePointRebaseWarning')}</Alert>
+          )}
+
+          {/* Confirm field for destructive operations */}
+          {isDestructive && !isExecuting && !execution && (
+            <Box>
+              <Typography variant='body2' sx={{ mb: 1 }}>
+                {t('siteRecovery.failover.typeToConfirm', { name: plan.name })}
+              </Typography>
+              <TextField
+                value={confirmText}
+                onChange={e => setConfirmText(e.target.value)}
+                placeholder={plan.name}
+                size='small'
+                fullWidth
+                autoComplete='off'
+              />
+            </Box>
+          )}
+
+          {/* Cleanup result */}
+          {cleanupResult && (() => {
+            const errs = cleanupResult.errors || []
+            return (
+              <Alert severity={errs.length > 0 ? 'warning' : 'success'}>
+                <Typography variant='body2' sx={{ fontWeight: 600, mb: 0.5 }}>
+                  {t('siteRecovery.failover.cleanupDone')}
+                </Typography>
+                <Typography variant='caption' component='div'>
+                  {cleanupResult.vms_stopped > 0 && <>{cleanupResult.vms_stopped} VM(s) {t('siteRecovery.failover.stopped')}<br /></>}
+                  {cleanupResult.disks_rolled > 0 && <>{cleanupResult.disks_rolled} {t('siteRecovery.failover.disksRolledBack')}<br /></>}
+                  {cleanupResult.jobs_resumed > 0 && <>{cleanupResult.jobs_resumed} {t('siteRecovery.failover.jobsResumed')}</>}
+                </Typography>
+                {errs.length > 0 && errs.map((err: string, i: number) => (
+                  <Typography key={i} variant='caption' sx={{ color: 'error.main', display: 'block', mt: 0.5 }}>{err}</Typography>
+                ))}
+              </Alert>
+            )
+          })()}
+
+          {/* Failover completion summary */}
+          {execution && execution.status === 'completed' && type === 'failover' && (() => {
+            const results = execution.vm_results || []
+            const total = results.length
+            const okCount = results.filter(r => r.status === 'completed').length
+            const allOk = total > 0 && okCount === total
+            return (
+              <Alert severity={allOk ? 'success' : 'warning'}>
+                <Typography variant='body2' sx={{ fontWeight: 600, mb: 0.5 }}>
+                  {t('siteRecovery.failover.completeTitle')}
+                </Typography>
+                <Typography variant='caption' component='div'>
+                  {okCount}/{total} {t('siteRecovery.failover.completeVMs')}
+                </Typography>
+                <Typography variant='caption' component='div'>
+                  {t('siteRecovery.failover.completeLocked')}
+                </Typography>
+              </Alert>
+            )
+          })()}
+
+          {/* Failback completion summary */}
+          {execution && execution.status === 'completed' && type === 'failback' && (
+            <Alert severity='success'>
+              <Typography variant='body2' sx={{ fontWeight: 600, mb: 0.5 }}>
+                {t('siteRecovery.failback.completeTitle')}
+              </Typography>
+              <Typography variant='caption' component='div'>
+                {t('siteRecovery.failback.completeReprotected')}
+              </Typography>
+            </Alert>
+          )}
+
+          {/* Failback reverse-sync monitor — dedicated per-VM sync table
+              instead of the generic progress rows below, since there is no
+              percent/step progress to show while the loop just converges */}
+          {isExecuting && execution && isReverseSyncPhase && (
+            <Box>
+              <Typography variant='subtitle2' sx={{ mb: 1.5 }}>
+                {t('siteRecovery.failback.phase1Title')}
+              </Typography>
+
+              {/* Animated data-flow banner — a purely visual cue (no
+                  byte-level telemetry backs it): DR on the left, source on
+                  the right, with an animated dashed line flowing between
+                  them. Reuses the exact dashed-flow CSS technique from
+                  CreateJobDialog's SSH connectivity connector
+                  (repeating-linear-gradient + a backgroundPosition
+                  keyframe), just relabeled endpoints — DR → source here,
+                  the reverse of that dialog's source → target. */}
+              <Box
+                data-testid='failback-flow-banner'
+                sx={{
+                  display: 'flex', alignItems: 'center', gap: 1,
+                  height: 48, px: 1.5, mb: 1.5,
+                  borderRadius: 1, border: '1px solid', borderColor: 'divider',
+                  bgcolor: 'action.hover'
+                }}
+              >
+                <Typography
+                  variant='caption'
+                  sx={{ display: 'flex', alignItems: 'center', gap: 0.5, fontWeight: 600, fontSize: '0.7rem', flexShrink: 0, maxWidth: '35%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  <i className='ri-server-line' style={{ fontSize: 15, opacity: 0.75 }} />
+                  {drClusterName}
+                </Typography>
+                <Box sx={{
+                  flex: 1, height: 2, borderRadius: 1, minWidth: 24,
+                  background: theme => `repeating-linear-gradient(90deg, ${theme.palette.warning.main} 0 6px, transparent 6px 12px)`,
+                  backgroundSize: '12px 2px',
+                  animation: 'failbackFlow 1.2s linear infinite',
+                  '@keyframes failbackFlow': {
+                    '0%': { backgroundPosition: '0 0' },
+                    '100%': { backgroundPosition: '12px 0' },
+                  },
+                }} />
+                <i className='ri-arrow-right-line' style={{ fontSize: 15, opacity: 0.6, flexShrink: 0 }} />
+                <Typography
+                  variant='caption'
+                  sx={{ display: 'flex', alignItems: 'center', gap: 0.5, fontWeight: 600, fontSize: '0.7rem', flexShrink: 0, maxWidth: '35%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  {sourceClusterName}
+                  <i className='ri-server-line' style={{ fontSize: 15, opacity: 0.75 }} />
+                </Typography>
+              </Box>
+
+              {/* Header row */}
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 0.75, pb: 0.5 }}>
+                <Typography variant='caption' sx={{ flex: 1, minWidth: 0, color: 'text.secondary', fontWeight: 600, fontSize: '0.65rem', textTransform: 'uppercase' }}>
+                  {t('siteRecovery.snapshots.vm')}
+                </Typography>
+                <Typography variant='caption' sx={{ color: 'text.secondary', fontWeight: 600, fontSize: '0.65rem', textTransform: 'uppercase', textAlign: 'right' }}>
+                  {t('siteRecovery.failback.colLastSync')}
+                </Typography>
+                <Typography variant='caption' sx={{ color: 'text.secondary', fontWeight: 600, fontSize: '0.65rem', textTransform: 'uppercase', textAlign: 'right', minWidth: 70 }}>
+                  {t('siteRecovery.failback.colTransferred')}
+                </Typography>
+              </Box>
+
+              <Stack spacing={1}>
+                {(execution.vm_results || []).map((vm: RecoveryVMResult) => (
+                  <Box key={vm.vm_id} sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography variant='body2' sx={{ fontWeight: 500, fontSize: '0.8rem' }}>
+                        {vmNameMap?.[vm.vm_id] || vm.vm_name}
+                      </Typography>
+                      {vm.error && (
+                        <Typography variant='caption' sx={{ color: 'error.main', fontSize: '0.65rem' }}>{vm.error}</Typography>
+                      )}
+                    </Box>
+                    <Typography variant='caption' sx={{ color: 'text.secondary', fontSize: '0.7rem', textAlign: 'right' }}>
+                      {vm.last_reverse_sync_at ? new Date(vm.last_reverse_sync_at).toLocaleString() : t('siteRecovery.failback.neverSynced')}
+                    </Typography>
+                    <Typography variant='caption' sx={{ color: 'text.secondary', fontSize: '0.7rem', minWidth: 70, textAlign: 'right' }}>
+                      {typeof vm.last_reverse_sync_bytes === 'number' && vm.last_reverse_sync_bytes > 0
+                        ? formatBytes(vm.last_reverse_sync_bytes)
+                        : '—'}
+                    </Typography>
+                  </Box>
+                ))}
+              </Stack>
+              <Alert severity='info' sx={{ mt: 1.5 }}>{t('siteRecovery.failback.phase1Help')}</Alert>
+            </Box>
+          )}
+
+          {/* Execution progress */}
+          {isExecuting && execution && !isReverseSyncPhase && (
+            <Box>
+              <Typography variant='subtitle2' sx={{ mb: 1.5 }}>
+                {t('siteRecovery.failover.inProgress')}
+              </Typography>
+              <Stack spacing={1}>
+                {(execution.vm_results || []).map((vm: RecoveryVMResult) => (
+                  <Box key={vm.vm_id} sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <Box sx={{ width: 20, textAlign: 'center' }}>
+                      {vm.status === 'completed' && <i className='ri-check-line' style={{ color: 'var(--mui-palette-success-main)' }} />}
+                      {vm.status === 'failed' && <i className='ri-close-line' style={{ color: 'var(--mui-palette-error-main)' }} />}
+                      {vm.status === 'running' && <i className='ri-loader-4-line' style={{ color: 'var(--mui-palette-primary-main)' }} />}
+                      {vm.status === 'pending' && <i className='ri-time-line' style={{ color: 'var(--mui-palette-text-disabled)' }} />}
+                    </Box>
+                    <Box sx={{ flex: 1 }}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.25 }}>
+                        <Typography variant='body2' sx={{ fontWeight: 500, fontSize: '0.8rem' }}>{vm.vm_name}</Typography>
+                        <Typography variant='caption' sx={{ color: 'text.secondary' }}>{vm.progress_percent}%</Typography>
+                      </Box>
+                      <LinearProgress
+                        variant={vm.status === 'running' ? 'indeterminate' : 'determinate'}
+                        value={vm.progress_percent}
+                        color={vm.status === 'failed' ? 'error' : vm.status === 'completed' ? 'success' : 'primary'}
+                        sx={{ height: 3, borderRadius: 1 }}
+                      />
+                      {vm.error && (
+                        <Typography variant='caption' sx={{ color: 'error.main', fontSize: '0.65rem' }}>{vm.error}</Typography>
+                      )}
+                      {!vm.error && vm.status === 'running' && vm.step && t.has(`siteRecovery.failover.step.${vm.step}`) && (
+                        <Typography variant='caption' sx={{ color: 'text.secondary', fontSize: '0.65rem', display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <i className='ri-loader-4-line' style={{ fontSize: 11, animation: 'spin 1.5s linear infinite' }} />
+                          {t(`siteRecovery.failover.step.${vm.step}`)}
+                        </Typography>
+                      )}
+                    </Box>
+                    {type === 'test' && targetConnId && vm.target_node && vm.target_vmid != null &&
+                     (vm.status === 'running' || vm.status === 'completed') && (
+                      <Tooltip title={t('siteRecovery.failover.openConsole')}>
+                        <IconButton
+                          size='small'
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            window.open(
+                              `/novnc/console.html?connId=${encodeURIComponent(targetConnId)}&type=qemu&node=${encodeURIComponent(vm.target_node!)}&vmid=${vm.target_vmid}`,
+                              `console-dr-${vm.target_vmid}`,
+                              'width=1024,height=768,menubar=no,toolbar=no,location=no,status=no'
+                            )
+                          }}
+                          sx={{ color: 'primary.main' }}
+                        >
+                          <i className='ri-terminal-box-line' />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                    {(() => {
+                      const shot = screenshots.find(s => s.vm_id === vm.vm_id)
+                      if (!shot) return null
+                      return (
+                        <Tooltip title={t('siteRecovery.screenshots.view')}>
+                          <IconButton
+                            size='small'
+                            onClick={() => setScreenshotPreview(shot)}
+                            sx={{ color: 'text.secondary' }}
+                          >
+                            <i className='ri-camera-line' />
+                          </IconButton>
+                        </Tooltip>
+                      )
+                    })()}
+                  </Box>
+                ))}
+              </Stack>
+              {type === 'test' && (() => {
+                const allTerminal = (execution.vm_results || []).length > 0
+                  && (execution.vm_results || []).every((vm: RecoveryVMResult) => vm.status === 'completed' || vm.status === 'failed')
+                const steps = [
+                  {
+                    key: 'boot',
+                    label: t('siteRecovery.screenshots.stepBoot'),
+                    state: (execution.phase === 'stabilizing' || execution.phase === 'capturing' || allTerminal) ? 'done' : 'active'
+                  },
+                  {
+                    key: 'stabilize',
+                    label: execution.phase === 'stabilizing' && stabilizeRemainingSeconds != null
+                      ? `${t('siteRecovery.screenshots.stepStabilize')} (${stabilizeRemainingSeconds} s)`
+                      : t('siteRecovery.screenshots.stepStabilize'),
+                    state: execution.phase === 'capturing' ? 'done' : execution.phase === 'stabilizing' ? 'active' : 'pending'
+                  },
+                  {
+                    key: 'capture',
+                    label: t('siteRecovery.screenshots.stepCapture'),
+                    state: execution.phase === 'capturing' ? 'active' : 'pending'
+                  }
+                ] as const
+                return (
+                  <Stack spacing={0.75} sx={{ mt: 1.5 }}>
+                    {steps.map(step => {
+                      const stepIcon = step.state === 'done' ? { icon: 'ri-check-line', color: 'success.main' }
+                        : step.state === 'active' ? { icon: 'ri-loader-4-line', color: 'primary.main' }
+                        : { icon: 'ri-time-line', color: 'text.disabled' }
+                      return (
+                        <Box key={step.key} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Box sx={{ width: 16, textAlign: 'center', color: stepIcon.color, fontSize: 14, display: 'inline-flex', justifyContent: 'center' }}>
+                            <i className={stepIcon.icon} style={{ animation: stepIcon.icon === 'ri-loader-4-line' ? 'spin 1.5s linear infinite' : 'none' }} />
+                            <Box sx={{ '@keyframes spin': { '0%': { transform: 'rotate(0deg)' }, '100%': { transform: 'rotate(360deg)' } } }} />
+                          </Box>
+                          <Typography variant='caption' sx={{ color: 'text.secondary' }}>{step.label}</Typography>
+                        </Box>
+                      )
+                    })}
+                  </Stack>
+                )
+              })()}
+            </Box>
+          )}
+        </Stack>
+      </DialogContent>
+      {errorMessage && <Alert severity='error' sx={{ mx: 3 }}>{errorMessage}</Alert>}
+      <DialogActions sx={{ px: 3, pb: 2 }}>
+        {!execution && (
+          <>
+            <Button onClick={onClose}>{t('common.cancel')}</Button>
+            <Button
+              variant='contained'
+              color={config.color}
+              onClick={() => onConfirm(
+                type === 'test'
+                  ? {
+                    ...(Object.keys(selectedPoints).length ? { restorePoints: selectedPoints } : {}),
+                    networkIsolated,
+                    screenshotDelaySeconds: Number(screenshotDelay)
+                  }
+                  : Object.keys(selectedPoints).length ? { restorePoints: selectedPoints } : undefined
+              )}
+              disabled={!canConfirm}
+              startIcon={<i className={config.icon} />}
+            >
+              {config.title}
+            </Button>
+          </>
+        )}
+        {isReverseSyncPhase && (
+          <>
+            <Button onClick={onClose}>{t('common.close')}</Button>
+            <Button variant='outlined' onClick={() => setConfirmCancelFailback(true)}>
+              {t('siteRecovery.failback.cancelFailback')}
+            </Button>
+            <Tooltip title={t('siteRecovery.failback.cutoverNotReady')} disableHoverListener={!cutoverNotReady} arrow>
+              <span>
+                <Button variant='contained' color='warning' onClick={() => setConfirmCutover(true)} disabled={cutoverNotReady}>
+                  {t('siteRecovery.failback.cutover')}
+                </Button>
+              </span>
+            </Tooltip>
+          </>
+        )}
+        {execution && execution.status !== 'running' && (
+          <>
+            {type === 'test' && onCleanup && !cleanupResult && (
+              <Button
+                variant='outlined'
+                color='warning'
+                onClick={onCleanup}
+                disabled={cleanupLoading}
+                startIcon={cleanupLoading
+                  ? <i className='ri-loader-4-line' />
+                  : <i className='ri-delete-back-2-line' />
+                }
+              >
+                {t('siteRecovery.failover.cleanup')}
+              </Button>
+            )}
+            <Button onClick={onClose}>{t('common.close')}</Button>
+          </>
+        )}
+      </DialogActions>
+
+      {/* Nested confirm: cancel failback */}
+      <Dialog open={confirmCancelFailback} onClose={() => setConfirmCancelFailback(false)} maxWidth='sm' fullWidth>
+        <DialogTitle>{t('siteRecovery.failback.cancelFailback')}</DialogTitle>
+        <DialogContent>
+          <DialogContentText>{t('siteRecovery.failback.cancelConfirm')}</DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setConfirmCancelFailback(false)}>{t('common.cancel')}</Button>
+          <Button
+            variant='contained'
+            color='error'
+            onClick={() => { setConfirmCancelFailback(false); onFailbackCancel?.(plan.id) }}
+          >
+            {t('common.confirm')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Nested confirm: cutover */}
+      <Dialog open={confirmCutover} onClose={() => setConfirmCutover(false)} maxWidth='sm' fullWidth>
+        <DialogTitle>{t('siteRecovery.failback.cutover')}</DialogTitle>
+        <DialogContent>
+          <DialogContentText>{t('siteRecovery.failback.cutoverConfirm')}</DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setConfirmCutover(false)}>{t('common.cancel')}</Button>
+          <Button
+            variant='contained'
+            color='warning'
+            onClick={() => { setConfirmCutover(false); onFailbackCutover?.(plan.id) }}
+          >
+            {t('common.confirm')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {execution && (
+        <ScreenshotPreviewDialog
+          executionId={execution.id}
+          shot={screenshotPreview}
+          label={screenshotPreview ? (vmNameMap?.[screenshotPreview.vm_id] || `VM ${screenshotPreview.vm_id}`) : ''}
+          onClose={() => setScreenshotPreview(null)}
+        />
+      )}
+    </Dialog>
+  )
+}

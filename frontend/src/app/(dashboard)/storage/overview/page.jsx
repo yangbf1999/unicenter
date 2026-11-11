@@ -1,0 +1,1077 @@
+'use client'
+
+import { nebulaMetricColor } from '@/lib/theme/nebulaMetricColor'
+import { useEffect, useMemo, useState } from 'react'
+
+import Link from 'next/link'
+
+import { useTranslations } from 'next-intl'
+
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  Divider,
+  Drawer,
+  FormControl,
+  IconButton,
+  InputAdornment,
+  LinearProgress,
+  ListItemText,
+  MenuItem,
+  Select,
+  Stack,
+  TextField,
+  Tooltip,
+  Typography,
+  useTheme
+} from '@mui/material'
+
+import { DataGrid } from '@mui/x-data-grid'
+
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import { formatBytes } from '@/utils/format'
+import EmptyState from '@/components/EmptyState'
+import { CardsSkeleton, TableSkeleton } from '@/components/skeletons'
+import StorageContentBrowser from '@/components/storage/StorageContentBrowser'
+import { filterStorages } from '@/lib/storage/filterStorages'
+import { useSettings } from '@core/hooks/useSettings'
+
+// Sentinel MenuItem value for the "select all / clear selection" toggle in the
+// tenant selector (issue #609). MUI's Select clones every child with its own
+// onClick and unconditionally fires onChange afterwards regardless of whether
+// the clicked item has a value, so a foreign onClick on that MenuItem gets
+// clobbered by MUI's own onChange call in the same click. Routing the toggle
+// through a real value handled inside onChange avoids that race.
+const TENANT_SELECT_ALL = '__all__'
+
+// Icône pour les types de storage
+const StorageIcon = ({ type, size = 20 }) => {
+  const iconMap = {
+    'dir': 'ri-folder-line',
+    'lvm': 'ri-stack-line',
+    'lvmthin': 'ri-stack-line',
+    'zfs': 'ri-database-2-line',
+    'zfspool': 'ri-database-2-line',
+    'nfs': 'ri-share-line',
+    'cifs': 'ri-windows-line',
+    'glusterfs': 'ri-share-line',
+    'iscsi': 'ri-hard-drive-2-line',
+    'iscsidirect': 'ri-hard-drive-2-line',
+    'rbd': 'ri-cloud-line',
+    'cephfs': 'ri-cloud-line',
+    'pbs': 'ri-shield-check-line',
+    'btrfs': 'ri-database-line',
+  }
+
+  
+return <i className={iconMap[type] || 'ri-hard-drive-line'} style={{ fontSize: size }} />
+}
+
+// Couleurs pour les types
+const getTypeColor = (type) => {
+  const colorMap = {
+    'dir': '#607d8b',
+    'lvm': '#795548',
+    'lvmthin': '#8d6e63',
+    'zfs': '#2196f3',
+    'zfspool': '#1976d2',
+    'nfs': '#4caf50',
+    'cifs': '#00bcd4',
+    'glusterfs': '#9c27b0',
+    'iscsi': '#ff9800',
+    'iscsidirect': '#f57c00',
+    'rbd': '#e91e63',
+    'cephfs': '#e91e63',
+    'pbs': '#673ab7',
+    'btrfs': '#009688',
+  }
+
+  
+return colorMap[type] || '#9e9e9e'
+}
+
+// Chip de type storage
+const StorageTypeChip = ({ type }) => {
+  const color = getTypeColor(type)
+
+  const labels = {
+    'dir': 'Directory',
+    'lvm': 'LVM',
+    'lvmthin': 'LVM-Thin',
+    'zfs': 'ZFS',
+    'zfspool': 'ZFS Pool',
+    'nfs': 'NFS',
+    'cifs': 'CIFS/SMB',
+    'glusterfs': 'GlusterFS',
+    'iscsi': 'iSCSI',
+    'iscsidirect': 'iSCSI Direct',
+    'rbd': 'Ceph RBD',
+    'cephfs': 'CephFS',
+    'pbs': 'PBS',
+    'btrfs': 'Btrfs',
+  }
+
+  
+return (
+    <Chip 
+      size='small' 
+      label={labels[type] || type || 'Unknown'} 
+      sx={{ 
+        bgcolor: `${color}20`, 
+        color: color,
+        fontWeight: 700,
+        fontSize: 11,
+      }} 
+    />
+  )
+}
+
+// Chip partagé/local - Note: This component needs t() passed as prop since it's outside the main component
+const ScopeChip = ({ shared, sharedLabel, localLabel }) => {
+  if (shared) {
+    return <Chip size='small' label={sharedLabel || 'Shared'} color='primary' variant='outlined' sx={{ fontSize: 11 }} />
+  }
+
+  
+return <Chip size='small' label={localLabel || 'Local'} variant='outlined' sx={{ fontSize: 11 }} />
+}
+
+// Chip de contenu - needs t() passed as prop
+const ContentChip = ({ content, t }) => {
+  const labels = {
+    'images': t ? t('storage.content.vmDisks') : 'VM Disks',
+    'rootdir': t ? t('storage.content.containers') : 'Containers',
+    'vztmpl': t ? t('storage.content.ctTemplates') : 'CT Templates',
+    'iso': t ? t('storage.content.iso') : 'ISO',
+    'backup': t ? t('storage.content.backups') : 'Backups',
+    'snippets': t ? t('storage.content.snippets') : 'Snippets',
+  }
+
+  
+return (
+    <Chip 
+      size='small' 
+      label={labels[content] || content} 
+      variant='outlined'
+      sx={{ fontSize: 10, height: 20 }} 
+    />
+  )
+}
+
+// Barre de capacité
+const CapacityBar = ({ usedPct, isNebula = false }) => {
+  const getColor = (pct) => {
+    if (pct >= 90) return '#f44336'
+    if (pct >= 75) return '#ff9800'
+    
+return '#4caf50'
+  }
+  
+  return (
+    <LinearProgress className="nebula-linear-progress"
+      variant='determinate'
+      value={Math.min(100, usedPct || 0)}
+      sx={{ '--nebula-progress-color': nebulaMetricColor(getColor(usedPct), 'storage'),
+        height: isNebula ? 7 : 14,
+        borderRadius: isNebula ? 999 : 0,
+        bgcolor: 'action.hover',
+        '& .MuiLinearProgress-bar': {
+          borderRadius: isNebula ? 999 : 0,
+          bgcolor: getColor(usedPct)
+        }
+      }}
+    />
+  )
+}
+
+/* -----------------------------
+  KPI Card
+------------------------------ */
+
+function KpiCard({ title, value, subtitle, icon, color, isNebula }) {
+  return (
+    <Card
+      variant='outlined'
+      sx={isNebula ? {
+        borderRadius: '10px',
+        borderColor: 'divider',
+        bgcolor: 'background.paper',
+        boxShadow: '0 0 0 1px rgba(59, 130, 246, 0.05), 0 8px 24px rgba(0, 0, 0, 0.28)'
+      } : undefined}
+    >
+      <CardContent sx={{ py: 2, px: 2.5, '&:last-child': { pb: 2 } }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <Box sx={{ 
+            width: 48, height: 48, borderRadius: isNebula ? '8px' : 2,
+            bgcolor: color ? `${color}18` : 'action.hover',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <i className={icon} style={{ fontSize: 24, color: color || 'inherit' }} />
+          </Box>
+          <Box>
+            <Typography variant='caption' sx={{ opacity: isNebula ? 0.72 : 0.6, fontWeight: 600, textTransform: 'uppercase' }}>
+              {title}
+            </Typography>
+            <Typography variant='h5' sx={{ fontWeight: isNebula ? 600 : 800, color: color || 'text.primary', fontVariantNumeric: 'tabular-nums' }}>
+              {value}
+            </Typography>
+            {subtitle && (
+              <Typography variant='caption' sx={{ opacity: 0.5 }}>
+                {subtitle}
+              </Typography>
+            )}
+          </Box>
+        </Box>
+      </CardContent>
+    </Card>
+  )
+}
+
+/* -----------------------------
+  Page
+------------------------------ */
+
+export default function StorageOverviewPage() {
+  const t = useTranslations()
+  const theme = useTheme()
+  const { settings } = useSettings()
+  const isNebula = settings.globalTheme === 'nebula'
+
+  const { setPageInfo } = usePageTitle()
+
+  useEffect(() => {
+    setPageInfo(t('navigation.storage'), t('storage.overview'), 'ri-database-2-fill')
+    
+return () => setPageInfo('', '', '')
+  }, [setPageInfo, t])
+  const primaryColor = theme.palette.primary.main
+
+  // State
+  const [connections, setConnections] = useState([])
+  const [connId, setConnId] = useState('*')
+
+  const [storages, setStorages] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  const [q, setQ] = useState('')
+  const [typeFilter, setTypeFilter] = useState('all')
+  const [scopeFilter, setScopeFilter] = useState('all') // Afficher tous par défaut
+
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [selectedId, setSelectedId] = useState(null)
+  const [contentNode, setContentNode] = useState(null)
+  const [contentConnId, setContentConnId] = useState(null)
+
+  // Facette de tenants renvoyée par l'API pour un appelant élargi (issue #609).
+  // tenantIds à null = pas de filtre tenant, donc pas de sélecteur.
+  const [tenants, setTenants] = useState([])
+  const [tenantIds, setTenantIds] = useState(null)
+  const [unavailable, setUnavailable] = useState([])
+
+  // Charger tous les storages en une seule requête
+  const loadStorages = async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const res = await fetch('/api/v1/storage')
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const json = await res.json()
+
+      const tenantFacets = Array.isArray(json?.tenants) ? json.tenants : []
+
+      setStorages(Array.isArray(json?.data) ? json.data : [])
+      setConnections(Array.isArray(json?.connections) ? json.connections : [])
+      setTenants(tenantFacets)
+      setUnavailable(Array.isArray(json?.unavailable) ? json.unavailable : [])
+
+      // Ouvrir sur tous les tenants cochés: la page ne doit jamais s'afficher
+      // vide pour un appelant élargi (issue #609).
+      setTenantIds(tenantFacets.length > 0 ? tenantFacets.map(t => t.id) : null)
+    } catch (e) {
+      setError(e?.message || String(e))
+      setStorages([])
+      setTenants([])
+      setTenantIds(null)
+      setUnavailable([])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadStorages()
+  }, [])
+
+  // Filtrage
+  const filtered = useMemo(
+    () => filterStorages(storages, { connId, query: q, type: typeFilter, scope: scopeFilter, tenantIds }),
+    [storages, q, typeFilter, scopeFilter, connId, tenantIds]
+  )
+
+  // Même seuil que TenantSwitcher.jsx:53: en dessous de 2 tenants, pas de sélecteur.
+  const showTenantSelector = tenants.length > 1
+  const noTenantSelected = Array.isArray(tenantIds) && tenantIds.length === 0
+  const allTenantsSelected = showTenantSelector && tenantIds?.length === tenants.length
+
+  // Types uniques pour le filtre
+  const uniqueTypes = useMemo(() => {
+    const types = new Set(storages.map(s => s.type).filter(Boolean))
+
+    
+return Array.from(types).sort((a, b) => a.localeCompare(b))
+  }, [storages])
+
+  // Agrégation pour les KPIs (sur les données filtrées)
+  const stats = useMemo(() => {
+    // Stats sur tous les storages (pour info)
+    const allShared = storages.filter(s => s.shared)
+    const allLocal = storages.filter(s => !s.shared)
+    
+    // Stats sur les filtrés
+    const totalUsed = filtered.reduce((acc, s) => acc + (s.used || 0), 0)
+    const totalCapacity = filtered.reduce((acc, s) => acc + (s.total || 0), 0)
+
+    const avgUsedPct = filtered.length > 0 
+      ? Math.round(filtered.reduce((acc, s) => acc + (s.usedPct || 0), 0) / filtered.length)
+      : 0
+
+    const critical = filtered.filter(s => s.usedPct >= 90).length
+    const warning = filtered.filter(s => s.usedPct >= 75 && s.usedPct < 90).length
+
+    return {
+      total: filtered.length,
+      totalAll: storages.length,
+      shared: allShared.length,
+      local: allLocal.length,
+      totalUsed,
+      totalCapacity,
+      totalUsedFormatted: formatBytes(totalUsed),
+      totalCapacityFormatted: formatBytes(totalCapacity),
+      avgUsedPct,
+      critical,
+      warning,
+    }
+  }, [filtered, storages])
+
+  // Selection
+  const selected = useMemo(() => {
+    return filtered.find(s => s.id === selectedId) || null
+  }, [filtered, selectedId])
+
+  const openStorage = (id) => {
+    setSelectedId(id)
+    setDrawerOpen(true)
+    const s = storages.find(st => st.id === id) || filtered.find(st => st.id === id)
+    if (s) {
+      const firstConn = s.connections?.[0] || {}
+      setContentConnId(firstConn.id || s.connId || null)
+      setContentNode(s.node || (s.allNodes || [])[0] || null)
+    }
+  }
+
+  // Colonnes DataGrid
+  const columns = useMemo(() => {
+    const cols = [
+    {
+      field: 'storage',
+      headerName: t('storage.title'),
+      flex: 1,
+      minWidth: 180,
+      renderCell: params => {
+        const nodeCount = params.row.allNodes?.length || params.row.nodes?.length || 1
+
+        
+return (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, height: '100%' }}>
+            <Box sx={{ 
+              width: 36, height: 36, borderRadius: 1.5, 
+              bgcolor: `${getTypeColor(params.row.type)}18`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: getTypeColor(params.row.type),
+              flexShrink: 0
+            }}>
+              <StorageIcon type={params.row.type} size={20} />
+            </Box>
+            <Box sx={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', minWidth: 0 }}>
+              <Typography variant='body2' sx={{ fontWeight: 700, lineHeight: 1.3 }}>{params.row.storage}</Typography>
+              <Typography variant='caption' sx={{ opacity: 0.6, lineHeight: 1.2 }}>
+                {nodeCount} node{nodeCount > 1 ? 's' : ''}
+              </Typography>
+            </Box>
+          </Box>
+        )
+      }
+    },
+    {
+      field: 'type',
+      headerName: t('common.type'),
+      width: 120,
+      renderCell: params => <StorageTypeChip type={params.row.type} />
+    },
+    {
+      field: 'shared',
+      headerName: t('storageOverview.scope'),
+      width: 100,
+      renderCell: params => <ScopeChip shared={params.row.shared} sharedLabel={t('storage.shared')} localLabel={t('storage.local')} />
+    },
+    {
+      field: 'connectionName',
+      headerName: t('storage.connection'),
+      width: 160,
+      renderCell: params => {
+        const conns = params.row.connections || []
+
+        if (conns.length === 1) {
+          return (
+            <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+              <Typography variant='body2' sx={{ opacity: 0.8 }}>{conns[0].name}</Typography>
+            </Box>
+          )
+        }
+
+        
+return (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Tooltip title={conns.map(c => c.name).join(', ')}>
+              <Chip
+                size='small'
+                label={t('storage.connectionCount', { count: conns.length })}
+                variant='outlined'
+                sx={{ fontSize: 11 }}
+              />
+            </Tooltip>
+          </Box>
+        )
+      }
+    },
+    {
+      field: 'content',
+      headerName: t('common.type'),
+      flex: 0.8,
+      minWidth: 150,
+      renderCell: params => (
+        <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', alignItems: 'center', height: '100%' }}>
+          {(params.row.content || []).slice(0, 3).map(c => (
+            <ContentChip key={c} content={c} t={t} />
+          ))}
+          {(params.row.content || []).length > 3 && (
+            <Chip size='small' label={`+${params.row.content.length - 3}`} sx={{ fontSize: 10, height: 20 }} />
+          )}
+        </Box>
+      )
+    },
+    {
+      field: 'usedPct',
+      headerName: t('storage.usage'),
+      width: 180,
+      renderCell: params => (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%', height: '100%' }}>
+          <Box sx={{ flex: 1 }}>
+            <CapacityBar usedPct={params.row.usedPct} isNebula={isNebula} />
+          </Box>
+          <Typography variant='body2' sx={{ fontWeight: 700, minWidth: 45, textAlign: 'right' }}>
+            {params.row.usedPct || 0}%
+          </Typography>
+        </Box>
+      )
+    },
+    {
+      field: 'totalFormatted',
+      headerName: t('storage.capacity'),
+      width: 100,
+      renderCell: params => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.row.totalFormatted}</Typography>
+        </Box>
+      )
+    },
+    {
+      field: 'actions',
+      headerName: '',
+      width: 60,
+      sortable: false,
+      renderCell: params => (
+        <Tooltip title={t('common.details')}>
+          <IconButton size='small' onClick={() => openStorage(params.row.id)}>
+            <i className='ri-arrow-right-s-line' />
+          </IconButton>
+        </Tooltip>
+      )
+    }
+    ]
+
+    if (showTenantSelector) {
+      const afterConnection = cols.findIndex(c => c.field === 'connectionName') + 1
+
+      cols.splice(afterConnection, 0, {
+        field: 'tenantName',
+        headerName: t('storage.tenant'),
+        width: 150,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ opacity: 0.8 }}>{params.row.tenantName || '-'}</Typography>
+          </Box>
+        )
+      })
+    }
+
+    return cols
+  }, [isNebula, t, showTenantSelector])
+
+  return (
+    // Page pleine hauteur, même recette que /operations/task-center : la racine
+    // remplit la zone de contenu (`flex: 1` + `minHeight: 0`), les blocs fixes
+    // au-dessus sont en `flexShrink: 0`, et seule la carte du tableau absorbe la
+    // hauteur restante. Sans le `minHeight: 0`, la racine refuse de rétrécir,
+    // déborde sous la taskbar et fait défiler toute la page.
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: isNebula ? 2 : 3, flex: 1, minHeight: 0 }}>
+      {/* KPIs. Pendant le scan de flotte, les KPI calculés sur un tableau vide
+          afficheraient 0 stockage / 0 B / 0 %, ce qui rejoue l'impression de
+          page cassée de l'issue #609. */}
+      {loading ? <CardsSkeleton count={4} columns={4} /> : (
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 2, flexShrink: 0 }}>
+        <KpiCard
+          title={t('storage.storages')}
+          value={stats.total}
+          subtitle={`${stats.shared} ${t('storage.shared')} • ${stats.local} ${t('storage.local')}`}
+          icon='ri-hard-drive-2-line'
+          color={primaryColor}
+          isNebula={isNebula}
+        />
+        <KpiCard
+          title={t('storage.capacity')}
+          value={stats.totalCapacityFormatted}
+          subtitle={`${stats.totalUsedFormatted} ${t('common.used')}`}
+          icon='ri-database-2-line'
+          color='#2196f3'
+          isNebula={isNebula}
+        />
+        <KpiCard
+          title={t('storage.usage')}
+          value={`${stats.avgUsedPct}%`}
+          subtitle={stats.avgUsedPct >= 75 ? t('common.warning') : 'OK'}
+          icon='ri-pie-chart-line'
+          color={stats.avgUsedPct >= 90 ? '#f44336' : stats.avgUsedPct >= 75 ? '#ff9800' : '#4caf50'}
+          isNebula={isNebula}
+        />
+        <KpiCard
+          title={t('alerts.title')}
+          value={stats.critical + stats.warning}
+          subtitle={`${stats.critical} ${t('alerts.criticals')} • ${stats.warning} ${t('alerts.warnings')}`}
+          icon='ri-alarm-warning-line'
+          color={stats.critical > 0 ? '#f44336' : stats.warning > 0 ? '#ff9800' : '#4caf50'}
+          isNebula={isNebula}
+        />
+      </Box>
+      )}
+
+      {/* Filtres */}
+      <Card
+        variant='outlined'
+        sx={{
+          flexShrink: 0,
+          ...(isNebula && {
+            borderRadius: '10px',
+            borderColor: 'divider',
+            boxShadow: '0 0 0 1px rgba(59, 130, 246, 0.05), 0 8px 24px rgba(0, 0, 0, 0.28)'
+          })
+        }}
+      >
+        <CardContent sx={{ py: 2, '&:last-child': { pb: 2 } }}>
+          <Box sx={{ display: 'flex', gap: isNebula ? 1.5 : 2, flexWrap: 'wrap', alignItems: 'center' }}>
+            {/* Connexion */}
+            <FormControl size='small' sx={{ minWidth: 180, width: { xs: '100%', sm: 'auto' } }}>
+              <Select
+                value={connId}
+                onChange={e => setConnId(e.target.value)}
+                displayEmpty
+              >
+                <MenuItem value='*'>{t('storage.scannedConnections')}</MenuItem>
+                {connections.map(c => (
+                  <MenuItem key={c.id} value={c.id}>{c.name}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            {/* Recherche */}
+            <TextField
+              size='small'
+              placeholder={t('common.search') + '...'}
+              value={q}
+              onChange={e => setQ(e.target.value)}
+              sx={{ minWidth: 200, flex: { sm: 1 }, width: { xs: '100%', sm: 'auto' } }}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position='start'>
+                    <i className='ri-search-line' style={{ opacity: 0.5 }} />
+                  </InputAdornment>
+                )
+              }}
+            />
+
+            {/* Type */}
+            <FormControl size='small' sx={{ minWidth: 140, width: { xs: '100%', sm: 'auto' } }}>
+              <Select value={typeFilter} onChange={e => setTypeFilter(e.target.value)}>
+                <MenuItem value='all'>{t('storage.allTypes')}</MenuItem>
+                {uniqueTypes.map(t => (
+                  <MenuItem key={t} value={t}>{t.toUpperCase()}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            {/* Scope */}
+            <FormControl size='small' sx={{ minWidth: 160, width: { xs: '100%', sm: 'auto' } }}>
+              <Select value={scopeFilter} onChange={e => setScopeFilter(e.target.value)}>
+                <MenuItem value='all'>{t('common.all')}</MenuItem>
+                <MenuItem value='shared'>{t('storage.shared')}</MenuItem>
+                <MenuItem value='local'>{t('storage.local')}</MenuItem>
+              </Select>
+            </FormControl>
+
+            {/* Tenants (issue #609): filtre local à la page, aucune bascule de
+                contexte tenant, aucun appel réseau au changement. */}
+            {showTenantSelector && (
+              <FormControl size='small' sx={{ minWidth: 200, width: { xs: '100%', sm: 'auto' } }}>
+                <Select
+                  multiple
+                  value={tenantIds || []}
+                  onChange={e => {
+                    const raw = typeof e.target.value === 'string' ? e.target.value.split(',') : e.target.value
+
+                    if (raw.includes(TENANT_SELECT_ALL)) {
+                      setTenantIds(allTenantsSelected ? [] : tenants.map(x => x.id))
+
+                      return
+                    }
+
+                    setTenantIds(raw)
+                  }}
+                  renderValue={selected => {
+                    if (selected.length === tenants.length) return t('storage.allTenants')
+                    if (selected.length === 1) return tenants.find(x => x.id === selected[0])?.name || selected[0]
+
+                    return t('storage.tenantsSelected', { count: selected.length })
+                  }}
+                  displayEmpty
+                >
+                  <MenuItem dense value={TENANT_SELECT_ALL}>
+                    <Typography variant='body2' sx={{ fontWeight: 600 }}>
+                      {allTenantsSelected ? t('storage.selectNone') : t('storage.selectAll')}
+                    </Typography>
+                  </MenuItem>
+                  <Divider />
+                  {tenants.map(tn => (
+                    <MenuItem key={tn.id} value={tn.id}>
+                      <Checkbox size='small' checked={(tenantIds || []).includes(tn.id)} />
+                      <ListItemText
+                        primary={`${tn.name} (${tn.storageCount})`}
+                        secondary={tn.connectionCount === 0 ? t('storage.tenantWithoutConnection') : null}
+                      />
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            )}
+
+            <Box sx={{ flex: 1, display: { xs: 'none', sm: 'block' } }} />
+
+            <Typography variant='body2' sx={{ opacity: 0.6, width: { xs: '100%', sm: 'auto' }, textAlign: { xs: 'right', sm: 'left' } }}>
+              {t('storage.storageCountPlural', { count: filtered.length })}
+            </Typography>
+          </Box>
+        </CardContent>
+      </Card>
+
+      {/* Sans ça, une connexion injoignable ou refusée rétrécit la vue en
+          silence, ce qui ferait mentir la vue agrégée (issue #609). */}
+      {!loading && unavailable.length > 0 && (
+        <Alert severity='warning' sx={{ flexShrink: 0 }}>
+          <Tooltip title={unavailable.map(u => u.connName).join(', ')}>
+            <span>{t('storage.unreachableConnections', { count: unavailable.length })}</span>
+          </Tooltip>
+        </Alert>
+      )}
+
+      {/* DataGrid */}
+      {/* Seul bloc extensible : il absorbe la hauteur restante. `overflow` caché
+          garde le DataGrid dans les coins arrondis de la carte, et son propre
+          défilement interne remplace celui de la page. */}
+      <Card
+        variant='outlined'
+        sx={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          minHeight: 0,
+          overflow: 'hidden',
+          ...(isNebula && {
+            borderRadius: '10px',
+            borderColor: 'divider',
+            boxShadow: '0 0 0 1px rgba(59, 130, 246, 0.05), 0 8px 24px rgba(0, 0, 0, 0.28)'
+          })
+        }}
+      >
+        {/* Doublure absolue, comme le Task Center : elle donne au DataGrid une
+            hauteur définie sans dépendre de la résolution du flex, sinon la
+            grille pousse la carte et repasse sous la taskbar. */}
+        <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
+          <Box sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}>
+          {loading ? (
+            <Box sx={{ p: 2 }}>
+              <TableSkeleton rows={6} columns={showTenantSelector ? 8 : 7} />
+            </Box>
+          ) : error ? (
+            <Box sx={{ p: 3 }}>
+              <Alert severity='error'>{error}</Alert>
+            </Box>
+          ) : filtered.length === 0 ? (
+            <EmptyState
+              icon="ri-hard-drive-2-line"
+              title={noTenantSelected ? t('storage.noTenantSelected') : t('emptyState.noStorage')}
+              description={noTenantSelected ? t('storage.noTenantSelectedDesc') : t('emptyState.noStorageDesc')}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={filtered}
+              columns={columns}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{
+                pagination: { paginationModel: { pageSize: 25 } },
+                sorting: { sortModel: [{ field: 'usedPct', sort: 'desc' }] }
+              }}
+              disableRowSelectionOnClick
+              onRowClick={(params) => openStorage(params.row.id)}
+              sx={{
+                border: 'none',
+                '& .MuiDataGrid-columnHeaders': { minHeight: isNebula ? '40px !important' : undefined, maxHeight: isNebula ? '40px !important' : undefined },
+                '& .MuiDataGrid-row': { cursor: 'pointer', minHeight: isNebula ? '44px !important' : undefined, maxHeight: isNebula ? '44px !important' : undefined },
+                '& .MuiDataGrid-cell:focus': { outline: 'none' },
+              }}
+            />
+          )}
+          </Box>
+        </Box>
+      </Card>
+
+      {/* Drawer */}
+      <Drawer
+        anchor='right'
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        PaperProps={{
+          sx: {
+            width: { xs: '100%', sm: 520 },
+            ...(isNebula && {
+              bgcolor: 'background.paper',
+              borderLeft: '1px solid',
+              borderColor: 'divider',
+              boxShadow: '-24px 0 64px rgba(0, 0, 0, 0.48)'
+            })
+          }
+        }}
+      >
+        <Box sx={{ p: { xs: 2, sm: 3 }, display: 'flex', flexDirection: 'column', gap: 2, height: '100%', overflow: 'auto' }}>
+          {!selected ? (
+            <Alert severity='info'>{t('common.select')} {t('storage.title').toLowerCase()}</Alert>
+          ) : (
+            <>
+              {/* Header */}
+              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+                <Box sx={{ 
+                  width: 56, height: 56, borderRadius: 2, 
+                  bgcolor: `${getTypeColor(selected.type)}18`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: getTypeColor(selected.type)
+                }}>
+                  <StorageIcon type={selected.type} size={28} />
+                </Box>
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant='h6' sx={{ fontWeight: 900 }}>{selected.storage}</Typography>
+                  <Box sx={{ display: 'flex', gap: 1, mt: 0.5 }}>
+                    <StorageTypeChip type={selected.type} />
+                    <ScopeChip shared={selected.shared} sharedLabel={t('storage.shared')} localLabel={t('storage.local')} />
+                  </Box>
+                </Box>
+                <IconButton onClick={() => setDrawerOpen(false)}>
+                  <i className='ri-close-line' />
+                </IconButton>
+              </Box>
+
+              <Divider />
+
+              {/* Capacité */}
+              <Box>
+                <Typography variant='overline' sx={{ opacity: 0.6 }}>{t('storage.capacity')}</Typography>
+                <Box sx={{ mt: 1 }}>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
+                    <Typography variant='body2'>{t('common.used')}</Typography>
+                    <Typography variant='body2' sx={{ fontWeight: 700 }}>
+                      {selected.usedFormatted} / {selected.totalFormatted}
+                    </Typography>
+                  </Box>
+                  <CapacityBar usedPct={selected.usedPct} isNebula={isNebula} />
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                    <Typography variant='caption' sx={{ opacity: 0.6 }}>
+                      {t('storage.usedPercent', { percent: selected.usedPct })}
+                    </Typography>
+                    <Typography variant='caption' sx={{ opacity: 0.6 }}>
+                      {selected.freeFormatted} {t('common.free')}
+                    </Typography>
+                  </Box>
+                </Box>
+              </Box>
+
+              <Divider />
+
+              {/* Informations */}
+              <Box>
+                <Typography variant='overline' sx={{ opacity: 0.6 }}>{t('common.info')}</Typography>
+                <Stack spacing={1.5} sx={{ mt: 1 }}>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('storage.connection')}</Typography>
+                    <Box sx={{ textAlign: 'right' }}>
+                      {(selected.connections || []).length <= 2 ? (
+                        <Typography variant='body2' sx={{ fontWeight: 700 }}>
+                          {(selected.connections || []).map(c => c.name).join(', ')}
+                        </Typography>
+                      ) : (
+                        <Tooltip title={(selected.connections || []).map(c => c.name).join(', ')}>
+                          <Typography variant='body2' sx={{ fontWeight: 700 }}>
+                            {t('storage.connectionCount', { count: selected.connections.length })}
+                          </Typography>
+                        </Tooltip>
+                      )}
+                    </Box>
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('storageOverview.nodes')}</Typography>
+                    <Box sx={{ textAlign: 'right' }}>
+                      {(selected.allNodes || selected.nodes || []).length <= 3 ? (
+                        <Typography variant='body2' sx={{ fontWeight: 700 }}>
+                          {(selected.allNodes || selected.nodes || [selected.node]).join(', ')}
+                        </Typography>
+                      ) : (
+                        <Tooltip title={(selected.allNodes || selected.nodes || []).join(', ')}>
+                          <Typography variant='body2' sx={{ fontWeight: 700 }}>
+                            {(selected.allNodes || selected.nodes || []).length} nodes
+                          </Typography>
+                        </Tooltip>
+                      )}
+                    </Box>
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('common.type')}</Typography>
+                    <Typography variant='body2' sx={{ fontWeight: 700 }}>{selected.type?.toUpperCase()}</Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('common.status')}</Typography>
+                    <Chip
+                      size='small'
+                      label={selected.enabled ? t('common.enabled') : t('common.disabled')}
+                      color={selected.enabled ? 'success' : 'default'}
+                      sx={{ height: 22 }}
+                    />
+                  </Box>
+                  {selected.path && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('storage.path')}</Typography>
+                      <Typography variant='body2' sx={{ fontWeight: 700, fontFamily: 'monospace', fontSize: 12 }}>
+                        {selected.path}
+                      </Typography>
+                    </Box>
+                  )}
+                  {selected.server && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Typography variant='body2' sx={{ opacity: 0.75 }}>{t('storage.server')}</Typography>
+                      <Typography variant='body2' sx={{ fontWeight: 700, fontFamily: 'monospace', fontSize: 12 }}>
+                        {selected.server}
+                      </Typography>
+                    </Box>
+                  )}
+                  {selected.export && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Typography variant='body2' sx={{ opacity: 0.75 }}>Export</Typography>
+                      <Typography variant='body2' sx={{ fontWeight: 700, fontFamily: 'monospace', fontSize: 12 }}>
+                        {selected.export}
+                      </Typography>
+                    </Box>
+                  )}
+                  {selected.pool && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Typography variant='body2' sx={{ opacity: 0.75 }}>Pool</Typography>
+                      <Typography variant='body2' sx={{ fontWeight: 700 }}>{selected.pool}</Typography>
+                    </Box>
+                  )}
+                  {selected.monhost && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Typography variant='body2' sx={{ opacity: 0.75 }}>Mon Host</Typography>
+                      <Typography variant='body2' sx={{ fontWeight: 700, fontFamily: 'monospace', fontSize: 11 }}>
+                        {selected.monhost}
+                      </Typography>
+                    </Box>
+                  )}
+                </Stack>
+              </Box>
+
+              <Divider />
+
+              {/* Contenu supporté */}
+              <Box>
+                <Typography variant='overline' sx={{ opacity: 0.6 }}>{t('common.type')}</Typography>
+                <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap', mt: 1 }}>
+                  {(selected.content || []).length === 0 ? (
+                    <Typography variant='body2' sx={{ opacity: 0.5 }}>{t('common.noData')}</Typography>
+                  ) : (
+                    selected.content.map(c => <ContentChip key={c} content={c} t={t} />)
+                  )}
+                </Box>
+              </Box>
+
+              {/* Détails par nœud - affiché si plusieurs nœuds */}
+              {(selected.nodeBreakdown || []).length > 1 && (
+                <>
+                  <Divider />
+                  <Box>
+                    <Typography variant='overline' sx={{ opacity: 0.6 }}>
+                      {t('storageOverview.nodes')} ({selected.nodeBreakdown.length})
+                    </Typography>
+                    <Stack spacing={1.5} sx={{ mt: 1.5 }}>
+                      {selected.nodeBreakdown
+                        .slice()
+                        .sort((a, b) => (b.usedPct || 0) - (a.usedPct || 0))
+                        .map((n, idx) => (
+                          <Box
+                            key={n.node || idx}
+                            sx={{ p: 1.5, borderRadius: 1.5, bgcolor: 'action.hover', border: '1px solid', borderColor: 'divider' }}
+                          >
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                              <Typography variant='body2' sx={{ fontWeight: 700 }}>{n.node}</Typography>
+                              <Typography variant='body2' sx={{ fontWeight: 700 }}>{n.usedPct || 0}%</Typography>
+                            </Box>
+                            <CapacityBar usedPct={n.usedPct} isNebula={isNebula} />
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                              <Typography variant='caption' sx={{ opacity: 0.6 }}>{n.usedFormatted}</Typography>
+                              <Typography variant='caption' sx={{ opacity: 0.6 }}>{n.totalFormatted}</Typography>
+                            </Box>
+                          </Box>
+                        ))}
+                    </Stack>
+                  </Box>
+                </>
+              )}
+
+              {/* Content browser */}
+              {contentNode && contentConnId && (
+                <>
+                  <Divider />
+                  <Box>
+                    <Typography variant='overline' sx={{ opacity: 0.6, mb: 1, display: 'block' }}>
+                      {t('storage.content.title')}
+                    </Typography>
+
+                    {/* Filters: connection + node + upload */}
+                    <Box sx={{ display: 'flex', gap: 1, mb: 2, flexWrap: 'wrap', alignItems: 'center' }}>
+                      {/* Connection selector */}
+                      {(selected.connections || []).length > 1 ? (
+                        <FormControl size='small' sx={{ minWidth: 140 }}>
+                          <Select
+                            value={contentConnId}
+                            onChange={e => {
+                              const newConnId = e.target.value
+                              setContentConnId(newConnId)
+                              setContentNode(selected.allNodes?.[0] || null)
+                            }}
+                            sx={{ fontSize: 12, height: 32, '& .MuiSelect-select': { py: 0.5 } }}
+                          >
+                            {(selected.connections || []).map(c => (
+                              <MenuItem key={c.id} value={c.id} sx={{ fontSize: 12 }}>
+                                <i className='ri-server-line' style={{ fontSize: 14, marginRight: 6, opacity: 0.5 }} />
+                                {c.name}
+                              </MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                      ) : (selected.connections || []).length === 1 && (
+                        <Chip
+                          size='small'
+                          icon={<i className='ri-server-line' style={{ fontSize: 14 }} />}
+                          label={selected.connections[0].name}
+                          variant='outlined'
+                          sx={{ fontSize: 11, height: 28 }}
+                        />
+                      )}
+
+                      <Box sx={{ flex: 1 }} />
+
+                      {/* Node selector */}
+                      {(selected.allNodes || []).length > 1 ? (
+                        <FormControl size='small' sx={{ minWidth: 130 }}>
+                          <Select
+                            value={contentNode}
+                            onChange={e => setContentNode(e.target.value)}
+                            sx={{ fontSize: 12, height: 32, '& .MuiSelect-select': { py: 0.5 } }}
+                          >
+                            {(selected.allNodes || []).map(n => (
+                              <MenuItem key={n} value={n} sx={{ fontSize: 12 }}>
+                                <i className='ri-computer-line' style={{ fontSize: 14, marginRight: 6, opacity: 0.5 }} />
+                                {n}
+                              </MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                      ) : (
+                        <Chip
+                          size='small'
+                          icon={<i className='ri-computer-line' style={{ fontSize: 14 }} />}
+                          label={contentNode}
+                          variant='outlined'
+                          sx={{ fontSize: 11, height: 28 }}
+                        />
+                      )}
+                    </Box>
+
+                    <StorageContentBrowser
+                      key={`${contentConnId}-${contentNode}`}
+                      connId={contentConnId}
+                      node={contentNode}
+                      storage={selected.storage}
+                      contentTypes={selected.content || []}
+                      onDelete={loadStorages}
+                    />
+                  </Box>
+                </>
+              )}
+
+              <Box sx={{ flex: 1 }} />
+
+              {/* Actions */}
+              <Box>
+                <Typography variant='overline' sx={{ opacity: 0.6 }}>{t('common.actions')}</Typography>
+                <Stack direction='row' spacing={1} sx={{ mt: 1 }}>
+                  <Button
+                    size='small'
+                    variant='outlined'
+                    startIcon={<i className='ri-external-link-line' />}
+                    component={Link}
+                    href={`/infrastructure/resources?storage=${selected.storage}`}
+                  >
+                    {t('common.view')}
+                  </Button>
+                </Stack>
+              </Box>
+            </>
+          )}
+        </Box>
+      </Drawer>
+    </Box>
+  )
+}

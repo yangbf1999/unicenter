@@ -1,0 +1,714 @@
+import type { Node, Edge } from '@xyflow/react'
+
+import type {
+  InventoryData,
+  InventoryGuest,
+  TopologyFilters,
+  ClusterNodeData,
+  HostNodeData,
+  VmNodeData,
+  VmSummaryNodeData,
+  VlanGroupNodeData,
+  VlanContainerNodeData,
+  VlanContainerVm,
+  TagGroupNodeData,
+  UniCenterNodeData,
+  PbsServerNodeData,
+  NodeStatus,
+} from '../types'
+import type { NetworkMap, VmNetworkInfo } from '../hooks/useTopologyNetworks'
+import { getResourceStatus, getStatusColor, getVmStatusColor } from './topologyColors'
+import { NO_SEGMENT_KEY, NO_SEGMENT_LABEL, type NicSegment } from '@/lib/esage/nicSegment'
+
+/** Bucket a guest with no readable NIC at all falls into. */
+const UNKNOWN_SEGMENT: NicSegment = {
+  key: NO_SEGMENT_KEY,
+  label: NO_SEGMENT_LABEL,
+  vlan: null,
+  tag: null,
+  bridgeLabel: 'unknown',
+}
+
+/**
+ * Segment a NIC is bucketed under. Resolution happens server-side (SDN VNet >
+ * per-NIC tag > host bridge VLAN, see lib/esage/nicSegment.ts); this only
+ * covers the NIC being absent.
+ */
+function segmentOf(nic: VmNetworkInfo | undefined): NicSegment {
+  return nic?.segment ?? UNKNOWN_SEGMENT
+}
+
+/** The segment fields both VLAN bucket nodes carry, from a resolved segment. */
+function segmentFields(segment: NicSegment) {
+  return {
+    segmentKey: segment.key,
+    segmentTag: segment.tag,
+    ...(segment.vnet !== undefined ? { vnet: segment.vnet } : {}),
+    ...(segment.zone !== undefined ? { zone: segment.zone } : {}),
+    ...(segment.zoneType !== undefined ? { zoneType: segment.zoneType } : {}),
+  }
+}
+
+function buildVmNode(
+  conn: { id: string },
+  nodeName: string,
+  guest: InventoryGuest,
+  idSuffix?: string
+): { node: Node; data: VmNodeData } {
+  const vmid = typeof guest.vmid === 'string' ? Number.parseInt(guest.vmid, 10) : guest.vmid
+  const vmCpu = guest.cpu || 0
+  const vmMaxCpu = guest.maxcpu || 0
+  const vmMem = guest.mem || 0
+  const vmMaxMem = guest.maxmem || 0
+
+  const vmData: VmNodeData = {
+    label: guest.name || `VM ${vmid}`,
+    connectionId: conn.id,
+    vmid,
+    vmType: guest.type || 'qemu',
+    vmStatus: guest.status,
+    cpuUsage: vmMaxCpu > 0 ? vmCpu / vmMaxCpu : 0,
+    ramUsage: vmMaxMem > 0 ? vmMem / vmMaxMem : 0,
+    nodeName,
+    width: 160,
+    height: 50,
+  }
+
+  const id = idSuffix
+    ? `vm-net-${idSuffix}-${conn.id}-${nodeName}-${vmid}`
+    : `vm-${conn.id}-${nodeName}-${vmid}`
+
+  return {
+    node: {
+      id,
+      type: 'vm',
+      position: { x: 0, y: 0 },
+      data: vmData,
+    },
+    data: vmData,
+  }
+}
+
+function buildVmEdge(sourceId: string, vmId: string, status: string): Edge {
+  return {
+    id: `e-${sourceId}-${vmId}`,
+    source: sourceId,
+    target: vmId,
+    type: 'smoothstep',
+    animated: status === 'running',
+    style: {
+      stroke: status === 'running' ? getVmStatusColor(status) : '#9e9e9e',
+      strokeWidth: 1,
+    },
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Network (VLAN-only) view                                           */
+/* ------------------------------------------------------------------ */
+
+/** One segment bucket of the network view: its identity plus its guests. */
+type VlanBucket = { segment: NicSegment; cidrs: number[]; vms: VlanContainerVm[] }
+
+function buildNetworkView(
+  data: InventoryData,
+  filters: TopologyFilters,
+  networkMap?: NetworkMap
+): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = []
+  const edges: Edge[] = []
+
+  if (!data?.clusters) return { nodes, edges }
+
+  const clusters = filters.connectionId
+    ? data.clusters.filter((c) => c.id === filters.connectionId)
+    : data.clusters
+
+  let grandTotalVms = 0
+  let grandTotalNodes = 0
+
+  // Per-cluster: collect VMs into segment buckets (one SDN VNet, one VLAN id,
+  // or the segment-less catch-all)
+  const clusterVlanMap = new Map<string, Map<string, VlanBucket>>()
+
+  for (const conn of clusters) {
+    grandTotalNodes += conn.nodes.length
+    const buckets = new Map<string, VlanBucket>()
+
+    for (const node of conn.nodes) {
+      let guests = node.guests || []
+
+      if (filters.vmStatus && filters.vmStatus !== 'all') {
+        guests = guests.filter((g) => g.status === filters.vmStatus)
+      }
+
+      grandTotalVms += guests.length
+
+      for (const guest of guests) {
+        const vmid = typeof guest.vmid === 'string' ? Number.parseInt(guest.vmid, 10) : guest.vmid
+        const type = guest.type || 'qemu'
+        const netKey = `${conn.id}:${type}:${node.node}:${typeof guest.vmid === 'string' ? guest.vmid : String(guest.vmid)}`
+        const nics = networkMap?.get(netKey) || []
+
+        if (nics.length === 0) {
+          const segment = UNKNOWN_SEGMENT
+
+          if (!buckets.has(segment.key)) {
+            buckets.set(segment.key, { segment, cidrs: [], vms: [] })
+          }
+
+          buckets.get(segment.key)!.vms.push({
+            vmid,
+            name: guest.name || `VM ${vmid}`,
+            vmType: type,
+            vmStatus: guest.status,
+            nodeName: node.node,
+            ip: null,
+          })
+        } else {
+          for (const nic of nics) {
+            const segment = segmentOf(nic)
+
+            if (!buckets.has(segment.key)) {
+              buckets.set(segment.key, { segment, cidrs: [], vms: [] })
+            }
+
+            const bucket = buckets.get(segment.key)!
+
+            if (nic.cidr != null && !bucket.cidrs.includes(nic.cidr)) {
+              bucket.cidrs.push(nic.cidr)
+            }
+
+            bucket.vms.push({
+              vmid,
+              name: guest.name || `VM ${vmid}`,
+              vmType: type,
+              vmStatus: guest.status,
+              nodeName: node.node,
+              ip: nic.ip || null,
+            })
+          }
+        }
+      }
+    }
+
+    clusterVlanMap.set(conn.id, buckets)
+  }
+
+  // UniCenter root
+  const unicenterData: UniCenterNodeData = {
+    label: 'UniCenter',
+    clusterCount: clusters.length,
+    totalNodes: grandTotalNodes,
+    totalVms: grandTotalVms,
+    width: 300,
+    height: 90,
+  }
+
+  nodes.push({
+    id: 'unicenter',
+    type: 'unicenter',
+    position: { x: 0, y: 0 },
+    data: unicenterData,
+  })
+
+  // Cluster nodes + VLAN containers per cluster
+  for (const conn of clusters) {
+    const clusterId = `cluster-${conn.id}`
+    const isOnline = conn.status === 'online' || conn.status === 'degraded'
+
+    let cpuSum = 0
+    let ramSum = 0
+    let nodeCountOnline = 0
+    let totalVms = 0
+    let worstStatus: NodeStatus = 'ok'
+
+    for (const node of conn.nodes) {
+      const nodeIsOnline = node.status === 'online'
+      const nodeCpuUsage = node.cpu || 0
+      const nodeMem = node.mem || 0
+      const nodeMaxMem = node.maxmem || 0
+      const nodeRamUsage = nodeMaxMem > 0 ? nodeMem / nodeMaxMem : 0
+      const nodeStatus = getResourceStatus(Math.max(nodeCpuUsage, nodeRamUsage), nodeIsOnline)
+
+      if (nodeStatus === 'critical') worstStatus = 'critical'
+      else if (nodeStatus === 'warning' && worstStatus !== 'critical') worstStatus = 'warning'
+
+      if (nodeIsOnline) {
+        cpuSum += nodeCpuUsage
+        ramSum += nodeRamUsage
+        nodeCountOnline++
+      }
+
+      totalVms += (node.guests || []).length
+    }
+
+    if (!isOnline && worstStatus !== 'critical') worstStatus = 'critical'
+
+    const clusterData: ClusterNodeData = {
+      label: conn.name,
+      host: conn.name,
+      connectionId: conn.id,
+      nodeCount: conn.nodes.length,
+      vmCount: totalVms,
+      cpuUsage: nodeCountOnline > 0 ? cpuSum / nodeCountOnline : 0,
+      ramUsage: nodeCountOnline > 0 ? ramSum / nodeCountOnline : 0,
+      status: isOnline ? worstStatus : 'offline',
+      width: 220,
+      height: 115,
+    }
+
+    nodes.push({
+      id: clusterId,
+      type: 'cluster',
+      position: { x: 0, y: 0 },
+      data: clusterData,
+    })
+
+    edges.push({
+      id: `e-unicenter-${clusterId}`,
+      source: 'unicenter',
+      target: clusterId,
+      type: 'smoothstep',
+      animated: true,
+      style: { stroke: '#F29221', strokeWidth: 2 },
+    })
+
+    // VLAN container nodes for this cluster
+    const buckets = clusterVlanMap.get(conn.id)
+
+    if (buckets) {
+      for (const [groupKey, bucket] of buckets) {
+        const containerId = `vlanc-${conn.id}-${groupKey}`
+        const VM_ROW_HEIGHT = 18
+        const HEADER_HEIGHT = 32
+        const PADDING = 8
+        const containerHeight = HEADER_HEIGHT + PADDING + bucket.vms.length * VM_ROW_HEIGHT + PADDING
+
+        // Compute subnet from first IP with CIDR
+        let subnet: string | null = null
+        const cidr = bucket.cidrs[0]
+
+        if (cidr != null) {
+          const firstVmWithIp = bucket.vms.find(v => v.ip)
+
+          if (firstVmWithIp?.ip) {
+            const octets = firstVmWithIp.ip.split('.').map(Number)
+            const mask = cidr === 0 ? 0 : (~0 << (32 - cidr)) >>> 0
+            const netAddr = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) & mask
+
+            subnet = `${(netAddr >>> 24) & 0xff}.${(netAddr >>> 16) & 0xff}.${(netAddr >>> 8) & 0xff}.${netAddr & 0xff}/${cidr}`
+          }
+        }
+
+        const containerData: VlanContainerNodeData = {
+          label: bucket.segment.label,
+          vlanTag: bucket.segment.vlan,
+          bridge: bucket.segment.bridgeLabel,
+          ...segmentFields(bucket.segment),
+          subnet,
+          vms: bucket.vms,
+          width: 240,
+          height: Math.max(containerHeight, 70),
+        }
+
+        nodes.push({
+          id: containerId,
+          type: 'vlanContainer',
+          position: { x: 0, y: 0 },
+          data: containerData,
+        })
+
+        edges.push({
+          id: `e-${clusterId}-${containerId}`,
+          source: clusterId,
+          target: containerId,
+          type: 'smoothstep',
+          animated: true,
+          style: { stroke: '#1976d2', strokeWidth: 1.5 },
+        })
+      }
+    }
+  }
+
+  return { nodes, edges }
+}
+
+/* ------------------------------------------------------------------ */
+/* Infrastructure view (default)                                      */
+/* ------------------------------------------------------------------ */
+
+function buildInfraView(
+  data: InventoryData,
+  filters: TopologyFilters,
+  networkMap?: NetworkMap
+): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = []
+  const edges: Edge[] = []
+
+  if (!data?.clusters) return { nodes, edges }
+
+  const clusters = filters.connectionId
+    ? data.clusters.filter((c) => c.id === filters.connectionId)
+    : data.clusters
+
+  // Aggregate totals for UniCenter root node
+  let grandTotalNodes = 0
+  let grandTotalVms = 0
+
+  for (const conn of clusters) {
+    const clusterId = `cluster-${conn.id}`
+    const isOnline = conn.status === 'online' || conn.status === 'degraded'
+
+    // Compute aggregate stats for the cluster
+    let totalVms = 0
+    let worstStatus: NodeStatus = 'ok'
+    let cpuSum = 0
+    let ramSum = 0
+    let nodeCountOnline = 0
+
+    for (const node of conn.nodes) {
+      const nodeIsOnline = node.status === 'online'
+
+      // UNISPHERE returns node.cpu as a 0-1 ratio already (not raw cycles)
+      const nodeCpuUsage = node.cpu || 0
+      const nodeMem = node.mem || 0
+      const nodeMaxMem = node.maxmem || 0
+      const nodeRamUsage = nodeMaxMem > 0 ? nodeMem / nodeMaxMem : 0
+      const nodeStatus = getResourceStatus(Math.max(nodeCpuUsage, nodeRamUsage), nodeIsOnline)
+
+      if (nodeStatus === 'critical') worstStatus = 'critical'
+      else if (nodeStatus === 'warning' && worstStatus !== 'critical') worstStatus = 'warning'
+
+      if (nodeIsOnline) {
+        cpuSum += nodeCpuUsage
+        ramSum += nodeRamUsage
+        nodeCountOnline++
+      }
+
+      const guests = node.guests || []
+
+      totalVms += guests.length
+    }
+
+    if (!isOnline && worstStatus !== 'critical') worstStatus = 'critical'
+
+    grandTotalNodes += conn.nodes.length
+    grandTotalVms += totalVms
+
+    const clusterData: ClusterNodeData = {
+      label: conn.name,
+      host: conn.name,
+      connectionId: conn.id,
+      nodeCount: conn.nodes.length,
+      vmCount: totalVms,
+      cpuUsage: nodeCountOnline > 0 ? cpuSum / nodeCountOnline : 0,
+      ramUsage: nodeCountOnline > 0 ? ramSum / nodeCountOnline : 0,
+      status: isOnline ? worstStatus : 'offline',
+      width: 220,
+      height: 115,
+    }
+
+    nodes.push({
+      id: clusterId,
+      type: 'cluster',
+      position: { x: 0, y: 0 },
+      data: clusterData,
+    })
+
+    // Process each host node
+    for (const node of conn.nodes) {
+      const hostId = `host-${conn.id}-${node.node}`
+      const nodeIsOnline = node.status === 'online'
+
+      // UNISPHERE returns node.cpu as a 0-1 ratio already
+      const cpuUsage = node.cpu || 0
+      const ramUsage = (node.maxmem || 0) > 0 ? (node.mem || 0) / (node.maxmem || 1) : 0
+      const nodeStatus = getResourceStatus(Math.max(cpuUsage, ramUsage), nodeIsOnline)
+
+      // Filter guests based on filters
+      let guests = node.guests || []
+
+      if (filters.vmStatus && filters.vmStatus !== 'all') {
+        guests = guests.filter((g) => g.status === filters.vmStatus)
+      }
+
+      const hostData: HostNodeData = {
+        label: node.node,
+        connectionId: conn.id,
+        nodeName: node.node,
+        cpuUsage,
+        ramUsage,
+        vmCount: guests.length,
+        uptime: node.uptime || 0,
+        status: nodeIsOnline ? nodeStatus : 'offline',
+        width: 190,
+        height: 90,
+      }
+
+      nodes.push({
+        id: hostId,
+        type: 'host',
+        position: { x: 0, y: 0 },
+        data: hostData,
+      })
+
+      edges.push({
+        id: `e-${clusterId}-${hostId}`,
+        source: clusterId,
+        target: hostId,
+        type: 'smoothstep',
+        animated: nodeIsOnline,
+        style: { stroke: getStatusColor(hostData.status), strokeWidth: 1.5 },
+      })
+
+      // VMs: individual or summary
+      if (guests.length > 0) {
+        if (guests.length <= filters.vmThreshold) {
+          // Check if VLAN grouping is enabled and data is available
+          if (filters.groupByVlan && networkMap && networkMap.size > 0) {
+            // Group VMs by the segment of their primary NIC
+            const vlanGroups = new Map<string, { segment: NicSegment; guests: InventoryGuest[] }>()
+
+            for (const guest of guests) {
+              const vmid = typeof guest.vmid === 'string' ? guest.vmid : String(guest.vmid)
+              const type = guest.type || 'qemu'
+              const key = `${conn.id}:${type}:${node.node}:${vmid}`
+              const netInfo = networkMap.get(key)
+
+              // Use the first NIC's segment
+              const segment = segmentOf(netInfo?.[0])
+
+              if (!vlanGroups.has(segment.key)) {
+                vlanGroups.set(segment.key, { segment, guests: [] })
+              }
+
+              vlanGroups.get(segment.key)!.guests.push(guest)
+            }
+
+            // Create VLAN group nodes and edges
+            for (const [groupKey, group] of vlanGroups) {
+              const vlanNodeId = `vlan-${conn.id}-${node.node}-${groupKey}`
+
+              const vlanData: VlanGroupNodeData = {
+                label: group.segment.label,
+                connectionId: conn.id,
+                nodeName: node.node,
+                vlanTag: group.segment.vlan,
+                bridge: group.segment.bridgeLabel,
+                ...segmentFields(group.segment),
+                vmCount: group.guests.length,
+                width: 170,
+                height: 50,
+              }
+
+              nodes.push({
+                id: vlanNodeId,
+                type: 'vlanGroup',
+                position: { x: 0, y: 0 },
+                data: vlanData,
+              })
+
+              edges.push({
+                id: `e-${hostId}-${vlanNodeId}`,
+                source: hostId,
+                target: vlanNodeId,
+                type: 'smoothstep',
+                animated: true,
+                style: { stroke: '#1976d2', strokeWidth: 1.5 },
+              })
+
+              // Individual VM nodes under the VLAN group
+              for (const guest of group.guests) {
+                const { node: vmNode } = buildVmNode(conn, node.node, guest)
+
+                nodes.push(vmNode)
+                edges.push(buildVmEdge(vlanNodeId, vmNode.id, guest.status))
+              }
+            }
+          } else if (filters.groupByTag) {
+            // Group VMs by first eSage tag
+            const tagGroups = new Map<string, InventoryGuest[]>()
+
+            for (const guest of guests) {
+              const tags = guest.tags?.split(';').filter(Boolean) || []
+              const firstTag = tags[0] || '__none__'
+
+              if (!tagGroups.has(firstTag)) {
+                tagGroups.set(firstTag, [])
+              }
+
+              tagGroups.get(firstTag)!.push(guest)
+            }
+
+            for (const [tag, tagGuests] of tagGroups) {
+              const tagNodeId = `tag-${conn.id}-${node.node}-${tag}`
+
+              const tagData: TagGroupNodeData = {
+                label: tag === '__none__' ? 'No Tag' : tag,
+                connectionId: conn.id,
+                nodeName: node.node,
+                tag,
+                vmCount: tagGuests.length,
+                width: 170,
+                height: 45,
+              }
+
+              nodes.push({
+                id: tagNodeId,
+                type: 'tagGroup',
+                position: { x: 0, y: 0 },
+                data: tagData,
+              })
+
+              edges.push({
+                id: `e-${hostId}-${tagNodeId}`,
+                source: hostId,
+                target: tagNodeId,
+                type: 'smoothstep',
+                animated: true,
+                style: { stroke: '#7b1fa2', strokeWidth: 1.5 },
+              })
+
+              for (const guest of tagGuests) {
+                const { node: vmNode } = buildVmNode(conn, node.node, guest)
+
+                nodes.push(vmNode)
+                edges.push(buildVmEdge(tagNodeId, vmNode.id, guest.status))
+              }
+            }
+          } else {
+            // Individual VM nodes (no grouping)
+            for (const guest of guests) {
+              const { node: vmNode } = buildVmNode(conn, node.node, guest)
+
+              nodes.push(vmNode)
+              edges.push(buildVmEdge(hostId, vmNode.id, guest.status))
+            }
+          }
+        } else {
+          // Summary node
+          const summaryId = `vmsummary-${conn.id}-${node.node}`
+          const running = guests.filter((v) => v.status === 'running').length
+          const stopped = guests.filter((v) => v.status === 'stopped').length
+
+          const summaryData: VmSummaryNodeData = {
+            label: `${guests.length} VMs`,
+            connectionId: conn.id,
+            nodeName: node.node,
+            total: guests.length,
+            running,
+            stopped,
+            width: 180,
+            height: 60,
+          }
+
+          nodes.push({
+            id: summaryId,
+            type: 'vmSummary',
+            position: { x: 0, y: 0 },
+            data: summaryData,
+          })
+
+          const runningRatio = guests.length > 0 ? running / guests.length : 0
+          const summaryEdgeColor = runningRatio > 0.5 ? '#4caf50' : runningRatio > 0 ? '#ff9800' : '#9e9e9e'
+
+          edges.push({
+            id: `e-${hostId}-${summaryId}`,
+            source: hostId,
+            target: summaryId,
+            type: 'smoothstep',
+            animated: running > 0,
+            style: { stroke: summaryEdgeColor, strokeWidth: 1 },
+          })
+        }
+      }
+    }
+  }
+
+  // UniCenter root node — always at top, connecting to all clusters/standalone nodes
+  const pbsCount = (data.pbsServers || []).length
+  const unicenterData: UniCenterNodeData = {
+    label: 'UniCenter',
+    clusterCount: clusters.length,
+    totalNodes: grandTotalNodes,
+    totalVms: grandTotalVms,
+    pbsCount,
+    width: 300,
+    height: 90,
+  }
+
+  nodes.push({
+    id: 'unicenter',
+    type: 'unicenter',
+    position: { x: 0, y: 0 },
+    data: unicenterData,
+  })
+
+  for (const conn of clusters) {
+    const clusterId = `cluster-${conn.id}`
+
+    edges.push({
+      id: `e-unicenter-${clusterId}`,
+      source: 'unicenter',
+      target: clusterId,
+      type: 'smoothstep',
+      animated: true,
+      style: { stroke: '#F29221', strokeWidth: 2 },
+    })
+  }
+
+  // PBS servers
+  const pbsServers = data.pbsServers || []
+
+  for (const pbs of pbsServers) {
+    const pbsId = `pbs-${pbs.id}`
+
+    const pbsData: PbsServerNodeData = {
+      label: pbs.name,
+      serverId: pbs.id,
+      status: pbs.status,
+      version: pbs.version,
+      datastoreCount: pbs.stats?.datastoreCount || 0,
+      backupCount: pbs.stats?.backupCount || 0,
+      totalSize: pbs.stats?.totalSize || 0,
+      totalUsed: pbs.stats?.totalUsed || 0,
+      width: 220,
+      height: 100,
+    }
+
+    nodes.push({
+      id: pbsId,
+      type: 'pbsServer',
+      position: { x: 0, y: 0 },
+      data: pbsData,
+    })
+
+    edges.push({
+      id: `e-unicenter-${pbsId}`,
+      source: 'unicenter',
+      target: pbsId,
+      type: 'smoothstep',
+      animated: pbs.status === 'online',
+      style: { stroke: '#26a269', strokeWidth: 2 },
+    })
+  }
+
+  return { nodes, edges }
+}
+
+/* ------------------------------------------------------------------ */
+/* Main entry — dispatches based on viewMode                          */
+/* ------------------------------------------------------------------ */
+
+export function buildTopologyGraph(
+  data: InventoryData,
+  filters: TopologyFilters,
+  networkMap?: NetworkMap
+): { nodes: Node[]; edges: Edge[] } {
+  if (filters.viewMode === 'network') {
+    return buildNetworkView(data, filters, networkMap)
+  }
+
+  return buildInfraView(data, filters, networkMap)
+}

@@ -1,0 +1,315 @@
+import { NextResponse } from "next/server"
+
+import { unisphereFetch } from "@/lib/esage/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { getCurrentTenantId } from "@/lib/tenant"
+import { getTenantInfrastructureScope, canMigrateConnections } from "@/lib/tenant/infraScope"
+import { watchMigrationAndCleanup } from "@/lib/migration/cross-cluster-watcher"
+import { assertVmid, assertNodeName } from "@/lib/ssh/validate"
+import { getNodeIp } from "@/lib/ssh/node-ip"
+
+export const runtime = "nodejs"
+
+/**
+ * POST /api/v1/connections/{id}/guests/{type}/{node}/{vmid}/remote-migrate
+ * 
+ * Lance une migration cross-cluster (remote_migrate) d'une VM vers un autre cluster eSage.
+ * Utilise l'API eSage: POST /nodes/{node}/qemu/{vmid}/remote_migrate
+ * 
+ * Body params:
+ * - targetConnectionId: string - ID de la connexion cible dans UniCenter
+ * - targetNode: string - Nom du nœud cible sur le cluster distant
+ * - targetVmid?: number - VMID sur le cluster cible (optionnel, garde le même par défaut)
+ * - targetStorage: string - Stockage cible sur le cluster distant
+ * - targetBridge: string - Bridge réseau cible sur le cluster distant
+ * - online?: boolean - Migration live si true (défaut: true si VM running)
+ * - delete?: boolean - Supprimer la VM source après migration réussie (défaut: false)
+ * - bwlimit?: number - Limite de bande passante en KiB/s (optionnel)
+ */
+export async function POST(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    // Vérifier que c'est bien une VM QEMU (remote_migrate n'est pas supporté pour LXC actuellement)
+    if (type !== 'qemu') {
+      return NextResponse.json(
+        { error: "Cross-cluster migration is currently only supported for QEMU VMs, not LXC containers" },
+        { status: 400 }
+      )
+    }
+
+    // Constrain the node name and VMID before either can reach a shell command
+    // on the node: the fire-and-forget cleanup watcher runs `qm unlock ${vmid}`
+    // over SSH, and getNodeIp() may fall back to the raw node name as the SSH
+    // host. Both are re-derived here so no attacker-controlled characters flow
+    // through (command injection / log injection in the SSH layer).
+    let safeVmid: string
+    let safeNode: string
+    try {
+      safeVmid = assertVmid(vmid)
+      safeNode = assertNodeName(node)
+    } catch {
+      return NextResponse.json({ error: "Invalid node name or vmid" }, { status: 400 })
+    }
+
+    // RBAC: Check vm.migrate permission
+    const resourceId = buildVmResourceId(id, safeNode, type, safeVmid)
+    const denied = await checkPermission(PERMISSIONS.VM_MIGRATE, "vm", resourceId)
+    if (denied) return denied
+
+    // VM placement is a whole-cluster operation: the provider may migrate any
+    // cluster it manages; an MSP tenant may migrate within clusters it OWNS;
+    // vDC/iaas tenants get an abstracted slice and cannot migrate.
+    const tenantId = await getCurrentTenantId()
+    const infra = await getTenantInfrastructureScope(tenantId)
+    if (!canMigrateConnections(infra, id)) {
+      return NextResponse.json(
+        { error: 'Migration is restricted to the provider or the MSP tenant that owns this connection' },
+        { status: 403 },
+      )
+    }
+
+    const body = await req.json()
+    const {
+      targetConnectionId,
+      targetNode,
+      targetVmid,
+      targetStorage,
+      targetBridge,
+      online = true,
+      delete: deleteSource = false,
+      bwlimit,
+    } = body
+
+    // Validation des paramètres requis
+    if (!targetConnectionId) {
+      return NextResponse.json({ error: "targetConnectionId is required" }, { status: 400 })
+    }
+
+    // MSP tenants must also own the target connection
+    if (infra.kind === 'msp' && !infra.connectionIds.has(targetConnectionId)) {
+      return NextResponse.json(
+        { error: 'Cross-cluster migration target must be a connection owned by your tenant' },
+        { status: 403 },
+      )
+    }
+    if (!targetNode) {
+      return NextResponse.json({ error: "targetNode is required" }, { status: 400 })
+    }
+    if (!targetStorage) {
+      return NextResponse.json({ error: "targetStorage is required" }, { status: 400 })
+    }
+    if (!targetBridge) {
+      return NextResponse.json({ error: "targetBridge is required" }, { status: 400 })
+    }
+
+    // Récupérer les informations de connexion source et cible
+    const sourceConn = await getConnectionById(id)
+    const targetConn = await getConnectionById(targetConnectionId)
+
+    // Resolve the target NODE's address, not the cluster baseUrl, so the
+    // migration lands on the user-selected host. UNISPHERE's remote_migrate uses the
+    // host:port in the target-endpoint to reach the cluster API; talking to a
+    // specific node's unisphereproxy makes that node the receiver. Falling back to
+    // the cluster baseUrl made every cross-cluster migration land on whichever
+    // node baseUrl happens to point at, ignoring the user's choice (issue #282).
+    const targetUrl = new URL(targetConn.baseUrl)
+    const targetPort = targetUrl.port || '8006'
+    const targetHost = await getNodeIp(targetConn, targetNode)
+
+    // Récupérer le fingerprint TLS du certificat du serveur cible
+    // C'est le fingerprint SHA-256 du certificat TLS qui est requis par remote_migrate
+    let targetFingerprint = ''
+    
+    try {
+      // Méthode 1: Récupérer le fingerprint directement depuis le certificat TLS
+      const tls = await import('tls')
+      const net = await import('net')
+      
+      targetFingerprint = await new Promise<string>((resolve, reject) => {
+        const socket = tls.connect({
+          host: targetHost,
+          port: Number.parseInt(targetPort),
+          rejectUnauthorized: false, // On accepte les certificats auto-signés
+          timeout: 10000,
+        }, () => {
+          const cert = socket.getPeerCertificate()
+          socket.end()
+          
+          if (cert && cert.fingerprint256) {
+            // Le fingerprint est au format XX:XX:XX:... 
+            resolve(cert.fingerprint256)
+          } else if (cert && cert.fingerprint) {
+            // Fallback sur SHA1 si SHA256 non disponible (moins courant)
+            resolve(cert.fingerprint)
+          } else {
+            reject(new Error('No certificate fingerprint available'))
+          }
+        })
+        
+        socket.on('error', (err) => {
+          reject(err)
+        })
+        
+        socket.on('timeout', () => {
+          socket.destroy()
+          reject(new Error('Connection timeout'))
+        })
+      })
+      
+    } catch (tlsError) {
+      console.warn('[remote-migrate] Failed to get TLS fingerprint:', tlsError)
+      
+      // Fallback: essayer les méthodes API eSage
+      try {
+        // Pour un cluster, essayer /cluster/config/join
+        const joinInfo = await unisphereFetch<any>(targetConn, "/cluster/config/join")
+        
+        if (joinInfo?.fingerprint) {
+          targetFingerprint = joinInfo.fingerprint
+        } else if (joinInfo?.nodelist?.[0]?.unisphere_fp) {
+          targetFingerprint = joinInfo.nodelist[0].unisphere_fp
+        }
+      } catch {
+        // Pas un cluster ou pas d'accès
+      }
+      
+      // Fallback: récupérer depuis /cluster/config/nodes
+      if (!targetFingerprint) {
+        try {
+          const configNodes = await unisphereFetch<any[]>(targetConn, "/cluster/config/nodes")
+          const targetNodeConfig = configNodes?.find((n: any) => n.name === targetNode)
+          if (targetNodeConfig?.unisphere_fp) {
+            targetFingerprint = targetNodeConfig.unisphere_fp
+          }
+        } catch {
+          // Ignorer
+        }
+      }
+    }
+    
+    if (!targetFingerprint) {
+      return NextResponse.json(
+        { error: "Could not retrieve TLS fingerprint from target cluster. Please ensure the target is reachable." },
+        { status: 400 }
+      )
+    }
+
+    // Construire le target-endpoint au format attendu par eSage
+    // Format: apitoken=PVEAPIToken=<user>@<realm>!<token>=<secret>,host=<address>,fingerprint=<fp>[,port=<port>]
+    const targetEndpointParts = [
+      `apitoken=PVEAPIToken=${targetConn.apiToken}`,
+      `host=${targetHost}`,
+      `port=${targetPort}`,
+      `fingerprint=${targetFingerprint}`,
+    ]
+    
+    const targetEndpoint = targetEndpointParts.join(',')
+
+    // Construire les paramètres de migration
+    const migrateParams: Record<string, string> = {
+      'target-endpoint': targetEndpoint,
+      'target-storage': targetStorage,
+      'target-bridge': targetBridge,
+    }
+    
+    // VMID cible (optionnel)
+    if (targetVmid !== undefined && targetVmid !== null && targetVmid !== '') {
+      migrateParams['target-vmid'] = String(targetVmid)
+    }
+    
+    // Migration online/offline
+    if (online) {
+      migrateParams['online'] = '1'
+    }
+    
+    // Note: eSage remote_migrate does NOT support the 'delete' parameter.
+    // Source VM deletion is handled by our task completion handler instead
+    // (see /api/v1/tasks/[connectionId]/[node]/[upid]/route.ts).
+    
+    // Limite de bande passante
+    if (bwlimit !== undefined && bwlimit !== null && bwlimit !== '') {
+      migrateParams['bwlimit'] = String(bwlimit)
+    }
+
+    // Appeler l'API eSage pour la migration cross-cluster
+    const result = await unisphereFetch<string>(
+      sourceConn,
+      `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(vmid)}/remote_migrate`,
+      {
+        method: 'POST',
+        body: new URLSearchParams(
+          Object.entries(migrateParams).map(([k, v]) => [k, v])
+        ).toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    )
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "migrate",
+      category: 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { sourceNode: node, targetNode, targetCluster: targetConn.name, connectionId: id, online },
+    })
+
+    // Fire-and-forget server-side watcher. Guarantees post-migration cleanup
+    // (SSH unlock + optional source VM delete) even if the user closes the
+    // browser tab, navigates away, or the tab is throttled in the background.
+    // tenantId must be captured here while the request session is alive.
+    if (typeof result === 'string' && result.startsWith('UPID:')) {
+      void watchMigrationAndCleanup({
+        connectionId: id,
+        tenantId,
+        sourceConn,
+        sourceNode: safeNode,
+        vmid: safeVmid,
+        upid: result,
+        deleteSource,
+      }).catch(err => {
+        console.warn('[remote-migrate] background watcher failed:', String(err?.message || err).replace(/[\r\n]/g, ''))
+      })
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: result, // UPID de la tâche
+      message: `Cross-cluster migration of VM ${vmid} to ${targetNode}@${targetHost} started`,
+      details: {
+        sourceCluster: sourceConn.name,
+        targetCluster: targetConn.name,
+        targetNode,
+        targetStorage,
+        targetBridge,
+        online,
+        deleteSource,
+      }
+    })
+
+  } catch (e: any) {
+    console.error('[remote-migrate] Error:', String(e?.message || e).replace(/[\r\n]/g, ''))
+    
+    // Parser le message d'erreur eSage pour le rendre plus lisible
+    let errorMessage = e?.message || String(e)
+    
+    // Erreurs communes
+    if (errorMessage.includes('no export formats')) {
+      errorMessage = 'Cloud-init drives cannot be migrated. Please remove or reconfigure the cloud-init drive before migration.'
+    } else if (errorMessage.includes('permission denied') || errorMessage.includes('401')) {
+      errorMessage = 'Permission denied on target cluster. Please verify the API token has sufficient permissions (VM.Migrate, Datastore.AllocateSpace, etc.)'
+    } else if (errorMessage.includes('storage') && errorMessage.includes('not found')) {
+      errorMessage = `Target storage not found or not accessible. Verify the storage "${errorMessage}" exists and the API token has access.`
+    }
+    
+    return NextResponse.json({ error: errorMessage }, { status: 500 })
+  }
+}

@@ -1,0 +1,294 @@
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+import { callRoute, readJson } from "@/__tests__/setup/route-test"
+
+// Hoisted mocks -- referenced from vi.mock factories below, which vitest
+// hoists above these imports/consts, so they must themselves be created
+// via vi.hoisted().
+const {
+  getConnectionByIdMock,
+  getInfraMock,
+  checkPermissionMock,
+  unisphereFetchMock,
+  resolveVdcForTenantMock,
+  getCurrentTenantIdMock,
+  waitForTaskMock,
+  syncIpamForVmConfigMock,
+  releaseAllocationsForVmMock,
+  afterCbs,
+} = vi.hoisted(() => ({
+  getConnectionByIdMock: vi.fn(),
+  getInfraMock: vi.fn(),
+  checkPermissionMock: vi.fn(),
+  unisphereFetchMock: vi.fn(),
+  resolveVdcForTenantMock: vi.fn(),
+  getCurrentTenantIdMock: vi.fn(),
+  waitForTaskMock: vi.fn(),
+  syncIpamForVmConfigMock: vi.fn(),
+  releaseAllocationsForVmMock: vi.fn(),
+  afterCbs: [] as Array<() => Promise<void>>,
+}))
+
+// The route schedules post-restore work (waitForTask, pool placement, IPAM
+// sync, QoS restamp) via next/server's after(). Most tests only care about
+// the synchronous response + the immediate UNISPHERE POST, so they never drive
+// afterCbs. Tests that need to exercise the scheduled work (Task 13's
+// restamp block) pull the captured callback out of afterCbs and await it
+// directly -- keeping NextResponse itself real.
+vi.mock("next/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("next/server")>()
+  return { ...actual, after: (fn: () => Promise<void>) => { afterCbs.push(fn) } }
+})
+
+vi.mock("@/lib/esage/client", () => ({ unisphereFetch: unisphereFetchMock }))
+vi.mock("@/lib/connections/getConnection", () => ({ getConnectionById: getConnectionByIdMock }))
+vi.mock("@/lib/rbac", () => ({
+  checkPermission: () => checkPermissionMock(),
+  buildNodeResourceId: (...a: any[]) => a.join(":"),
+  PERMISSIONS: { VM_BACKUP: "vm.backup" },
+}))
+vi.mock("@/lib/tenant", () => ({
+  getCurrentTenantId: () => getCurrentTenantIdMock(),
+  DEFAULT_TENANT_ID: "default",
+}))
+vi.mock("@/lib/tenant/infraScope", () => ({
+  getTenantInfrastructureScope: (...a: any[]) => getInfraMock(...a),
+}))
+vi.mock("@/lib/vdc/quota", () => ({
+  resolveVdcForTenant: (...a: any[]) => resolveVdcForTenantMock(...a),
+}))
+// Only exercised by the pbsBackup path, which none of these tests take.
+vi.mock("@/lib/vdc/scope", () => ({ assertVdcPbsAccess: vi.fn() }))
+vi.mock("@/lib/esage/tasks", () => ({ waitForTask: (...a: any[]) => waitForTaskMock(...a) }))
+vi.mock("@/lib/vdc/ipamSync", () => ({ syncIpamForVmConfig: (...a: any[]) => syncIpamForVmConfigMock(...a) }))
+vi.mock("@/lib/vdc/ipam", () => ({ releaseAllocationsForVm: (...a: any[]) => releaseAllocationsForVmMock(...a) }))
+// Guards prisma.vdc.findFirst (pool-placement lookup, isTenant only) and
+// prisma.connection.findUnique (pbsBackup path, unused here) from hitting a
+// real database.
+vi.mock("@/lib/db/prisma", () => ({
+  prisma: {
+    vdc: { findFirst: vi.fn().mockResolvedValue(null) },
+    connection: { findUnique: vi.fn() },
+  },
+}))
+// Dynamically imported by the route (`await import("@/lib/audit")`); vi.mock
+// intercepts dynamic imports too.
+vi.mock("@/lib/audit", () => ({ audit: vi.fn().mockResolvedValue("audit-1") }))
+
+beforeEach(() => {
+  afterCbs.length = 0
+  checkPermissionMock.mockReset().mockResolvedValue(null)
+  getConnectionByIdMock.mockReset().mockResolvedValue({
+    id: "unisphere-1",
+    name: "unisphere-1",
+    baseUrl: "https://unisphere.local:8006",
+    apiToken: "t",
+    insecureDev: false,
+    behindProxy: false,
+  })
+  getCurrentTenantIdMock.mockReset().mockResolvedValue("default")
+  getInfraMock.mockReset().mockResolvedValue({ kind: "provider" })
+  resolveVdcForTenantMock.mockReset().mockResolvedValue(null)
+  unisphereFetchMock.mockReset().mockResolvedValue("UPID:unisphere-1:00000000:00000000:00000000:qmrestore:111:root@pam:")
+  waitForTaskMock.mockReset().mockResolvedValue(undefined)
+  syncIpamForVmConfigMock.mockReset().mockResolvedValue({ bodyOverrides: {}, rollback: vi.fn() })
+  releaseAllocationsForVmMock.mockReset()
+})
+
+/** Decode the URL-encoded form body of a unisphereFetch(conn, path, opts) call. */
+function postedParams(call: unknown[]): URLSearchParams {
+  const opts = call[2] as { body?: string }
+  return new URLSearchParams(opts?.body ?? "")
+}
+
+const VZDUMP_QEMU_VOLID = "local:backup/vzdump-qemu-111-2026_08_11-15_51_33.vma.zst"
+const VZDUMP_LXC_VOLID = "local:backup/vzdump-lxc-111-2026_08_11-15_51_33.tar.zst"
+
+describe("POST /api/v1/connections/[id]/nodes/[node]/restore -- raw archive volid contract", () => {
+  it("qemu: archive volid is posted as `archive` to /nodes/{node}/qemu", async () => {
+    const { POST } = await import("./route")
+
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: VZDUMP_QEMU_VOLID, type: "qemu" },
+    })
+
+    expect(res.status).toBe(200)
+    expect(unisphereFetchMock).toHaveBeenCalledTimes(1)
+
+    const call = unisphereFetchMock.mock.calls[0]
+    expect(call[1]).toBe("/nodes/node1/qemu")
+    const params = postedParams(call)
+    expect(params.get("archive")).toBe(VZDUMP_QEMU_VOLID)
+    expect(params.get("vmid")).toBe("111")
+    expect(params.has("ostemplate")).toBe(false)
+    expect(params.has("restore")).toBe(false)
+  })
+
+  it("lxc: archive volid is posted as `ostemplate` with restore=1 to /nodes/{node}/lxc", async () => {
+    const { POST } = await import("./route")
+
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: VZDUMP_LXC_VOLID, type: "lxc" },
+    })
+
+    expect(res.status).toBe(200)
+    expect(unisphereFetchMock).toHaveBeenCalledTimes(1)
+
+    const call = unisphereFetchMock.mock.calls[0]
+    expect(call[1]).toBe("/nodes/node1/lxc")
+    const params = postedParams(call)
+    expect(params.get("ostemplate")).toBe(VZDUMP_LXC_VOLID)
+    expect(params.get("restore")).toBe("1")
+    expect(params.has("archive")).toBe(false)
+  })
+
+  it("iaas tenant: archive storage outside the vDC allow-list is refused, no UNISPHERE call emitted", async () => {
+    getCurrentTenantIdMock.mockResolvedValue("tenant-x")
+    getInfraMock.mockResolvedValue({
+      kind: "iaas",
+      vdcScope: {
+        connectionIds: new Set(["unisphere-1"]),
+        pbsConnectionIds: new Set<string>(),
+        nodesByConnection: new Map<string, Set<string>>(),
+        // Allow-listed storage is "ceph-vdc" -- deliberately does NOT
+        // include "local", which is the prefix of the archive below.
+        storagesByConnection: new Map([["unisphere-1", new Set(["ceph-vdc"])]]),
+        storagePoliciesByConnection: new Map<string, Map<string, any>>(),
+        poolsByConnection: new Map<string, Set<string>>(),
+        vnetsByConnection: new Map<string, Set<string>>(),
+        sharedBridgesByConnection: new Map<string, Set<string>>(),
+        pbsNamespacesByConnection: new Map<string, Array<{ datastore: string; namespace: string }>>(),
+        pbsNamespacesByUnisphereConnection: new Map<string, Set<string>>(),
+      },
+    })
+    // Tenant does have a vDC on this connection/node -- the allow-list
+    // check, not the "no vDC" branch, is what must reject this request.
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: "vdc-1", poolName: "pool-1", quota: null })
+
+    const { POST } = await import("./route")
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: VZDUMP_QEMU_VOLID, type: "qemu" },
+    })
+
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toMatch(/not authorised/i)
+    expect(unisphereFetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("POST /api/v1/connections/[id]/nodes/[node]/restore -- post-restore QoS restamp (Task 13)", () => {
+  const gold = { policyId: "p-gold", name: "Gold", iopsRd: 5000, iopsWr: 4000, mbpsRd: 500, mbpsWr: null }
+
+  /** iaas union scope with the given per-connection allowed storages + tier policies. */
+  function iaasScope(storages: string[], policies: Record<string, typeof gold> = {}) {
+    return {
+      kind: "iaas",
+      vdcScope: {
+        connectionIds: new Set(["unisphere-1"]),
+        pbsConnectionIds: new Set<string>(),
+        nodesByConnection: new Map<string, Set<string>>(),
+        storagesByConnection: new Map([["unisphere-1", new Set(storages)]]),
+        storagePoliciesByConnection: new Map([["unisphere-1", new Map(Object.entries(policies))]]),
+        poolsByConnection: new Map<string, Set<string>>(),
+        vnetsByConnection: new Map<string, Set<string>>(),
+        sharedBridgesByConnection: new Map<string, Set<string>>(),
+        pbsNamespacesByConnection: new Map<string, Array<{ datastore: string; namespace: string }>>(),
+        pbsNamespacesByUnisphereConnection: new Map<string, Set<string>>(),
+      },
+    }
+  }
+
+  function restoredConfigCall() {
+    return unisphereFetchMock.mock.calls.find(
+      (c) => String(c[1]).endsWith("/qemu/111/config") && c[2]?.method === "PUT",
+    )
+  }
+
+  it("iaas: restores an archive whose config carries a stale-QoS scsi0 on a policied storage -- restamp PUT captured with the policy caps", async () => {
+    getCurrentTenantIdMock.mockResolvedValue("tenant-x")
+    getInfraMock.mockResolvedValue(iaasScope(["ceph-nvme"], { "ceph-nvme": gold }))
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: "vdc-1", poolName: "pool-1", quota: null })
+    unisphereFetchMock.mockImplementation(async (_conn: any, path: string, opts?: any) => {
+      if (opts?.method === "POST") return "UPID:unisphere-1:00000000:00000000:00000000:qmrestore:111:root@pam:"
+      if (opts?.method === "PUT") return null
+      if (String(path).endsWith("/qemu/111/config")) {
+        return { scsi0: "ceph-nvme:vm-111-disk-0,size=32G,iops_rd=1" }
+      }
+      return {}
+    })
+
+    const { POST } = await import("./route")
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: "ceph-nvme:backup/vzdump-qemu-111-2026_08_11-15_51_33.vma.zst", type: "qemu" },
+    })
+    expect(res.status).toBe(200)
+
+    expect(afterCbs.length).toBeGreaterThan(0)
+    for (const cb of afterCbs) await cb()
+
+    const putCall = restoredConfigCall()
+    expect(putCall).toBeTruthy()
+    const patch = new URLSearchParams(String(putCall?.[2]?.body))
+    expect(patch.get("scsi0")).toBe("ceph-nvme:vm-111-disk-0,size=32G,iops_rd=5000,iops_wr=4000,mbps_rd=500")
+  })
+
+  it("no policies on the connection: no restamp PUT", async () => {
+    getCurrentTenantIdMock.mockResolvedValue("tenant-x")
+    getInfraMock.mockResolvedValue(iaasScope(["ceph-nvme"]))
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: "vdc-1", poolName: "pool-1", quota: null })
+    unisphereFetchMock.mockImplementation(async (_conn: any, path: string, opts?: any) => {
+      if (opts?.method === "POST") return "UPID:unisphere-1:00000000:00000000:00000000:qmrestore:111:root@pam:"
+      if (opts?.method === "PUT") return null
+      if (String(path).endsWith("/qemu/111/config")) {
+        return { scsi0: "ceph-nvme:vm-111-disk-0,size=32G" }
+      }
+      return {}
+    })
+
+    const { POST } = await import("./route")
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: "ceph-nvme:backup/vzdump-qemu-111-2026_08_11-15_51_33.vma.zst", type: "qemu" },
+    })
+    expect(res.status).toBe(200)
+
+    for (const cb of afterCbs) await cb()
+
+    expect(restoredConfigCall()).toBeUndefined()
+  })
+
+  it("provider: unchanged, no restamp attempted", async () => {
+    getCurrentTenantIdMock.mockResolvedValue("default")
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    unisphereFetchMock.mockImplementation(async (_conn: any, path: string, opts?: any) => {
+      if (opts?.method === "POST") return "UPID:unisphere-1:00000000:00000000:00000000:qmrestore:111:root@pam:"
+      if (opts?.method === "PUT") return null
+      if (String(path).endsWith("/qemu/111/config")) {
+        return { scsi0: "local-lvm:vm-111-disk-0,size=32G,iops_rd=1" }
+      }
+      return {}
+    })
+
+    const { POST } = await import("./route")
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { id: "unisphere-1", node: "node1" },
+      body: { vmid: 111, archive: VZDUMP_QEMU_VOLID, type: "qemu" },
+    })
+    expect(res.status).toBe(200)
+
+    for (const cb of afterCbs) await cb()
+
+    expect(restoredConfigCall()).toBeUndefined()
+  })
+})

@@ -1,0 +1,16 @@
+# Reviewed false positives in the rewritten internal candidate history.
+# Keep these fingerprint-specific so new findings in the same files still fail.
+b467297972749a30296083601c104bc9221f800e:.github/workflows/docker-publish.yml:generic-api-key:584
+b467297972749a30296083601c104bc9221f800e:frontend/src/app/api/v1/connections/route.test.ts:private-key:247
+b467297972749a30296083601c104bc9221f800e:frontend/src/components/settings/api-tokens/CreateTokenDialog.tsx:generic-api-key:61
+b467297972749a30296083601c104bc9221f800e:frontend/src/components/settings/api-tokens/ApiTokensTab.test.tsx:generic-api-key:56
+b467297972749a30296083601c104bc9221f800e:frontend/src/lib/auth/config.ts:generic-api-key:590
+b467297972749a30296083601c104bc9221f800e:frontend/src/lib/auth/config.ts:generic-api-key:642
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:.github/workflows/docker-publish.yml:generic-api-key:584
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/app/(dashboard)/infrastructure/inventory/tabs/pbs/PbsSubscriptionTab.test.tsx:generic-api-key:23
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/app/api/v1/connections/route.test.ts:private-key:247
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/components/settings/api-tokens/CreateTokenDialog.tsx:generic-api-key:61
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/components/settings/api-tokens/ApiTokensTab.test.tsx:generic-api-key:56
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/lib/auth/config.ts:generic-api-key:638
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/src/lib/auth/config.ts:generic-api-key:690
+42d62f68ef8bc207a8a7bf91e407ae7b79e40505:frontend/public/xterm/xterm.bundle.js:generic-api-key:3409

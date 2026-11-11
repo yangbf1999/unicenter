@@ -1,0 +1,224 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { NextResponse } from 'next/server'
+
+const getConnectionByIdMock = vi.fn()
+const unisphereFetchMock = vi.fn()
+const locateVmInClusterMock = vi.fn()
+const checkPermissionMock = vi.fn()
+const executeSSHMock = vi.fn()
+const getNodeIpMock = vi.fn()
+
+vi.mock('@/lib/connections/getConnection', () => ({
+  getConnectionById: (...args: unknown[]) => getConnectionByIdMock(...args),
+}))
+
+vi.mock('@/lib/esage/client', () => ({
+  unisphereFetch: (...args: unknown[]) => unisphereFetchMock(...args),
+}))
+
+vi.mock('@/lib/esage/locateVm', () => ({
+  locateVmInCluster: (...args: unknown[]) => locateVmInClusterMock(...args),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: (...args: unknown[]) => checkPermissionMock(...args),
+  buildVmResourceId: (id: string, node: string, type: string, vmid: string) =>
+    `${id}/${node}/${type}/${vmid}`,
+  PERMISSIONS: { VM_CONSOLE: 'vm.console' },
+}))
+
+vi.mock('@/lib/ssh/exec', () => ({
+  executeSSH: (...args: unknown[]) => executeSSHMock(...args),
+}))
+
+vi.mock('@/lib/ssh/node-ip', () => ({
+  getNodeIp: (...args: unknown[]) => getNodeIpMock(...args),
+}))
+
+import { GET, pruneScreenshotCaches } from './route'
+
+// A minimal valid P6 PPM (2x1: red, green) as the node would return it over
+// SSH: base64-encoded. The route re-encodes this to JPEG.
+const PPM_B64 = Buffer.concat([
+  Buffer.from('P6\n2 1\n255\n', 'ascii'),
+  Buffer.from([255, 0, 0, 0, 255, 0]),
+]).toString('base64')
+
+// Each test uses a unique id/vmid so the module-level screenshot and
+// framebuffer caches (keyed by `id:node:vmid`) never bleed across cases.
+let seq = 0
+function makeCtx(over: Partial<{ id: string; type: string; node: string; vmid: string }> = {}) {
+  seq += 1
+  const params = {
+    id: over.id ?? `conn-${seq}`,
+    type: over.type ?? 'qemu',
+    node: over.node ?? 'unisphere1',
+    vmid: over.vmid ?? `${100 + seq}`,
+  }
+  return { params: Promise.resolve(params) }
+}
+
+beforeEach(() => {
+  getConnectionByIdMock.mockReset()
+  unisphereFetchMock.mockReset()
+  locateVmInClusterMock.mockReset()
+  checkPermissionMock.mockReset()
+  executeSSHMock.mockReset()
+  getNodeIpMock.mockReset()
+
+  checkPermissionMock.mockResolvedValue(null) // allow by default
+  getConnectionByIdMock.mockResolvedValue({ id: 'c', baseUrl: 'https://unisphere:8006', apiToken: 't' })
+  getNodeIpMock.mockResolvedValue('10.0.0.1')
+})
+
+describe('GET .../screenshot — display detection', () => {
+  it('returns reason=no_display for a serial-only VM and never runs SSH', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'serial0' })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+    const body = await res.json()
+
+    expect(body).toEqual({ data: null, reason: 'no_display' })
+    expect(executeSSHMock).not.toHaveBeenCalled()
+  })
+
+  it('treats vga: none (e.g. GPU passthrough) as no_display', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'none' })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+    const body = await res.json()
+
+    expect(body.reason).toBe('no_display')
+    expect(executeSSHMock).not.toHaveBeenCalled()
+  })
+
+  it('captures a screenshot for a graphical VM (vga: std) and returns image/jpeg', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'std' })
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: `${PPM_B64}\n` })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('image/jpeg')
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    // JPEG Start-Of-Image marker.
+    expect([bytes[0], bytes[1]]).toEqual([0xff, 0xd8])
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats an absent vga (default std) as graphical and proceeds to SSH', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({})
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: PPM_B64 })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+
+    expect(res.headers.get('content-type')).toContain('image/jpeg')
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries on the relocated node and reports it via X-Screenshot-Moved-To', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'std' })
+    // First node has no such VM (migrated away); locate finds it on unisphere2.
+    executeSSHMock.mockResolvedValueOnce({ success: false, error: 'no such vm' })
+    locateVmInClusterMock.mockResolvedValueOnce({ node: 'unisphere2' })
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: PPM_B64 })
+
+    const res = await GET(new Request('http://localhost'), makeCtx({ node: 'unisphere1' }))
+
+    expect(res.headers.get('content-type')).toContain('image/jpeg')
+    expect(res.headers.get('x-screenshot-moved-to')).toBe('unisphere2')
+    expect(executeSSHMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns reason=decode_failed when the capture is not a valid PPM', async () => {
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'std' })
+    // 'QkFTRTY0' decodes to "BASE64" — not a P6 PPM, so JPEG encoding fails.
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: 'QkFTRTY0\n' })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+    const body = await res.json()
+
+    expect(res.headers.get('content-type')).toContain('application/json')
+    expect(body.reason).toBe('decode_failed')
+  })
+
+  it('serves the cached frame as image/jpeg on the second poll without re-running SSH', async () => {
+    const ctxArgs = { id: 'screenshot-cache', node: 'unisphere1', vmid: '999' }
+    unisphereFetchMock.mockResolvedValue({ vga: 'std' })
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: PPM_B64 })
+
+    const first = await GET(new Request('http://localhost'), makeCtx(ctxArgs))
+    const second = await GET(new Request('http://localhost'), makeCtx(ctxArgs))
+
+    expect(first.headers.get('content-type')).toContain('image/jpeg')
+    expect(second.headers.get('content-type')).toContain('image/jpeg')
+    expect(second.headers.get('x-screenshot-cache')).toBe('hit')
+    // Second poll hit the cache, so SSH ran exactly once.
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('caches the no_display verdict: a second poll does not re-probe the config', async () => {
+    const ctxArgs = { id: 'cached-conn', node: 'unisphere1', vmid: '777' }
+    unisphereFetchMock.mockResolvedValueOnce({ vga: 'serial0' })
+
+    const first = await (await GET(new Request('http://localhost'), makeCtx(ctxArgs))).json()
+    const second = await (await GET(new Request('http://localhost'), makeCtx(ctxArgs))).json()
+
+    expect(first.reason).toBe('no_display')
+    expect(second.reason).toBe('no_display')
+    // Config probed once; the second call is served from hasFramebufferCache.
+    expect(unisphereFetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls through to the screendump path when the config probe fails', async () => {
+    unisphereFetchMock.mockRejectedValueOnce(new Error('node down'))
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: PPM_B64 })
+
+    const res = await GET(new Request('http://localhost'), makeCtx())
+
+    expect(res.headers.get('content-type')).toContain('image/jpeg')
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('short-circuits LXC guests before any display probe', async () => {
+    const res = await GET(new Request('http://localhost'), makeCtx({ type: 'lxc' }))
+    const body = await res.json()
+
+    expect(body).toEqual({ data: null, reason: 'lxc' })
+    expect(unisphereFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('pruneScreenshotCaches evicts stale entries so the VM is re-probed', async () => {
+    const ctxArgs = { id: 'prune-conn', node: 'unisphere1', vmid: '888' }
+    unisphereFetchMock.mockResolvedValue({ vga: 'serial0' })
+
+    // First poll populates the framebuffer cache.
+    await GET(new Request('http://localhost'), makeCtx(ctxArgs))
+    expect(unisphereFetchMock).toHaveBeenCalledTimes(1)
+
+    // Far-future "now" makes every entry older than 2x its TTL → evicted.
+    pruneScreenshotCaches(Date.now() + 10 * 60_000)
+
+    // Cache miss now, so the config is probed again rather than served stale.
+    await GET(new Request('http://localhost'), makeCtx(ctxArgs))
+    expect(unisphereFetchMock).toHaveBeenCalledTimes(2)
+  })
+})
+
+// The [vmid] segment is interpolated into `qm monitor ${vmid}` / the tmp file
+// path in the SSH command, so a non-numeric vmid must be rejected up front —
+// before the config probe or any SSH runs.
+describe('GET .../screenshot — vmid validation (command injection)', () => {
+  const MALICIOUS = ['1; touch /tmp/pwn', '$(id)', '`whoami`', '1 && reboot', '100abc', '../../etc']
+
+  for (const vmid of MALICIOUS) {
+    it(`rejects ${JSON.stringify(vmid)} with 400 and never probes or runs SSH`, async () => {
+      const res = await GET(new Request('http://localhost'), makeCtx({ vmid }))
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body).toEqual({ data: null, reason: 'invalid_vmid' })
+      expect(unisphereFetchMock).not.toHaveBeenCalled()
+      expect(executeSSHMock).not.toHaveBeenCalled()
+    })
+  }
+})

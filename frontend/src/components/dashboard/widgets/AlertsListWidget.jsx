@@ -1,0 +1,271 @@
+'use client'
+
+import React, { useState } from 'react'
+
+import { useRouter } from 'next/navigation'
+
+import { useTranslations } from 'next-intl'
+import {
+  Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle,
+  Divider, IconButton, Table, TableBody, TableCell, TableRow, Typography, useTheme
+} from '@mui/material'
+
+import { widgetColors } from './themeColors'
+
+// ─── Entity icon with status dot ─────────────────────────────────────────────
+function EntityIcon({ entityType, severity, isDark }) {
+  const dotColor = severity === 'crit' ? '#f44336' : severity === 'warn' ? '#ff9800' : '#3b82f6'
+  const isNode = entityType === 'node'
+
+  const icon = isNode ? null
+    : entityType === 'cluster' ? 'ri-server-line'
+    : entityType === 'server' ? 'ri-shield-check-line'
+    : 'ri-alarm-warning-line'
+
+  return (
+    <Box sx={{ position: 'relative', width: 16, height: 16, flexShrink: 0 }}>
+      {isNode
+        ? <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 14, opacity: 0.8 }} />
+        : <i className={icon} style={{ fontSize: '1rem', opacity: 0.7 }} />
+      }
+      <Box sx={{
+        position: 'absolute', bottom: -1, right: -1, width: 6, height: 6, borderRadius: '50%',
+        bgcolor: dotColor, border: '1.5px solid', borderColor: isDark ? '#1e1e2d' : '#fff',
+      }} />
+    </Box>
+  )
+}
+
+// ─── Detail Dialog ───────────────────────────────────────────────────────────
+function NodeLabel({ name, online, isDark }) {
+  return (
+    <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}>
+      <Box sx={{ position: 'relative', width: 16, height: 16, flexShrink: 0 }}>
+        <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 14, opacity: 0.8 }} />
+        <Box sx={{ position: 'absolute', bottom: -1, right: -1, width: 7, height: 7, borderRadius: '50%', bgcolor: online !== false ? '#4caf50' : '#f44336', border: '1.5px solid', borderColor: 'background.paper' }} />
+      </Box>
+      {name}
+    </Box>
+  )
+}
+
+function AlertDetailDialog({ alert, open, onClose, onNavigate, router, t, nodeStatusMap, isDark }) {
+  if (!alert) return null
+
+  const severityConfig = {
+    crit: { label: 'CRITICAL', color: 'error' },
+    warn: { label: 'WARNING', color: 'warning' },
+    info: { label: 'INFO', color: 'info' },
+  }
+
+  const cfg = severityConfig[alert.severity] || severityConfig.info
+
+  function getEntityLink(a) {
+    if (a.entityType === 'node' && a.connId && a.entityId) return `/infrastructure/inventory?selectType=node&selectId=${a.connId}:${a.entityId}`
+    if (a.entityType === 'cluster' && a.connId) return `/infrastructure/inventory?selectType=cluster&selectId=${a.connId}`
+    
+return null
+  }
+
+  const entityLink = getEntityLink(alert)
+
+  const sourceValue = entityLink ? (
+    <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}>
+      <Box sx={{ position: 'relative', width: 16, height: 16, flexShrink: 0 }}>
+        <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 14, opacity: 0.8 }} />
+        <Box sx={{ position: 'absolute', bottom: -1, right: -1, width: 7, height: 7, borderRadius: '50%', bgcolor: nodeStatusMap?.[alert.source] !== false ? '#4caf50' : '#f44336', border: '1.5px solid', borderColor: 'background.paper' }} />
+      </Box>
+      <Typography
+        variant='body2' component='span'
+        sx={{ fontSize: '0.9286rem', color: 'primary.main', cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
+        onClick={() => { router.push(entityLink); onClose() }}
+      >
+        {alert.source} <i className='ri-external-link-line' style={{ fontSize: '0.7857rem' }} />
+      </Typography>
+    </Box>
+  ) : <NodeLabel name={alert.source} online={nodeStatusMap?.[alert.source]} isDark={isDark} />
+
+  const nodeOnline = nodeStatusMap?.[alert.entityName] ?? nodeStatusMap?.[alert.source]
+
+  const rows = [
+    { label: t('alerts.detail.severity'), value: <Chip size='small' label={cfg.label} color={cfg.color} sx={{ height: 22, fontSize: '0.7857rem' }} /> },
+    { label: t('alerts.detail.message'), value: alert.message },
+    { label: t('alerts.detail.source'), value: sourceValue },
+    { label: t('alerts.detail.sourceType'), value: (alert.sourceType || 'unisphere').toUpperCase() },
+    alert.entityName && { label: t('alerts.detail.entity'), value: alert.entityType === 'node'
+      ? <NodeLabel name={alert.entityName} online={nodeOnline} isDark={isDark} />
+      : alert.entityName },
+    alert.entityType && { label: t('alerts.detail.entityType'), value: alert.entityType },
+    alert.metric && { label: t('alerts.detail.metric'), value: alert.metric },
+    alert.currentValue != null && { label: t('alerts.detail.currentValue'), value: `${alert.currentValue}%` },
+    alert.threshold != null && { label: t('alerts.detail.threshold'), value: `${alert.threshold}%` },
+    alert.time && { label: t('alerts.detail.time'), value: new Date(alert.time).toLocaleString() },
+  ].filter(Boolean)
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth='sm' fullWidth>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', pb: 1 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className='ri-alarm-warning-line' style={{ fontSize: '1.4286rem' }} />
+          {t('alerts.detail.title')}
+        </Box>
+        <IconButton size='small' onClick={onClose}><i className='ri-close-line' /></IconButton>
+      </DialogTitle>
+      <Divider />
+      <DialogContent sx={{ p: 0 }}>
+        <Table size='small'>
+          <TableBody>
+            {rows.map((row, idx) => (
+              <TableRow key={idx}>
+                <TableCell sx={{ fontWeight: 600, width: 140, color: 'text.secondary', fontSize: '0.9286rem', border: 'none', py: 1.25, pl: 3 }}>{row.label}</TableCell>
+                <TableCell sx={{ fontSize: '0.9286rem', border: 'none', py: 1.25 }}>{row.value}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </DialogContent>
+      <Divider />
+      <DialogActions sx={{ px: 3, py: 1.5 }}>
+        {onNavigate && (
+          <Button variant='outlined' size='small' startIcon={<i className='ri-external-link-line' />} onClick={() => { onNavigate(); onClose() }}>
+            {t('alerts.detail.goToEntity')}
+          </Button>
+        )}
+        <Button onClick={onClose} size='small'>{t('alerts.detail.close')}</Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+// ─── Main Widget ─────────────────────────────────────────────────────────────
+function AlertsListWidget({ data, loading }) {
+  const t = useTranslations()
+  const router = useRouter()
+  const theme = useTheme()
+  const isDark = theme.palette.mode === 'dark'
+  const c = widgetColors(isDark)
+  const [selectedAlert, setSelectedAlert] = useState(null)
+
+  const alerts = data?.alerts || []
+
+  // Build node name -> online status map
+  const nodeStatusMap = {}
+
+  for (const n of (data?.nodes || [])) {
+    nodeStatusMap[n.name] = n.status === 'online'
+  }
+
+  function getAlertLink(alert) {
+    if (alert.entityType === 'node' && alert.connId && alert.entityId) return `/infrastructure/inventory?selectType=node&selectId=${alert.connId}:${alert.entityId}`
+    if (alert.entityType === 'cluster' && alert.entityId) return `/infrastructure/inventory?selectType=cluster&selectId=${alert.entityId}`
+    
+return null
+  }
+
+  function timeAgo(date) {
+    const now = new Date()
+    const past = new Date(date)
+    const diff = Math.floor((now - past) / 1000)
+
+    if (diff < 60) return t('time.justNow')
+    if (diff < 3600) return t('time.minutesAgo', { count: Math.floor(diff / 60) })
+    if (diff < 86400) return t('time.hoursAgo', { count: Math.floor(diff / 3600) })
+    
+return t('time.daysAgo', { count: Math.floor(diff / 86400) })
+  }
+
+  function getSeverityColor(severity) {
+    if (severity === 'crit') return '#f44336'
+    if (severity === 'warn') return '#ff9800'
+    
+return '#3b82f6'
+  }
+
+  const darkCard = {
+    bgcolor: isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.03)',
+    border: '1px solid', borderColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+    borderRadius: 'var(--unicenter-card-radius)', p: 1.5,
+    transition: 'border-color 0.2s, box-shadow 0.2s',
+    '&:hover': { borderColor: c.surfaceActive, boxShadow: isDark ? '0 2px 8px rgba(0,0,0,0.3)' : '0 2px 8px rgba(0,0,0,0.08)' },
+  }
+
+  if (alerts.length === 0) {
+    return (
+      <Box sx={{ height: '100%', ...darkCard, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: 0.65 }}>
+          <i className='ri-checkbox-circle-line' style={{ fontSize: '1.2857rem', color: '#4caf50' }} />
+          <Typography sx={{ fontSize: '0.8571rem' }}>{t('alerts.noActiveAlerts')}</Typography>
+        </Box>
+      </Box>
+    )
+  }
+
+  return (
+    <>
+      <Box sx={{ height: '100%', ...darkCard, overflow: 'auto' }}>
+        {alerts.map((alert, idx) => {
+          const sevColor = getSeverityColor(alert.severity)
+          const sevLabel = alert.severity === 'crit' ? 'CRIT' : alert.severity === 'warn' ? 'WARN' : 'INFO'
+
+          return (
+            <Box
+              key={idx}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => setSelectedAlert(alert)}
+              sx={{
+                display: 'flex', alignItems: 'center', gap: 0.75,
+                px: 0.75, py: 0.6,
+                borderBottom: idx < alerts.length - 1 ? `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` : 'none',
+                cursor: 'pointer',
+                '&:hover': { bgcolor: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)' },
+              }}
+            >
+              {/* Severity badge */}
+              <Box sx={{
+                px: 0.5, py: 0.1, borderRadius: 0.5, flexShrink: 0,
+                bgcolor: `${sevColor}18`, color: sevColor,
+                fontSize: '0.5714rem', fontWeight: 800, fontFamily: '"JetBrains Mono", monospace', lineHeight: 1.4,
+              }}>
+                {sevLabel}
+              </Box>
+
+              {/* Message */}
+              <Typography sx={{ fontSize: '0.7857rem', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>
+                {alert.message}
+              </Typography>
+
+              {/* Source with server-line icon + node online status dot */}
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.4, flexShrink: 0 }}>
+                <Box sx={{ position: 'relative', width: 14, height: 14, flexShrink: 0 }}>
+                  <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 12, opacity: 0.7 }} />
+                  <Box sx={{ position: 'absolute', bottom: -1, right: -1, width: 5, height: 5, borderRadius: '50%', bgcolor: nodeStatusMap[alert.source] === false ? '#f44336' : '#4caf50', border: '1px solid', borderColor: isDark ? '#1e1e2d' : '#fff' }} />
+                </Box>
+                <Typography sx={{ fontSize: '0.6429rem', opacity: 0.65, fontFamily: '"JetBrains Mono", monospace', maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {alert.source}
+                </Typography>
+              </Box>
+
+              {/* Time ago */}
+              <Typography sx={{ fontSize: '0.6429rem', opacity: 0.5, flexShrink: 0 }}>
+                {timeAgo(alert.time)}
+              </Typography>
+            </Box>
+          )
+        })}
+      </Box>
+
+      <AlertDetailDialog
+        alert={selectedAlert}
+        open={!!selectedAlert}
+        onClose={() => setSelectedAlert(null)}
+        onNavigate={selectedAlert && getAlertLink(selectedAlert) ? () => router.push(getAlertLink(selectedAlert)) : null}
+        router={router}
+        t={t}
+        nodeStatusMap={nodeStatusMap}
+        isDark={isDark}
+      />
+    </>
+  )
+}
+
+export default React.memo(AlertsListWidget)

@@ -1,0 +1,155 @@
+name: SonarCloud (PR gate)
+
+# Pre-merge analysis only. Goal: nothing degrades the rating on main, so
+# the public badge stays AAA. SonarCloud's automatic analysis on the
+# SonarCloud side keeps refreshing the main branch rating after merge,
+# this workflow gates the PR before it can land.
+#
+# Make this check required in branch protection ("Settings -> Branches ->
+# main -> Require status checks -> SonarCloud Code Analysis") so a failed
+# Quality Gate blocks the merge.
+
+on:
+  pull_request:
+    branches: [main]
+  # Also analyze main after each merge so SonarCloud has a fresh baseline
+  # to compare PRs against. Without this trigger the project's new-code
+  # period drifts and pre-existing issues start showing up as "new" on
+  # every PR. The PR gate above prevents anything that would degrade the
+  # rating from reaching main, so main keeps its AAA after analysis.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sonar:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: SonarCloud Code Analysis
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: unicenter
+          POSTGRES_PASSWORD: test-pass
+          POSTGRES_DB: unicenter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U unicenter -d unicenter"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Sonar needs full history for blame / SCM info / new-code detection.
+          fetch-depth: 0
+
+      - name: Check SonarCloud configuration
+        id: sonar-config
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_PROJECT_KEY" ] && [ -n "$SONAR_ORGANIZATION" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SonarCloud is not configured; analysis is skipped until SONAR_TOKEN, SONAR_PROJECT_KEY, and SONAR_ORGANIZATION are provided."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Generate Prisma client
+        working-directory: frontend
+        env:
+          DATABASE_URL: postgresql://unicenter:test-pass@localhost:5432/unicenter
+        run: npx prisma generate
+
+      - name: Install psql client
+        # The Vitest globalSetup shells out to psql to create / drop the
+        # per-run schema; ubuntu-latest images ship without it.
+        run: sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Run scripts unit tests
+        # The coverage ratchet's own unit test (pure logic, no DB). Isolated
+        # scripts config, so it is not part of the coverage suite.
+        working-directory: frontend
+        run: npm run test:scripts
+
+      - name: Run tests with coverage
+        working-directory: frontend
+        env:
+          POSTGRES_TEST_URL_BASE: postgresql://unicenter:test-pass@localhost:5432/unicenter
+        # Produces frontend/coverage/lcov.info which sonar-project.properties
+        # references via sonar.javascript.lcov.reportPaths.
+        run: npm run test:coverage
+
+      - name: Rewrite LCOV paths for Sonar
+        if: steps.sonar-config.outputs.enabled == 'true'
+        # Vitest runs from `frontend/`, so the LCOV SF: lines look like
+        # `src/lib/...`. Sonar runs from the repo root and expects
+        # `frontend/src/lib/...` (matches sonar.sources). Without this
+        # rewrite Sonar logs "Could not resolve <N> file paths" and
+        # new_coverage stays at 0 %.
+        run: |
+          if [ -f frontend/coverage/lcov.info ]; then
+            sed -i 's|^SF:src/|SF:frontend/src/|' frontend/coverage/lcov.info
+            echo "Rewrote LCOV paths (first 3 SF lines):"
+            grep -m 3 '^SF:' frontend/coverage/lcov.info || true
+          else
+            echo "No LCOV produced at frontend/coverage/lcov.info"
+            exit 1
+          fi
+
+      - name: SonarCloud scan
+        if: steps.sonar-config.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          # Wait for the Quality Gate ONLY on pull requests, so a failing gate
+          # blocks the merge before it can degrade the rating. On push to main
+          # the analysis just refreshes the new-code baseline; that post-merge
+          # run must not fail on the gate (the merge already happened), or
+          # main's check goes red for new code that already landed.
+          # node.maxspace gives the JS/TS analyzer's Node bridge an 8 GB heap.
+          # The default heap AND 4 GB both OOM on the full main analysis (~182k
+          # LOC): the run logged "running out of memory (heap size limit 4288
+          # MB)" then "bridge server is unresponsive" (gRPC Goaway), failing
+          # every push to main since 2026-06-14 so the main coverage/rating
+          # never refreshed. The runner has ~16 GB, so 8 GB leaves room for the
+          # JVM scanner. PR analysis (changed files only) stayed under the limit.
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=${{ github.event_name == 'pull_request' }}
+            -Dsonar.javascript.node.maxspace=8192
+
+      - name: Coverage ratchet (main only)
+        # The SonarCloud scan above already populated the branch measures.
+        # Per-PR coverage is enforced by the Quality Gate (new-code >=80%);
+        # this step guards the OVERALL number on main against silent drift.
+        if: steps.sonar-config.outputs.enabled == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: frontend
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+          SONAR_BRANCH: main
+        run: node scripts/coverage-ratchet.mjs

@@ -1,0 +1,126 @@
+name: Community CI and Container
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/unicenter-frontend
+
+jobs:
+  test:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: unicenter
+          POSTGRES_PASSWORD: test-pass
+          POSTGRES_DB: unicenter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U unicenter -d unicenter"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://unicenter:test-pass@localhost:5432/unicenter
+        run: npx prisma generate
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+        working-directory: .
+
+      - name: Run script tests
+        run: npm run test:scripts
+
+      - name: Run frontend tests
+        env:
+          POSTGRES_TEST_URL_BASE: postgresql://unicenter:test-pass@localhost:5432/unicenter
+        run: npm test
+
+      - name: Build icon CSS
+        # npm ci runs with --ignore-scripts in CI, so the postinstall hook
+        # does not generate the CSS imported by the Next.js root layout.
+        run: npm run build:icons
+
+      - name: Build production application
+        env:
+          DATABASE_URL: postgresql://unicenter:test-pass@localhost:5432/unicenter
+          APP_SECRET: ci-only-not-for-production
+          NEXTAUTH_SECRET: ci-only-not-for-production
+        run: npm run build
+
+  container:
+    name: Build Community container
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and optionally publish
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64

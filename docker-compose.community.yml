@@ -1,0 +1,141 @@
+# ============================================
+# UniCenter Community Edition
+# Frontend only - No orchestrator required
+# ============================================
+
+services:
+  # ========================================
+  # Frontend (Next.js + WebSocket Proxy)
+  # ========================================
+  frontend:
+    image: ${UNICENTER_IMAGE:-unicenter-frontend:1.0.0}
+    container_name: unicenter-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # Unified HTTP + WebSocket
+    environment:
+      - NODE_ENV=production
+      # UniCenter speaks Postgres only since the SQLite cutover. The
+      # bundled `postgres` service below holds every table.
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-unicenter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-unicenter}?schema=public
+      - APP_SECRET=${APP_SECRET}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - AUTH_TRUST_HOST=${AUTH_TRUST_HOST:-true}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-}
+      - APP_URL=${APP_URL:-}
+      - NEXT_PUBLIC_GITHUB_REPO=${NEXT_PUBLIC_GITHUB_REPO:-yangbf1999/unicenter}
+      - AUTH_COOKIE_PREFIX=${AUTH_COOKIE_PREFIX:-}
+      # Identity this instance stamps on the migration jobs it runs, so a boot
+      # can fail the ones its previous incarnation left behind (#608). Fixed on
+      # purpose: the container id changes on every image upgrade, which would
+      # delay the cleanup of a job interrupted by that very upgrade. Only ever
+      # one frontend per stack here; give each instance its own value if you
+      # point several at one database.
+      - UNICENTER_INSTANCE_ID=${UNICENTER_INSTANCE_ID:-unicenter-frontend}
+      # Session lifetimes, in seconds. Left empty on purpose: the frontend
+      # then applies its defaults, 12 hours of inactivity and 7 days absolute.
+      # A malformed value falls back to those defaults rather than to no limit.
+      - SESSION_IDLE_TIMEOUT=${SESSION_IDLE_TIMEOUT:-}
+      - SESSION_ABSOLUTE_TIMEOUT=${SESSION_ABSOLUTE_TIMEOUT:-}
+      # Cloud image catalog: point TEMPLATE_CATALOG_URL at an internal mirror,
+      # or set TEMPLATE_CATALOG_AUTO_UPDATE=false on an air-gapped install.
+      - TEMPLATE_CATALOG_URL=${TEMPLATE_CATALOG_URL:-}
+      - TEMPLATE_CATALOG_AUTO_UPDATE=${TEMPLATE_CATALOG_AUTO_UPDATE:-}
+      # Air-gapped instance: no version check, no GitHub badge, no catalog
+      # refresh, and the maps say why they cannot show tiles. Leave empty on a
+      # connected site; set it explicitly for a manually mirrored deployment.
+      - UNICENTER_OFFLINE=${UNICENTER_OFFLINE:-}
+      # Shared secret for the first-run setup endpoint, which is reachable
+      # without authentication for as long as no account exists. Empty keeps
+      # the historical behaviour. Set it when the first boot happens on a
+      # network someone else can reach, then send the same value as the
+      # x-setup-token header of the setup request.
+      - UNICENTER_SETUP_TOKEN=${UNICENTER_SETUP_TOKEN:-}
+      # eSage API budgets in milliseconds. Empty keeps the defaults: 8000 for
+      # a regular call, 30000 for the reads that enumerate every storage. Raise
+      # the slow one on a datacenter declaring many PBS targets.
+      - UNISPHERE_TIMEOUT_MS=${UNISPHERE_TIMEOUT_MS:-}
+      - UNISPHERE_SLOW_READ_TIMEOUT_MS=${UNISPHERE_SLOW_READ_TIMEOUT_MS:-}
+      # Current v1.0 Community deployment has no external orchestrator.
+      #
+      # Docker Secrets support (Swarm / file-based):
+      # Instead of setting APP_SECRET directly, point to a secret file:
+      # - APP_SECRET_FILE=/run/secrets/app_secret
+      # - NEXTAUTH_SECRET_FILE=/run/secrets/nextauth_secret
+    volumes:
+      - unicenter_data:/app/data
+    # secrets:
+    #   - app_secret
+    #   - nextauth_secret
+    networks:
+      - unicenter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ========================================
+  # Postgres (application database)
+  # ========================================
+  # Single source of truth for UniCenter data. The frontend connects to this
+  # instance over the internal network.
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: unicenter-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-unicenter}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (see .env.example)}
+      - POSTGRES_DB=${POSTGRES_DB:-unicenter}
+      # Performance + correctness: stop the server if a write fails on disk
+      # rather than silently corrupting the WAL. Defaults are fine but we
+      # pin them to avoid surprises across postgres image versions.
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No ports: published on purpose. Postgres is reached over the internal
+    # `unicenter` network only. Uncomment to expose it to the host for
+    # debugging with psql / DBeaver / pgAdmin.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    networks:
+      - unicenter
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-unicenter} -d ${POSTGRES_DB:-unicenter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# ========================================
+# Networks
+# ========================================
+networks:
+  unicenter:
+    driver: bridge
+    name: unicenter
+
+# ========================================
+# Volumes
+# ========================================
+# ========================================
+# Secrets (uncomment for Docker Swarm)
+# ========================================
+# secrets:
+#   app_secret:
+#     external: true
+#   nextauth_secret:
+#     external: true
+
+volumes:
+  unicenter_data:
+    name: unicenter_data
+    external: true
+  postgres_data:
+    name: postgres_data
+    external: true

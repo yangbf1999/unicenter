@@ -1,0 +1,193 @@
+import { describe, it, expect } from 'vitest'
+
+import { aggregateStorage, normalizeStorageEntry, storageFormats, vmDiskFormats } from './storage'
+
+const TiB = 1024 ** 4
+
+function raw(over: Partial<any> = {}) {
+  return {
+    connId: 'c1', connName: 'UNISPHERE-1', node: 'n1',
+    storage: 'local-lvm', type: 'lvmthin', shared: false,
+    used: 10 * TiB, total: 20 * TiB, content: ['images'],
+    enabled: true, status: 'available',
+    ...over,
+  }
+}
+
+describe('aggregateStorage', () => {
+  it('keeps same-named storages on different connections separate (#569)', () => {
+    const out = aggregateStorage([
+      raw({ connId: 'c1', connName: 'UNISPHERE-1', node: 'n1', used: 45 * TiB, total: 90 * TiB }),
+      raw({ connId: 'c2', connName: 'UNISPHERE-2', node: 'm1', used: 3 * TiB, total: 15 * TiB }),
+    ])
+    const lvm = out.filter(s => s.storage === 'local-lvm')
+    expect(lvm).toHaveLength(2)
+    expect(lvm.find(s => s.connId === 'c1')!.total).toBe(90 * TiB)
+    expect(lvm.find(s => s.connId === 'c2')!.total).toBe(15 * TiB)
+    expect(lvm.map(s => s.id).sort()).toEqual(['c1:local-lvm', 'c2:local-lvm'])
+  })
+
+  it('sums a local storage across nodes of one cluster and builds nodeBreakdown', () => {
+    const out = aggregateStorage([
+      raw({ node: 'n1', used: 5 * TiB, total: 15 * TiB }),
+      raw({ node: 'n2', used: 6 * TiB, total: 15 * TiB }),
+      raw({ node: 'n3', used: 4 * TiB, total: 15 * TiB }),
+    ])
+    expect(out).toHaveLength(1)
+    expect(out[0].total).toBe(45 * TiB)
+    expect(out[0].used).toBe(15 * TiB)
+    expect(out[0].usedPct).toBe(33.3)
+    expect(out[0].allNodes.sort()).toEqual(['n1', 'n2', 'n3'])
+    expect(out[0].nodeBreakdown).toHaveLength(3)
+    expect(out[0].nodeBreakdown[0].totalFormatted).toBeTruthy()
+  })
+
+  it('treats a shared storage as one pool and is robust to a node reporting 0', () => {
+    const out = aggregateStorage([
+      raw({ storage: 'nfs1', type: 'nfs', shared: true, node: 'n1', used: 0, total: 0 }),
+      raw({ storage: 'nfs1', type: 'nfs', shared: true, node: 'n2', used: 5 * TiB, total: 20 * TiB }),
+    ])
+    expect(out).toHaveLength(1)
+    expect(out[0].shared).toBe(true)
+    expect(out[0].total).toBe(20 * TiB)
+    expect(out[0].used).toBe(5 * TiB)
+    expect(out[0].nodeBreakdown).toHaveLength(1)
+  })
+
+  it('classifies by type when the shared flag is missing (zfs, rbd)', () => {
+    const zfs = aggregateStorage([raw({ storage: 'zi', type: 'zfs', shared: false, node: 'n1', used: TiB, total: 2 * TiB })])
+    const rbd = aggregateStorage([raw({ storage: 'ceph', type: 'rbd', shared: false, node: 'n1', used: TiB, total: 2 * TiB })])
+    expect(zfs[0].shared).toBe(true)
+    expect(rbd[0].shared).toBe(true)
+  })
+
+  it('excludes blank node names from allNodes', () => {
+    const out = aggregateStorage([
+      raw({ storage: 'nfs1', type: 'nfs', shared: true, node: '', used: 5 * TiB, total: 20 * TiB }),
+    ])
+    expect(out[0].allNodes).toEqual([])
+  })
+
+  it('yields (0,0) for a shared storage where every node reports total 0', () => {
+    const out = aggregateStorage([
+      raw({ storage: 'nfs0', type: 'nfs', shared: true, node: 'n1', used: 2 * TiB, total: 0 }),
+      raw({ storage: 'nfs0', type: 'nfs', shared: true, node: 'n2', used: 3 * TiB, total: 0 }),
+    ])
+    expect(out[0].used).toBe(0)
+    expect(out[0].total).toBe(0)
+    expect(out[0].usedPct).toBe(0)
+  })
+
+  it('returns an empty array for empty input', () => {
+    expect(aggregateStorage([])).toEqual([])
+  })
+
+  it('normalizeStorageEntry maps disk/maxdisk and shared 1|0', () => {
+    const e = normalizeStorageEntry({ connId: 'c1', connName: 'X', node: 'n1', storage: 's', plugintype: 'nfs', shared: 1, disk: 5, maxdisk: 10, content: 'images,iso' })
+    expect(e.used).toBe(5)
+    expect(e.total).toBe(10)
+    expect(e.shared).toBe(true)
+    expect(e.type).toBe('nfs')
+    expect(e.content).toEqual(['images', 'iso'])
+  })
+
+  it('carries tenantId and tenantName from the raw entries onto the aggregated row', () => {
+    const rows = aggregateStorage([
+      {
+        connId: 'conn-1',
+        connName: 'UNISPHERE-1',
+        tenantId: 'tenant-a',
+        tenantName: 'Tenant A',
+        node: 'unisphere1-n1',
+        storage: 'local-lvm',
+        type: 'lvmthin',
+        used: 10,
+        total: 100,
+      },
+    ])
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0].tenantId).toBe('tenant-a')
+    expect(rows[0].tenantName).toBe('Tenant A')
+  })
+
+  it('leaves tenantId and tenantName undefined when the raw entries carry none', () => {
+    const rows = aggregateStorage([
+      { connId: 'conn-1', connName: 'UNISPHERE-1', node: 'unisphere1-n1', storage: 'local-lvm', type: 'lvmthin', used: 10, total: 100 },
+    ])
+
+    expect(rows[0].tenantId).toBeUndefined()
+    expect(rows[0].tenantName).toBeUndefined()
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* Format capability per storage (issue #735)                         */
+/* ------------------------------------------------------------------ */
+
+describe('storageFormats', () => {
+  it('gives file-based storages their full set, raw by default', () => {
+    expect(storageFormats({ type: 'dir' })).toEqual({ formats: ['raw', 'qcow2', 'vmdk', 'subvol'], defaultFormat: 'raw' })
+    expect(storageFormats({ type: 'nfs' })).toEqual({ formats: ['raw', 'qcow2', 'vmdk'], defaultFormat: 'raw' })
+    expect(storageFormats({ type: 'cifs' })).toEqual({ formats: ['raw', 'qcow2', 'vmdk'], defaultFormat: 'raw' })
+  })
+
+  it('keeps raw-only storages raw-only', () => {
+    for (const type of ['lvmthin', 'rbd', 'iscsi', 'iscsidirect', 'cephfs', 'pbs', 'unknown-plugin']) {
+      expect(storageFormats({ type })).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+    }
+  })
+
+  it('gives ZFS and Btrfs raw plus the container subvolume', () => {
+    expect(storageFormats({ type: 'zfspool' }).formats).toEqual(['raw', 'subvol'])
+    expect(storageFormats({ type: 'btrfs' }).formats).toEqual(['raw', 'subvol'])
+  })
+
+  // UNISPHERE 9 LVMPlugin::get_formats: qcow2 is valid, and the default, only when
+  // the storage opted into volume-chain snapshots.
+  it('opens qcow2 on an LVM storage that snapshots as volume chain', () => {
+    expect(storageFormats({ type: 'lvm' })).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+    expect(storageFormats({ type: 'lvm', 'snapshot-as-volume-chain': 1 })).toEqual({
+      formats: ['raw', 'qcow2'],
+      defaultFormat: 'qcow2',
+    })
+  })
+
+  it('accepts the option however UNISPHERE spells it', () => {
+    expect(storageFormats({ type: 'lvm', 'snapshot-as-volume-chain': '1' }).formats).toContain('qcow2')
+    expect(storageFormats({ type: 'lvm', 'snapshot-as-volume-chain': true }).formats).toContain('qcow2')
+    expect(storageFormats({ type: 'lvm', 'snapshot-as-volume-chain': 0 }).formats).not.toContain('qcow2')
+  })
+
+  it('honours a format pinned in the storage config', () => {
+    expect(storageFormats({ type: 'dir', format: 'qcow2' }).defaultFormat).toBe('qcow2')
+  })
+
+  it('ignores a pinned format the storage does not accept', () => {
+    expect(storageFormats({ type: 'zfspool', format: 'qcow2' }).defaultFormat).toBe('raw')
+  })
+
+  it('answers raw for a missing config', () => {
+    expect(storageFormats(null)).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+    expect(storageFormats(undefined)).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+    expect(storageFormats({})).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+  })
+})
+
+describe('vmDiskFormats', () => {
+  it('drops subvol, which only ever holds a container', () => {
+    expect(vmDiskFormats({ type: 'dir' }).formats).toEqual(['raw', 'qcow2', 'vmdk'])
+    expect(vmDiskFormats({ type: 'zfspool' })).toEqual({ formats: ['raw'], defaultFormat: 'raw' })
+  })
+
+  it('carries the LVM volume-chain case through', () => {
+    expect(vmDiskFormats({ type: 'lvm', 'snapshot-as-volume-chain': 1 })).toEqual({
+      formats: ['raw', 'qcow2'],
+      defaultFormat: 'qcow2',
+    })
+  })
+
+  it('never returns an empty list', () => {
+    expect(vmDiskFormats({ type: 'whatever' }).formats).toEqual(['raw'])
+  })
+})

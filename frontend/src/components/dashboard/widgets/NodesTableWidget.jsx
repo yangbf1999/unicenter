@@ -1,0 +1,138 @@
+'use client'
+
+import React from 'react'
+
+import { useRouter } from 'next/navigation'
+
+import { useTranslations } from 'next-intl'
+import {
+  Alert, Box, Chip, LinearProgress,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Typography,
+  useTheme
+} from '@mui/material'
+
+import { widgetColors } from './themeColors'
+
+function NodesTableWidget({ data, loading }) {
+  const t = useTranslations()
+  const router = useRouter()
+  const theme = useTheme()
+  const isDark = theme.palette.mode === 'dark'
+  const c = widgetColors(isDark)
+  const nodes = data?.nodes || []
+
+  if (nodes.length === 0) {
+    return (
+      <Box
+        sx={{
+          height: '100%',
+          bgcolor: isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.03)',
+          border: '1px solid', borderColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+          borderRadius: 'var(--unicenter-card-radius)', p: 2,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          transition: 'border-color 0.2s, box-shadow 0.2s',
+          '&:hover': { borderColor: c.surfaceActive, boxShadow: isDark ? '0 2px 8px rgba(0,0,0,0.3)' : '0 2px 8px rgba(0,0,0,0.08)' },
+        }}
+      >
+        <Alert severity='info' sx={{ width: '100%' }}>{t('common.noData')}</Alert>
+      </Box>
+    )
+  }
+
+  const headerBg = c.surfaceHover
+
+  return (
+    <Box
+      sx={{
+        height: '100%',
+        bgcolor: isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.03)',
+        border: '1px solid', borderColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+        borderRadius: 'var(--unicenter-card-radius)',
+        overflow: 'hidden',
+        transition: 'border-color 0.2s, box-shadow 0.2s',
+        '&:hover': { borderColor: c.surfaceActive, boxShadow: isDark ? '0 2px 8px rgba(0,0,0,0.3)' : '0 2px 8px rgba(0,0,0,0.08)' },
+      }}
+    >
+      <TableContainer sx={{ height: '100%', overflow: 'auto' }}>
+        <Table size='small' stickyHeader>
+          <TableHead>
+            <TableRow>
+              <TableCell sx={{ fontWeight: 800, bgcolor: headerBg, fontSize: '0.8571rem', py: 1, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>{t('dashboard.widgets.nodes')}</TableCell>
+              <TableCell sx={{ fontWeight: 800, bgcolor: headerBg, fontSize: '0.8571rem', py: 1, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>{t('inventory.clusters')}</TableCell>
+              <TableCell align='center' sx={{ fontWeight: 800, bgcolor: headerBg, fontSize: '0.8571rem', py: 1, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>{t('common.status')}</TableCell>
+              <TableCell sx={{ fontWeight: 800, bgcolor: headerBg, minWidth: 100, fontSize: '0.8571rem', py: 1, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>{t('monitoring.cpu')}</TableCell>
+              <TableCell sx={{ fontWeight: 800, bgcolor: headerBg, minWidth: 100, fontSize: '0.8571rem', py: 1, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>{t('monitoring.memory')}</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {[...nodes].sort((a, b) => (b.memPct || 0) - (a.memPct || 0)).map((node, idx) => (
+              <TableRow
+                key={idx}
+                hover
+                onClick={() => node.connId && router.push(`/infrastructure/inventory?selectType=node&selectId=${node.connId}:${node.name}`)}
+                sx={{
+                  cursor: node.connId ? 'pointer' : 'default',
+                  '&:hover': { bgcolor: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)' },
+                }}
+              >
+                <TableCell sx={{ py: 0.75, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Box sx={{ position: 'relative', display: 'inline-flex', width: 18, height: 18, flexShrink: 0 }}>
+                      <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 18, opacity: node.status === 'online' ? 0.8 : 0.4 }} />
+                      <Box sx={{ position: 'absolute', bottom: -1, right: -1, width: 8, height: 8, borderRadius: '50%', bgcolor: node.status === 'online' ? '#4caf50' : '#f44336', border: '1.5px solid', borderColor: isDark ? 'rgba(255,255,255,0.03)' : '#fff' }} />
+                    </Box>
+                    <Typography variant='body2' sx={{ fontWeight: 700, fontSize: '0.8571rem' }}>{node.name}</Typography>
+                  </Box>
+                </TableCell>
+                <TableCell sx={{ py: 0.75, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>
+                  <Typography variant='body2' sx={{ opacity: 0.7, fontSize: '0.7857rem' }}>{node.connection}</Typography>
+                </TableCell>
+                <TableCell align='center' sx={{ py: 0.75, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>
+                  <Chip
+                    size='small'
+                    label={node.status === 'online' ? t('common.online') : t('common.offline')}
+                    color={node.status === 'online' ? 'success' : 'error'}
+                    variant='outlined'
+                    sx={{ fontSize: '0.7143rem', height: 20, fontWeight: 600 }}
+                  />
+                </TableCell>
+                <TableCell sx={{ py: 0.75, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>
+                  <Box sx={{ position: 'relative' }}>
+                    <LinearProgress
+                      className='nebula-linear-progress'
+                      variant='determinate'
+                      value={node.cpuPct || 0}
+                      sx={{
+                        '--nebula-progress-color': 'var(--nebula-brand-blue)',
+                        height: 14, borderRadius: 0, bgcolor: c.surfaceActive,
+                        '& .MuiLinearProgress-bar': { borderRadius: 0, background: 'linear-gradient(90deg, #22c55e 0%, #eab308 50%, #ef4444 100%)', backgroundSize: (node.cpuPct || 0) > 0 ? `${(100 / (node.cpuPct || 1)) * 100}% 100%` : '100% 100%' }
+                      }}
+                    />
+                    <Typography variant='caption' sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{node.cpuPct || 0}%</Typography>
+                  </Box>
+                </TableCell>
+                <TableCell sx={{ py: 0.75, borderBottom: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}` }}>
+                  <Box sx={{ position: 'relative' }}>
+                    <LinearProgress
+                      className='nebula-linear-progress'
+                      variant='determinate'
+                      value={node.memPct || 0}
+                      sx={{
+                        '--nebula-progress-color': 'var(--nebula-brand-cyan)',
+                        height: 14, borderRadius: 0, bgcolor: c.surfaceActive,
+                        '& .MuiLinearProgress-bar': { borderRadius: 0, background: 'linear-gradient(90deg, #22c55e 0%, #eab308 50%, #ef4444 100%)', backgroundSize: (node.memPct || 0) > 0 ? `${(100 / (node.memPct || 1)) * 100}% 100%` : '100% 100%' }
+                      }}
+                    />
+                    <Typography variant='caption' sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{node.memPct || 0}%</Typography>
+                  </Box>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    </Box>
+  )
+}
+
+export default React.memo(NodesTableWidget)

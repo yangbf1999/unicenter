@@ -1,0 +1,4953 @@
+'use client'
+
+import React, { useState, useEffect, useMemo } from 'react'
+import { useTranslations, useLocale } from 'next-intl'
+import dynamic from 'next/dynamic'
+import DOMPurify from 'dompurify'
+import ExpandableChart from '../components/ExpandableChart'
+
+import {
+  Alert,
+  Box,
+  Breadcrumbs,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  LinearProgress,
+  List,
+  ListItem,
+  ListItemButton,
+  ListItemIcon,
+  ListItemText,
+  ListSubheader,
+  Menu,
+  MenuItem,
+  Select,
+  Slider,
+  Stack,
+  Switch,
+  Tab,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tabs,
+  TextField,
+  Typography,
+  Collapse,
+  ToggleButton,
+  ToggleButtonGroup,
+  Tooltip as MuiTooltip,
+  alpha,
+  useTheme,
+} from '@mui/material'
+import { AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts'
+import ChartContainer from '@/components/ChartContainer'
+
+import { formatBytes } from '@/utils/format'
+import { formatDateTime } from '@/lib/i18n/date'
+import VmFirewallTab from '@/components/VmFirewallTab'
+import RestoreVmDialog from '@/components/backup/RestoreVmDialog'
+import ChangeTrackingTab from './ChangeTrackingTab'
+import { useLicense, Features } from '@/contexts/LicenseContext'
+import { useRBAC } from '@/contexts/RBACContext'
+const AddDiskDialog = dynamic(() => import('@/components/HardwareModals').then(mod => ({ default: mod.AddDiskDialog })), { ssr: false })
+const AddNetworkDialog = dynamic(() => import('@/components/HardwareModals').then(mod => ({ default: mod.AddNetworkDialog })), { ssr: false })
+const EditDiskDialog = dynamic(() => import('@/components/HardwareModals').then(mod => ({ default: mod.EditDiskDialog })), { ssr: false })
+const EditNetworkDialog = dynamic(() => import('@/components/HardwareModals').then(mod => ({ default: mod.EditNetworkDialog })), { ssr: false })
+const EditScsiControllerDialog = dynamic(() => import('@/components/HardwareModals').then(mod => ({ default: mod.EditScsiControllerDialog })), { ssr: false })
+const DetachConfirmDialog = dynamic(() => import('@/components/hardware/DetachConfirmDialog').then(mod => ({ default: mod.DetachConfirmDialog })), { ssr: false })
+const DeleteUnusedDiskDialog = dynamic(() => import('@/components/hardware/DeleteUnusedDiskDialog').then(mod => ({ default: mod.DeleteUnusedDiskDialog })), { ssr: false })
+
+import type { InventorySelection, DetailsPayload, RrdTimeframe, SeriesPoint, Status } from '../types'
+import { formatBps, formatOsType, formatRrdTick, formatRrdTooltipTs, formatUptime, parseMarkdown, markdownSx, parseNodeId, parseVmId, cpuPct, pct, buildSeriesFromRrd, fetchRrd, machineTypeRow, hotplugDevice, guestNameOptionEdit } from '../helpers'
+import { useTagColors } from '@/contexts/TagColorContext'
+import { useTenant } from '@/contexts/TenantContext'
+import { useToast } from '@/contexts/ToastContext'
+import { AreaPctChart, AreaBpsChart2 } from '../components/RrdCharts'
+import InventorySummary from '../components/InventorySummary'
+import LxcOptionRows from './LxcOptionRows'
+import { SaveIcon, AddIcon, CloseIcon } from '../components/IconWrappers'
+import VdcQuotaBanner from '@/components/inventory/VdcQuotaBanner'
+import NumericTextField from '@/components/ui/NumericTextField'
+import { extractCustomCpuModels, isKnownCpuType } from '@/lib/inventory/cpuModels'
+import { cpuGroupHeaderSx } from '../cpuSelectStyles'
+
+export default function VmDetailTabs(props: any) {
+  const toast = useToast()
+  const t = useTranslations()
+  const locale = useLocale()
+  const theme = useTheme()
+  // Replication and HA are provider-scope operations (cluster-wide resource
+  // planning, node failover policies) — hide their tabs from tenants.
+  const { isAdmin } = useRBAC()
+  // Tenant-only: live vDC quota banner on the Hardware tab so the user
+  // sees the impact of CPU/RAM tweaks before hitting Save (the server still
+  // returns 409 if the projected usage exceeds the quota; this is purely
+  // an anticipation UX). Provider has no vDC scope and the banner hides.
+  const { currentTenant, loading: tenantLoading } = useTenant()
+  const isProviderTenant = !tenantLoading && currentTenant?.id === 'default'
+  const [vdcQuota, setVdcQuota] = useState<{ maxVcpus: number | null; maxRamMb: number | null; maxStorageMb: number | null; maxVms: number | null } | null>(null)
+  const [vdcUsage, setVdcUsage] = useState<{ usedVcpus: number; usedRamMb: number; usedStorageMb: number; usedVms: number } | null>(null)
+  const [hwQuotaBlocked, setHwQuotaBlocked] = useState(false)
+  const vmConnId = props.selection?.id ? parseVmId(props.selection.id).connId : undefined
+  const { getColor: getTagColor } = useTagColors(vmConnId)
+
+  // Modèles CPU custom du cluster (cpu-models.conf). Le Select "CPU Type" est
+  // statique : sans cette liste, une VM configurée en "custom-*" affiche un
+  // champ vide (#665).
+  const [customCpuModels, setCustomCpuModels] = useState<string[]>([])
+  useEffect(() => {
+    const { connId, node, type } = props.selection?.id ? parseVmId(props.selection.id) : { connId: '', node: '', type: '' }
+    if (!connId || !node || type !== 'qemu') { setCustomCpuModels([]); return }
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/cpu-models`)
+        if (!res.ok) return
+        const json = await res.json()
+        if (!cancelled) setCustomCpuModels(extractCustomCpuModels(json?.data))
+      } catch { /* on retombe sur la liste statique */ }
+    })()
+    return () => { cancelled = true }
+  }, [props.selection?.id])
+
+  // Fetch vDC quota+usage for the connection that hosts this VM. Skipped
+  // for the provider (no vDC mapping → API returns nothing). Refreshed
+  // when the selection / tenant changes.
+  useEffect(() => {
+    if (!vmConnId || tenantLoading || isProviderTenant) {
+      setVdcQuota(null); setVdcUsage(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch('/api/v1/vdcs')
+        if (!res.ok) { if (!cancelled) { setVdcQuota(null); setVdcUsage(null) } ; return }
+        const json = await res.json()
+        const vdcs: any[] = Array.isArray(json?.data) ? json.data : []
+        const match = vdcs.find(v => v.connectionId === vmConnId || v.connection_id === vmConnId)
+        if (cancelled) return
+        if (match?.quota) {
+          setVdcQuota({
+            maxVcpus: match.quota.maxVcpus ?? null,
+            maxRamMb: match.quota.maxRamMb ?? null,
+            maxStorageMb: match.quota.maxStorageMb ?? null,
+            maxVms: match.quota.maxVms ?? null,
+          })
+          setVdcUsage({
+            usedVcpus: match.usage?.usedVcpus ?? 0,
+            usedRamMb: match.usage?.usedRamMb ?? 0,
+            usedStorageMb: match.usage?.usedStorageMb ?? 0,
+            usedVms: match.usage?.usedVms ?? 0,
+          })
+        } else {
+          setVdcQuota(null); setVdcUsage(null)
+        }
+      } catch {
+        if (!cancelled) { setVdcQuota(null); setVdcUsage(null) }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [vmConnId, tenantLoading, isProviderTenant])
+  const chartTooltipStyle = { backgroundColor: theme.palette.background.paper, border: `1px solid ${theme.palette.divider}`, borderRadius: 4, color: theme.palette.text.primary }
+  const [cpuFlagsOpen, setCpuFlagsOpen] = useState(false)
+  const [hwSections, setHwSections] = useState<Set<string>>(new Set(['cpu', 'memory', 'system', 'disks', 'network', 'other']))
+  const toggleHwSection = (section: string) => setHwSections(prev => {
+    const next = new Set(prev)
+    if (next.has(section)) next.delete(section)
+    else next.add(section)
+    return next
+  })
+  const [expandedVmBackupGroups, setExpandedVmBackupGroups] = useState<Set<string>>(new Set())
+  // Namespace filter for the BACKUP tab. 'all' shows every namespace, otherwise
+  // limits the listing to the chosen one. Reset when a different VM is selected.
+  const [vmBackupNamespaceFilter, setVmBackupNamespaceFilter] = useState<string>('all')
+  // Per-backup restore dialog (Backup tab). Null when closed.
+  const [restoreDialog, setRestoreDialog] = useState<{ backup: any } | null>(null)
+  const [bootOrderOpen, setBootOrderOpen] = useState(false)
+  const [bootDevices, setBootDevices] = useState<Array<{ id: string; enabled: boolean }>>([])
+  const [bootSaving, setBootSaving] = useState(false)
+  const [dragIdx, setDragIdx] = useState<number | null>(null)
+
+  const {
+    addCephReplicationDialogOpen,
+    addReplicationDialogOpen,
+    availableTargetNodes,
+    backToArchives,
+    backToBackupsList,
+    backups,
+    backupsError,
+    backupsLoading,
+    backupsPreloaded,
+    backupsStats,
+    backupsWarnings,
+    backupsPbsConfigured,
+    backupsVzdumpScanned,
+    balloon,
+    balloonEnabled,
+    browseArchive,
+    canPreview,
+    canShowRrd,
+    cephClusters,
+    cephClustersLoading,
+    cephReplicationJobs,
+    cephReplicationSchedule,
+    compatibleStorages,
+    cpuCores,
+    cpuFlags,
+    cpuLimit,
+    cpuLimitEnabled,
+    cpuModified,
+    cpuSockets,
+    cpuType,
+    createSnapshot,
+    data,
+    deleteReplicationId,
+    deleteSnapshot,
+    deleteAllSnapshots,
+    deleteAllBusy,
+    deleteAllProgress,
+    detailTab,
+    downloadFile,
+    error,
+    exploreWithUnisphereStorage,
+    explorerArchive,
+    explorerArchives,
+    explorerError,
+    explorerFiles,
+    explorerLoading,
+    explorerMode,
+    explorerPath,
+    explorerSearch,
+    filteredExplorerFiles,
+    haComment,
+    haConfig,
+    haEditing,
+    haError,
+    haFailback,
+    haGroup,
+    haGroups,
+    haLoading,
+    haMaxRelocate,
+    haMaxRestart,
+    haSaving,
+    haState,
+    loadBackupContent,
+    loadBackupContentViaPbs,
+    loadHaConfig,
+    loadNotes,
+    loadTasks,
+    loading,
+    localTags,
+    memory,
+    memoryModified,
+    swap,
+    navigateToBreadcrumb,
+    navigateToFolder,
+    navigateUp,
+    numaEnabled,
+    newSnapshotDesc,
+    newSnapshotName,
+    newSnapshotRam,
+    notesEditing,
+    notesError,
+    notesLoading,
+    notesSaving,
+    previewFile,
+    primaryColor,
+    primaryColorLight,
+    removeHaConfig,
+    replicationComment,
+    replicationJobs,
+    replicationLoading,
+    replicationRateLimit,
+    replicationSchedule,
+    replicationTargetNode,
+    rollbackSnapshot,
+    rrdError,
+    rrdLoading,
+    saveCpuConfig,
+    saveHaConfig,
+    saveMemoryConfig,
+    saveNotes,
+    savingCpu,
+    savingMemory,
+    savingReplication,
+    selectedBackup,
+    selectedCephCluster,
+    selectedUnisphereStorage,
+    selectedVmIsCluster,
+    selection,
+    series,
+    setAddCephReplicationDialogOpen,
+    setAddDiskDialogOpen,
+    setAddNetworkDialogOpen,
+    setAddOtherHardwareDialogOpen,
+    setEditOtherHardwareDialogOpen,
+    setSelectedOtherHardware,
+    setAddReplicationDialogOpen,
+    setBackupCompress,
+    setBackupMode,
+    setBackupNote,
+    setBackupStorage,
+    setBackupStorages,
+    setBalloon,
+    setBalloonEnabled,
+    setCephClusters,
+    setCephReplicationSchedule,
+    setCpuCores,
+    setCpuFlags,
+    setCpuLimit,
+    setCpuLimitEnabled,
+    setCpuSockets,
+    setCpuType,
+    setCreateBackupDialogOpen,
+    setDeleteReplicationId,
+    setDetailTab,
+    setEditDiskDialogOpen,
+    setEditDiskInitialTab,
+    handleDetachDisk,
+    setEditNetworkDialogOpen,
+    setEditOptionDialog,
+    setEditScsiControllerDialogOpen,
+    setExplorerArchive,
+    setExplorerArchives,
+    setExplorerFiles,
+    setExplorerSearch,
+    setHaComment,
+    setHaFailback,
+    setHaEditing,
+    setHaGroup,
+    setHaMaxRelocate,
+    setHaMaxRestart,
+    setHaState,
+    setMemory,
+    setSwap,
+    setNewSnapshotDesc,
+    setNewSnapshotName,
+    setNewSnapshotRam,
+    setNotesEditing,
+    setNumaEnabled,
+    setReplicationComment,
+    setReplicationLoaded,
+    setReplicationRateLimit,
+    setReplicationSchedule,
+    setReplicationTargetNode,
+    setSavingReplication,
+    setSelectedBackup,
+    selectedDisk,
+    setSelectedCephCluster,
+    setSelectedDisk,
+    setSelectedNetwork,
+    setSelectedUnisphereStorage,
+    setShowCreateSnapshot,
+    setTasksLoaded,
+    setTf,
+    setVmNotes,
+    showCreateSnapshot,
+    snapshotActionBusy,
+    snapshotFeatureAvailable,
+    snapshotRowTasks = {} as Record<string, 'delete' | 'create' | 'rollback'>,
+    snapshots,
+    snapshotsError,
+    snapshotsLoading,
+    snapshotTaskBusy,
+    sourceCephAvailable,
+    refreshData,
+    tags,
+    tasks,
+    tasksError,
+    tasksLoading,
+    tf,
+    vmNotes,
+  } = props
+
+  const { hasFeature } = useLicense()
+  const changeTrackingAvailable = hasFeature(Features.CHANGE_TRACKING)
+
+  // Namespaces seen in the loaded backup snapshots, sorted alphabetically with
+  // root first. Drives the dropdown above the BACKUP list. vzdump archives live
+  // on a UNISPHERE storage and have no namespace, so they never feed the dropdown.
+  const availableBackupNamespaces = useMemo<string[]>(() => {
+    const set = new Set<string>()
+    for (const b of backups || []) {
+      if (b.source === 'vzdump') continue
+      set.add(b.namespace || '')
+    }
+    return Array.from(set).sort((a, b) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)))
+  }, [backups])
+
+  // Reset the filter to 'all' as soon as it points to a namespace that is no
+  // longer in the current backups (e.g. switching to another VM whose snapshots
+  // live in a different namespace).
+  useEffect(() => {
+    if (vmBackupNamespaceFilter !== 'all' && !availableBackupNamespaces.includes(vmBackupNamespaceFilter)) {
+      setVmBackupNamespaceFilter('all')
+    }
+  }, [availableBackupNamespaces, vmBackupNamespaceFilter])
+
+  const [diskMenuAnchor, setDiskMenuAnchor] = useState<HTMLElement | null>(null)
+  const [diskMenuTarget, setDiskMenuTarget] = useState<any | null>(null)
+  const [detachConfirmOpen, setDetachConfirmOpen] = useState(false)
+  const [deleteUnusedTarget, setDeleteUnusedTarget] = useState<any | null>(null)
+
+  // Replication log dialog
+  const [replicationLogJob, setReplicationLogJob] = useState<any | null>(null)
+  const [replicationLogOpen, setReplicationLogOpen] = useState(false)
+  const [replicationLogData, setReplicationLogData] = useState<string[]>([])
+  const [replicationLogLoading, setReplicationLogLoading] = useState(false)
+
+  return (
+    <>
+          {/* Onglets pour VMs: Résumé / Matériel / Options / Historique / Sauvegardes / Snapshots / Notes / HA */}
+          {selection?.type === 'vm' && (
+            <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <Tabs
+                value={detailTab}
+                onChange={(_e, v) => setDetailTab(v)}
+                sx={{ borderBottom: 1, borderColor: 'divider' }}
+                variant="scrollable"
+                scrollButtons="auto"
+              >
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-dashboard-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.summary')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-cpu-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.hardware')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-settings-3-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.options')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-history-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.history')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-hard-drive-2-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.backups')}
+                      {backupsStats?.total > 0 && (
+                        <Chip size="small" label={backupsStats.total} sx={{ height: 18, fontSize: 11, ml: 0.5 }} />
+                      )}
+                    </Box>
+                  }
+                />
+                <Tab
+                  sx={data?.isTemplate ? { display: 'none' } : undefined}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-camera-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.snapshots')}
+                      {snapshots.length > 0 && (
+                        <Chip size="small" label={snapshots.length} sx={{ height: 18, fontSize: 11, ml: 0.5 }} />
+                      )}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-sticky-note-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.notes')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  sx={!isAdmin ? { display: 'none' } : undefined}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-repeat-line" style={{ fontSize: 16 }} />
+                      {t('replication.title')}
+                      {replicationJobs.length > 0 && (
+                        <Chip size="small" label={replicationJobs.length} sx={{ height: 18, fontSize: 11, ml: 0.5 }} />
+                      )}
+                    </Box>
+                  }
+                />
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-cloud-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.cloudInit')}
+                    </Box>
+                  }
+                />
+                {selectedVmIsCluster && (
+                  <Tab
+                    sx={(!isAdmin || data?.isTemplate) ? { display: 'none' } : undefined}
+                    label={
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                        <i className="ri-shield-check-line" style={{ fontSize: 16 }} />
+                        {t('inventory.tabs.ha')}
+                      </Box>
+                    }
+                  />
+                )}
+                <Tab
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-shield-keyhole-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabs.firewall')}
+                    </Box>
+                  }
+                />
+                <Tab
+                  sx={!changeTrackingAvailable ? { display: 'none' } : undefined}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <i className="ri-git-commit-line" style={{ fontSize: 16 }} />
+                      {t('inventory.tabChangeTracking')}
+                    </Box>
+                  }
+                />
+              </Tabs>
+
+              <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+              {/* ==================== ONGLET 0 - RÉSUMÉ ==================== */}
+              {detailTab === 0 && (
+                <Box sx={{ pt: 2 }}>
+                  {/* Graphiques de performances (RRD) - dans le résumé */}
+                  {canShowRrd && (
+                    <Card variant="outlined" sx={{ width: '100%', borderRadius: 2 }}>
+                      <CardContent sx={{ p: 2, '&:last-child': { pb: 1 } }}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1.5, flexWrap: 'wrap', gap: 1 }}>
+                          <Typography fontWeight={700} fontSize={14}>
+                            <i className="ri-line-chart-line" style={{ fontSize: 16, marginRight: 6 }} />
+                            {t('inventory.performances')}
+                          </Typography>
+                          <Box sx={{ display: 'flex', gap: 0.5 }}>
+                            {[
+                              { label: '1h', value: 'hour' as RrdTimeframe },
+                              { label: '24h', value: 'day' as RrdTimeframe },
+                              { label: t('inventory.rrd7d'), value: 'week' as RrdTimeframe },
+                              { label: t('inventory.rrd30d'), value: 'month' as RrdTimeframe },
+                              { label: t('inventory.rrd1y'), value: 'year' as RrdTimeframe },
+                            ].map(opt => (
+                              <Chip
+                                key={opt.value}
+                                label={opt.label}
+                                size="small"
+                                onClick={() => setTf(opt.value)}
+                                sx={{
+                                  height: 24,
+                                  fontSize: 11,
+                                  fontWeight: 600,
+                                  bgcolor: tf === opt.value ? 'primary.main' : 'action.hover',
+                                  color: tf === opt.value ? 'primary.contrastText' : 'text.secondary',
+                                  '&:hover': { bgcolor: tf === opt.value ? 'primary.dark' : 'action.selected' },
+                                  cursor: 'pointer',
+                                }}
+                              />
+                            ))}
+                          </Box>
+                        </Box>
+
+                        {rrdLoading ? <LinearProgress sx={{ mb: 2 }} /> : null}
+                        {rrdError ? (
+                          <Alert severity="warning" sx={{ mb: 2 }}>
+                            RRD: {rrdError}
+                          </Alert>
+                        ) : null}
+
+                        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 2 }}>
+                          {/* CPU Usage */}
+                          <ExpandableChart title={t('inventory.cpuUsage')} height={185}>
+                            <ChartContainer>
+                              <AreaChart data={series} margin={{ top: 2, right: 4, bottom: 0, left: 4 }}>
+                                <defs>
+                                  <linearGradient id="gradCpu" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#2196f3" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#2196f3" stopOpacity={0} />
+                                  </linearGradient>
+                                </defs>
+                                <XAxis dataKey="t" tickFormatter={v => formatRrdTick(Number(v), tf)} minTickGap={40} tick={{ fontSize: 9 }} />
+                                <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} tick={{ fontSize: 9 }} width={36} />
+                                <Tooltip wrapperStyle={{ backgroundColor: 'transparent', boxShadow: 'none' }} content={({ active, payload, label }) => {
+                                  if (!active || !payload?.length) return null
+                                  return (
+                                    <Box sx={{ bgcolor: 'background.paper', border: '1px solid', borderColor: 'divider', borderRadius: 1, overflow: 'hidden', boxShadow: '0 4px 14px rgba(0,0,0,0.15)', fontSize: 11, minWidth: 160 }}>
+                                      <Box sx={{ px: 1.5, py: 0.75, bgcolor: alpha('#2196f3', 0.1), borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                        <i className="ri-cpu-line" style={{ fontSize: 13, color: '#2196f3' }} />
+                                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#2196f3' }}>CPU</Typography>
+                                        <Typography variant="caption" sx={{ ml: 'auto', opacity: 0.6 }}>{formatRrdTooltipTs(Number(label), tf)}</Typography>
+                                      </Box>
+                                      <Box sx={{ px: 1.5, py: 0.75 }}>
+                                        {payload.map(entry => { const v = Number(entry.value); const c = v >= 80 ? '#f44336' : v >= 60 ? '#ff9800' : '#4caf50'; return (
+                                          <Box key={String(entry.dataKey)} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
+                                            <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: entry.color, flexShrink: 0 }} />
+                                            <Typography variant="caption" sx={{ flex: 1 }}>CPU</Typography>
+                                            <Typography variant="caption" sx={{ fontWeight: 600, fontFamily: '"JetBrains Mono", monospace', color: c }}>{v.toFixed(1)}%</Typography>
+                                          </Box>
+                                        )})}
+                                      </Box>
+                                    </Box>
+                                  )
+                                }} />
+                                <Area type="monotone" dataKey="cpuPct" stroke="#2196f3" fill="url(#gradCpu)" strokeWidth={1.5} isAnimationActive={false} />
+                              </AreaChart>
+                            </ChartContainer>
+                          </ExpandableChart>
+
+                          {/* Memory Usage */}
+                          <ExpandableChart title={t('inventory.memoryUsage')} height={185}>
+                            <ChartContainer>
+                              <AreaChart data={series} margin={{ top: 2, right: 4, bottom: 0, left: 4 }}>
+                                <defs>
+                                  <linearGradient id="gradRam" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#10b981" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#10b981" stopOpacity={0} />
+                                  </linearGradient>
+                                </defs>
+                                <XAxis dataKey="t" tickFormatter={v => formatRrdTick(Number(v), tf)} minTickGap={40} tick={{ fontSize: 9 }} />
+                                <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} tick={{ fontSize: 9 }} width={36} />
+                                <Tooltip wrapperStyle={{ backgroundColor: 'transparent', boxShadow: 'none' }} content={({ active, payload, label }) => {
+                                  if (!active || !payload?.length) return null
+                                  return (
+                                    <Box sx={{ bgcolor: 'background.paper', border: '1px solid', borderColor: 'divider', borderRadius: 1, overflow: 'hidden', boxShadow: '0 4px 14px rgba(0,0,0,0.15)', fontSize: 11, minWidth: 160 }}>
+                                      <Box sx={{ px: 1.5, py: 0.75, bgcolor: alpha('#10b981', 0.1), borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                        <i className="ri-ram-line" style={{ fontSize: 13, color: '#10b981' }} />
+                                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#10b981' }}>Memory</Typography>
+                                        <Typography variant="caption" sx={{ ml: 'auto', opacity: 0.6 }}>{formatRrdTooltipTs(Number(label), tf)}</Typography>
+                                      </Box>
+                                      <Box sx={{ px: 1.5, py: 0.75 }}>
+                                        {payload.map(entry => { const v = Number(entry.value); const c = v >= 80 ? '#f44336' : v >= 60 ? '#ff9800' : '#4caf50'; return (
+                                          <Box key={String(entry.dataKey)} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
+                                            <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: entry.color, flexShrink: 0 }} />
+                                            <Typography variant="caption" sx={{ flex: 1 }}>Memory</Typography>
+                                            <Typography variant="caption" sx={{ fontWeight: 600, fontFamily: '"JetBrains Mono", monospace', color: c }}>{v.toFixed(1)}%</Typography>
+                                          </Box>
+                                        )})}
+                                      </Box>
+                                    </Box>
+                                  )
+                                }} />
+                                <Area type="monotone" dataKey="ramPct" stroke="#10b981" fill="url(#gradRam)" strokeWidth={1.5} isAnimationActive={false} />
+                              </AreaChart>
+                            </ChartContainer>
+                          </ExpandableChart>
+
+                          {/* Network Traffic */}
+                          <ExpandableChart title={t('inventoryPage.networkTraffic')} height={185}>
+                            <ChartContainer>
+                              <AreaChart data={series} margin={{ top: 2, right: 4, bottom: 0, left: 4 }}>
+                                <defs>
+                                  <linearGradient id="gradNetIn" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#06b6d4" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#06b6d4" stopOpacity={0} />
+                                  </linearGradient>
+                                  <linearGradient id="gradNetOut" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#67e8f9" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#67e8f9" stopOpacity={0} />
+                                  </linearGradient>
+                                </defs>
+                                <XAxis dataKey="t" tickFormatter={v => formatRrdTick(Number(v), tf)} minTickGap={40} tick={{ fontSize: 9 }} />
+                                <YAxis tickFormatter={v => formatBps(Number(v))} tick={{ fontSize: 9 }} width={40} domain={[0, 'auto']} />
+                                <Tooltip wrapperStyle={{ backgroundColor: 'transparent', boxShadow: 'none' }} content={({ active, payload, label }) => {
+                                  if (!active || !payload?.length) return null
+                                  return (
+                                    <Box sx={{ bgcolor: 'background.paper', border: '1px solid', borderColor: 'divider', borderRadius: 1, overflow: 'hidden', boxShadow: '0 4px 14px rgba(0,0,0,0.15)', fontSize: 11, minWidth: 160 }}>
+                                      <Box sx={{ px: 1.5, py: 0.75, bgcolor: alpha('#06b6d4', 0.1), borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                        <i className="ri-exchange-line" style={{ fontSize: 13, color: '#06b6d4' }} />
+                                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#06b6d4' }}>Network</Typography>
+                                        <Typography variant="caption" sx={{ ml: 'auto', opacity: 0.6 }}>{formatRrdTooltipTs(Number(label), tf)}</Typography>
+                                      </Box>
+                                      <Box sx={{ px: 1.5, py: 0.75 }}>
+                                        {payload.map(entry => (
+                                          <Box key={String(entry.dataKey)} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
+                                            <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: entry.color, flexShrink: 0 }} />
+                                            <Typography variant="caption" sx={{ flex: 1 }}>{String(entry.name) === 'netInBps' ? 'In' : 'Out'}</Typography>
+                                            <Typography variant="caption" sx={{ fontWeight: 600, fontFamily: '"JetBrains Mono", monospace' }}>{formatBps(Number(entry.value))}</Typography>
+                                          </Box>
+                                        ))}
+                                      </Box>
+                                    </Box>
+                                  )
+                                }} />
+                                <Area type="monotone" dataKey="netInBps" stroke="#06b6d4" fill="url(#gradNetIn)" strokeWidth={1.5} isAnimationActive={false} name="netInBps" connectNulls />
+                                <Area type="monotone" dataKey="netOutBps" stroke="#67e8f9" fill="url(#gradNetOut)" strokeWidth={1.5} isAnimationActive={false} name="netOutBps" connectNulls />
+                              </AreaChart>
+                            </ChartContainer>
+                          </ExpandableChart>
+
+                          {/* Disk I/O (VMs) */}
+                          <ExpandableChart title={t('inventory.diskIo')} height={185}>
+                            <ChartContainer>
+                              <AreaChart data={series} margin={{ top: 2, right: 4, bottom: 0, left: 4 }}>
+                                <defs>
+                                  <linearGradient id="gradDiskRead" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                                  </linearGradient>
+                                  <linearGradient id="gradDiskWrite" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#fca5a5" stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor="#fca5a5" stopOpacity={0} />
+                                  </linearGradient>
+                                </defs>
+                                <XAxis dataKey="t" tickFormatter={v => formatRrdTick(Number(v), tf)} minTickGap={40} tick={{ fontSize: 9 }} />
+                                <YAxis tickFormatter={v => formatBps(Number(v))} tick={{ fontSize: 9 }} width={40} domain={[0, 'auto']} />
+                                <Tooltip wrapperStyle={{ backgroundColor: 'transparent', boxShadow: 'none' }} content={({ active, payload, label }) => {
+                                  if (!active || !payload?.length) return null
+                                  return (
+                                    <Box sx={{ bgcolor: 'background.paper', border: '1px solid', borderColor: 'divider', borderRadius: 1, overflow: 'hidden', boxShadow: '0 4px 14px rgba(0,0,0,0.15)', fontSize: 11, minWidth: 160 }}>
+                                      <Box sx={{ px: 1.5, py: 0.75, bgcolor: alpha('#ef4444', 0.1), borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                        <i className="ri-hard-drive-2-line" style={{ fontSize: 13, color: '#ef4444' }} />
+                                        <Typography variant="caption" sx={{ fontWeight: 700, color: '#ef4444' }}>Disk I/O</Typography>
+                                        <Typography variant="caption" sx={{ ml: 'auto', opacity: 0.6 }}>{formatRrdTooltipTs(Number(label), tf)}</Typography>
+                                      </Box>
+                                      <Box sx={{ px: 1.5, py: 0.75 }}>
+                                        {payload.map(entry => (
+                                          <Box key={String(entry.dataKey)} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
+                                            <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: entry.color, flexShrink: 0 }} />
+                                            <Typography variant="caption" sx={{ flex: 1 }}>{String(entry.name) === 'diskReadBps' ? 'Read' : 'Write'}</Typography>
+                                            <Typography variant="caption" sx={{ fontWeight: 600, fontFamily: '"JetBrains Mono", monospace' }}>{formatBps(Number(entry.value))}</Typography>
+                                          </Box>
+                                        ))}
+                                      </Box>
+                                    </Box>
+                                  )
+                                }} />
+                                <Area type="monotone" dataKey="diskReadBps" stroke="#ef4444" fill="url(#gradDiskRead)" strokeWidth={1.5} isAnimationActive={false} name="diskReadBps" connectNulls />
+                                <Area type="monotone" dataKey="diskWriteBps" stroke="#fca5a5" fill="url(#gradDiskWrite)" strokeWidth={1.5} isAnimationActive={false} name="diskWriteBps" connectNulls />
+                              </AreaChart>
+                            </ChartContainer>
+                          </ExpandableChart>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Template summary info */}
+                  {data?.isTemplate && (() => {
+                    const cpuInfo = data.cpuInfo
+                    const memoryInfo = data.memoryInfo
+                    const disksInfo = data.disksInfo || []
+                    const bootDisk = disksInfo.find((d: any) => d.id === 'rootfs' || d.id === 'scsi0' || d.id === 'virtio0' || d.id === 'sata0' || d.id === 'ide0')
+                    const totalCores = (cpuInfo?.sockets ?? 1) * (cpuInfo?.cores ?? 1)
+                    const ramMB = memoryInfo?.memory ?? 0
+                    const ramDisplay = ramMB >= 1024 ? `${(ramMB / 1024).toFixed(2)} GiB` : `${ramMB} MiB`
+                    const nodeId = selection?.id?.split(':') || []
+                    const nodeName = nodeId[1] || ''
+
+                    const rows = [
+                      { icon: 'ri-shield-check-line', label: 'HA State', value: 'none' },
+                      { icon: 'ri-server-line', label: t('inventory.node'), value: nodeName },
+                      { icon: 'ri-cpu-line', label: 'Processors', value: `${totalCores} (${cpuInfo?.sockets ?? 1} sockets, ${cpuInfo?.cores ?? 1} cores)` },
+                      { icon: 'ri-ram-line', label: t('inventory.memoryLabel'), value: ramDisplay },
+                      ...(bootDisk ? [{ icon: 'ri-hard-drive-2-line', label: 'Boot disk size', value: bootDisk.size }] : []),
+                      ...(cpuInfo?.type ? [{ icon: 'ri-settings-3-line', label: t('inventory.cpuType'), value: cpuInfo.type }] : []),
+                    ]
+
+                    return (
+                      <Card variant="outlined" sx={{ width: '100%', borderRadius: 2 }}>
+                        <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                          {rows.map((row, i) => (
+                            <Box key={i} sx={{ display: 'flex', alignItems: 'center', py: 0.75, borderBottom: i < rows.length - 1 ? '1px solid' : 'none', borderColor: 'divider' }}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 180 }}>
+                                <i className={row.icon} style={{ fontSize: 14, opacity: 0.5 }} />
+                                <Typography variant="body2" sx={{ opacity: 0.7 }}>{row.label}</Typography>
+                              </Box>
+                              <Typography variant="body2" fontWeight={600}>{row.value}</Typography>
+                            </Box>
+                          ))}
+                        </CardContent>
+                      </Card>
+                    )
+                  })()}
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 1 - MATÉRIEL ==================== */}
+              {detailTab === 1 && (
+                <Box sx={{ py: 2 }}>
+                  {loading ? (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                      <CircularProgress />
+                    </Box>
+                  ) : (
+                    <Stack spacing={1}>
+                      {/* ── vDC quota banner (tenant only) ──
+                          Live preview of CPU/RAM deltas vs the vDC quota.
+                          Only the *delta* relative to the current config is
+                          billed against the quota — decreases come out as 0.
+                          Disk delta is intentionally omitted: existing disks
+                          are already counted in `usedStorageMb`, and add/resize
+                          go through dedicated routes that have their own
+                          server-side check. */}
+                      {vdcQuota && vdcUsage && (() => {
+                        const currentVcpus = ((data?.cpuInfo?.cores ?? cpuCores) as number) * ((data?.cpuInfo?.sockets ?? cpuSockets) as number)
+                        const newVcpus = (cpuCores ?? 1) * (cpuSockets ?? 1)
+                        const vcpusDelta = Math.max(0, newVcpus - currentVcpus)
+                        const currentRamMb = (data?.memoryInfo?.memory ?? memory) as number
+                        const newRamMb = (memory ?? currentRamMb) as number
+                        const ramDelta = Math.max(0, newRamMb - currentRamMb)
+                        return (
+                          <VdcQuotaBanner
+                            quota={vdcQuota}
+                            usage={vdcUsage}
+                            requested={{ vcpus: vcpusDelta, ramMb: ramDelta, storageMb: 0, vms: 0 }}
+                            onStateChange={({ blocked }) => {
+                              if (blocked !== hwQuotaBlocked) setHwQuotaBlocked(blocked)
+                            }}
+                          />
+                        )
+                      })()}
+                      {/* ── Pending changes revert button (full width) ── */}
+                      {(() => {
+                        // Use the raw pending keys from UNISPHERE's config.pending, which
+                        // covers ALL pending changes (CPU, memory, machine, bios, vga,
+                        // network, disks, etc.) — not just the CPU+memory subset we
+                        // were manually tracking before.
+                        const revertKeys = data?.pendingKeys as string[] | undefined
+                        if (!revertKeys || revertKeys.length === 0) return null
+                        return (
+                          <Button
+                            fullWidth
+                            variant="contained"
+                            startIcon={<i className="ri-arrow-go-back-line" />}
+                            onClick={async () => {
+                              try {
+                                const { connId, node, type, vmid } = parseVmId(selection?.id || '')
+                                await fetch(
+                                  `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/config`,
+                                  {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ revert: revertKeys.join(',') }),
+                                  },
+                                )
+                                if (refreshData) await refreshData()
+                              } catch {
+                                // Best-effort; the inline alerts will persist until
+                                // the user refreshes manually if the revert fails.
+                              }
+                            }}
+                          >
+                            {t('inventory.revertPendingChanges')}
+                          </Button>
+                        )
+                      })()}
+                      {/* CPU et RAM côte à côte */}
+                      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' }, gap: 1 }}>
+                        {/* CPU */}
+                        <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('cpu')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('cpu') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-cpu-line" style={{ fontSize: 20 }} />
+                              {t('inventory.processor')}
+                              <Chip label={`${data?.cpuInfo?.sockets || cpuSockets}S / ${data?.cpuInfo?.cores || cpuCores}C`} size="small" sx={{ height: 22, fontSize: 11 }} />
+                            </Typography>
+                            <i className={hwSections.has('cpu') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                          </Box>
+                          <Collapse in={hwSections.has('cpu')}>
+                          <CardContent>
+                          
+                          {/* Avertissement si config CPU en attente de reboot */}
+                          {data?.cpuInfo?.pending && (
+                            <Alert 
+                              severity="warning" 
+                              sx={{ mb: 2 }}
+                              icon={<i className="ri-restart-line" style={{ fontSize: 20 }} />}
+                            >
+                              <Typography variant="body2" fontWeight={600}>
+                                {t('inventory.pendingRestart')}
+                              </Typography>
+                              <Typography variant="body2" sx={{ mt: 0.5, opacity: 0.9 }}>
+                                {data.cpuInfo.pending.sockets !== undefined && `Sockets: ${data.cpuInfo.sockets} → ${data.cpuInfo.pending.sockets}`}
+                                {data.cpuInfo.pending.sockets !== undefined && data.cpuInfo.pending.cores !== undefined && ' • '}
+                                {data.cpuInfo.pending.cores !== undefined && `Cores: ${data.cpuInfo.cores} → ${data.cpuInfo.pending.cores}`}
+                                {(data.cpuInfo.pending.sockets !== undefined || data.cpuInfo.pending.cores !== undefined) && data.cpuInfo.pending.cpu !== undefined && ' • '}
+                                {data.cpuInfo.pending.cpu !== undefined && `Type: ${data.cpuInfo.pending.cpu}`}
+                              </Typography>
+                            </Alert>
+                          )}
+                          
+                          {/* Sockets & Cores côte à côte */}
+                          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, mb: 3 }}>
+                            {/* Sockets */}
+                            {(() => {
+                              const maxSockets = data.nodeCapacity?.hostSockets || 4
+                              const marks = [
+                                { value: 1, label: '1' },
+                                ...(maxSockets >= 8 ? [{ value: Math.floor(maxSockets / 4), label: String(Math.floor(maxSockets / 4)) }] : []),
+                                ...(maxSockets >= 16 ? [{ value: Math.floor(maxSockets / 2), label: String(Math.floor(maxSockets / 2)) }] : []),
+                                ...(maxSockets > 1 ? [{ value: maxSockets, label: String(maxSockets) }] : []),
+                              ]
+                              return (
+                            <Box>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                                <Typography variant="body2" fontWeight={600}>{t('inventory.sockets')}</Typography>
+                                <NumericTextField
+                                  size="small"
+                                  type="number"
+                                  value={cpuSockets}
+                                  onChange={setCpuSockets}
+                                  fallback={1}
+                                  sx={{ width: 70 }}
+                                  inputProps={{ min: 1, max: maxSockets }}
+                                />
+                              </Box>
+                              <Slider
+                                value={Math.min(cpuSockets, maxSockets)}
+                                onChange={(_, val) => setCpuSockets(Math.round(val as number))}
+                                min={1}
+                                max={maxSockets}
+                                step={1}
+                                marks={marks}
+                                valueLabelDisplay="auto"
+                              />
+                            </Box>
+                              )
+                            })()}
+                            {/* Cores */}
+                            <Box>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                                <Typography variant="body2" fontWeight={600}>{t('inventory.coresPerSocket')}</Typography>
+                                <NumericTextField
+                                  size="small"
+                                  type="number"
+                                  value={cpuCores}
+                                  onChange={setCpuCores}
+                                  fallback={1}
+                                  sx={{ width: 70 }}
+                                  inputProps={{ min: 1 }}
+                                />
+                              </Box>
+                              {(() => {
+                                const hostCores = data.nodeCapacity?.maxCpu || 32
+                                const sliderMax = Math.min(hostCores, 64)
+                                const marks = [
+                                  { value: 1, label: '1' },
+                                  ...(sliderMax >= 8 ? [{ value: Math.floor(sliderMax / 4), label: String(Math.floor(sliderMax / 4)) }] : []),
+                                  ...(sliderMax >= 16 ? [{ value: Math.floor(sliderMax / 2), label: String(Math.floor(sliderMax / 2)) }] : []),
+                                  { value: sliderMax, label: String(sliderMax) },
+                                ]
+                                return (
+                                  <Slider
+                                    value={Math.min(cpuCores, sliderMax)}
+                                    onChange={(_, val) => setCpuCores(Math.round(val as number))}
+                                    min={1}
+                                    max={sliderMax}
+                                    step={1}
+                                    marks={marks}
+                                    valueLabelDisplay="auto"
+                                  />
+                                )
+                              })()}
+                            </Box>
+                          </Box>
+
+                          {/* CPU Type */}
+                          <FormControl fullWidth sx={{ mb: 3 }}>
+                            <InputLabel>{t('inventory.cpuType')}</InputLabel>
+                            <Select
+                              value={cpuType}
+                              label={t('inventory.cpuType')}
+                              onChange={(e) => setCpuType(e.target.value)}
+                            >
+                              {(customCpuModels.length > 0 || Boolean(cpuType && !isKnownCpuType(cpuType) && !customCpuModels.includes(cpuType))) && (
+                                <ListSubheader disableSticky sx={cpuGroupHeaderSx}>Custom</ListSubheader>
+                              )}
+                              {customCpuModels.map((m: string) => (
+                                <MenuItem key={m} value={m}>{m}</MenuItem>
+                              ))}
+                              {Boolean(cpuType && !isKnownCpuType(cpuType) && !customCpuModels.includes(cpuType)) && (
+                                <MenuItem value={cpuType}>{cpuType}</MenuItem>
+                              )}
+                              <ListSubheader disableSticky sx={cpuGroupHeaderSx}>Special</ListSubheader>
+                              <MenuItem value="host">host ({t('inventory.maxPerformance')})</MenuItem>
+                              <MenuItem value="max">max</MenuItem>
+                              <MenuItem value="kvm64">kvm64 ({t('inventory.compatible')})</MenuItem>
+                              <MenuItem value="kvm32">kvm32</MenuItem>
+                              <MenuItem value="qemu64">qemu64 ({t('inventory.emulation')})</MenuItem>
+                              <MenuItem value="qemu32">qemu32</MenuItem>
+                              <ListSubheader disableSticky sx={cpuGroupHeaderSx}>x86-64 Microarchitecture Levels</ListSubheader>
+                              <MenuItem value="x86-64-v2">x86-64-v2</MenuItem>
+                              <MenuItem value="x86-64-v2-AES">x86-64-v2-AES (Recommended)</MenuItem>
+                              <MenuItem value="x86-64-v3">x86-64-v3</MenuItem>
+                              <MenuItem value="x86-64-v4">x86-64-v4</MenuItem>
+                              <ListSubheader disableSticky sx={cpuGroupHeaderSx}>Intel</ListSubheader>
+                              <MenuItem value="486">486</MenuItem>
+                              <MenuItem value="pentium">Pentium</MenuItem>
+                              <MenuItem value="pentium2">Pentium 2</MenuItem>
+                              <MenuItem value="pentium3">Pentium 3</MenuItem>
+                              <MenuItem value="Conroe">Conroe</MenuItem>
+                              <MenuItem value="Penryn">Penryn</MenuItem>
+                              <MenuItem value="Nehalem">Nehalem</MenuItem>
+                              <MenuItem value="Nehalem-IBRS">Nehalem-IBRS</MenuItem>
+                              <MenuItem value="Westmere">Westmere</MenuItem>
+                              <MenuItem value="Westmere-IBRS">Westmere-IBRS</MenuItem>
+                              <MenuItem value="SandyBridge">SandyBridge</MenuItem>
+                              <MenuItem value="SandyBridge-IBRS">SandyBridge-IBRS</MenuItem>
+                              <MenuItem value="IvyBridge">IvyBridge</MenuItem>
+                              <MenuItem value="IvyBridge-IBRS">IvyBridge-IBRS</MenuItem>
+                              <MenuItem value="Haswell">Haswell</MenuItem>
+                              <MenuItem value="Haswell-IBRS">Haswell-IBRS</MenuItem>
+                              <MenuItem value="Haswell-noTSX">Haswell-noTSX</MenuItem>
+                              <MenuItem value="Haswell-noTSX-IBRS">Haswell-noTSX-IBRS</MenuItem>
+                              <MenuItem value="Broadwell">Broadwell</MenuItem>
+                              <MenuItem value="Broadwell-IBRS">Broadwell-IBRS</MenuItem>
+                              <MenuItem value="Broadwell-noTSX">Broadwell-noTSX</MenuItem>
+                              <MenuItem value="Broadwell-noTSX-IBRS">Broadwell-noTSX-IBRS</MenuItem>
+                              <MenuItem value="Skylake-Client">Skylake-Client</MenuItem>
+                              <MenuItem value="Skylake-Client-IBRS">Skylake-Client-IBRS</MenuItem>
+                              <MenuItem value="Skylake-Client-noTSX-IBRS">Skylake-Client-noTSX-IBRS</MenuItem>
+                              <MenuItem value="Skylake-Client-v4">Skylake-Client-v4</MenuItem>
+                              <MenuItem value="Skylake-Server">Skylake-Server</MenuItem>
+                              <MenuItem value="Skylake-Server-IBRS">Skylake-Server-IBRS</MenuItem>
+                              <MenuItem value="Skylake-Server-noTSX-IBRS">Skylake-Server-noTSX-IBRS</MenuItem>
+                              <MenuItem value="Skylake-Server-v4">Skylake-Server-v4</MenuItem>
+                              <MenuItem value="Skylake-Server-v5">Skylake-Server-v5</MenuItem>
+                              <MenuItem value="Cascadelake-Server">Cascadelake-Server</MenuItem>
+                              <MenuItem value="Cascadelake-Server-noTSX">Cascadelake-Server-noTSX</MenuItem>
+                              <MenuItem value="Cascadelake-Server-v2">Cascadelake-Server-v2</MenuItem>
+                              <MenuItem value="Cascadelake-Server-v4">Cascadelake-Server-v4</MenuItem>
+                              <MenuItem value="Cascadelake-Server-v5">Cascadelake-Server-v5</MenuItem>
+                              <MenuItem value="Cooperlake">Cooperlake</MenuItem>
+                              <MenuItem value="Cooperlake-v2">Cooperlake-v2</MenuItem>
+                              <MenuItem value="Icelake-Client">Icelake-Client</MenuItem>
+                              <MenuItem value="Icelake-Client-noTSX">Icelake-Client-noTSX</MenuItem>
+                              <MenuItem value="Icelake-Server">Icelake-Server</MenuItem>
+                              <MenuItem value="Icelake-Server-noTSX">Icelake-Server-noTSX</MenuItem>
+                              <MenuItem value="Icelake-Server-v3">Icelake-Server-v3</MenuItem>
+                              <MenuItem value="Icelake-Server-v4">Icelake-Server-v4</MenuItem>
+                              <MenuItem value="Icelake-Server-v5">Icelake-Server-v5</MenuItem>
+                              <MenuItem value="Icelake-Server-v6">Icelake-Server-v6</MenuItem>
+                              <MenuItem value="SapphireRapids">SapphireRapids</MenuItem>
+                              <MenuItem value="SapphireRapids-v2">SapphireRapids-v2</MenuItem>
+                              <MenuItem value="GraniteRapids">GraniteRapids</MenuItem>
+                              <MenuItem value="KnightsMill">KnightsMill</MenuItem>
+                              <ListSubheader disableSticky sx={cpuGroupHeaderSx}>AMD</ListSubheader>
+                              <MenuItem value="athlon">Athlon</MenuItem>
+                              <MenuItem value="phenom">Phenom</MenuItem>
+                              <MenuItem value="Opteron_G1">Opteron G1</MenuItem>
+                              <MenuItem value="Opteron_G2">Opteron G2</MenuItem>
+                              <MenuItem value="Opteron_G3">Opteron G3</MenuItem>
+                              <MenuItem value="Opteron_G4">Opteron G4</MenuItem>
+                              <MenuItem value="Opteron_G5">Opteron G5</MenuItem>
+                              <MenuItem value="EPYC">EPYC</MenuItem>
+                              <MenuItem value="EPYC-IBPB">EPYC-IBPB</MenuItem>
+                              <MenuItem value="EPYC-v3">EPYC-v3</MenuItem>
+                              <MenuItem value="EPYC-v4">EPYC-v4</MenuItem>
+                              <MenuItem value="EPYC-Rome">EPYC-Rome</MenuItem>
+                              <MenuItem value="EPYC-Rome-v2">EPYC-Rome-v2</MenuItem>
+                              <MenuItem value="EPYC-Rome-v3">EPYC-Rome-v3</MenuItem>
+                              <MenuItem value="EPYC-Rome-v4">EPYC-Rome-v4</MenuItem>
+                              <MenuItem value="EPYC-Milan">EPYC-Milan</MenuItem>
+                              <MenuItem value="EPYC-Milan-v2">EPYC-Milan-v2</MenuItem>
+                              <MenuItem value="EPYC-Genoa">EPYC-Genoa</MenuItem>
+                              <ListSubheader disableSticky sx={cpuGroupHeaderSx}>Legacy</ListSubheader>
+                              <MenuItem value="coreduo">Core Duo</MenuItem>
+                              <MenuItem value="core2duo">Core 2 Duo</MenuItem>
+                            </Select>
+                          </FormControl>
+
+                          {/* CPU Limit + NUMA toggles */}
+                          <Box sx={{ mb: 2 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                              <FormControlLabel
+                                control={
+                                  <Switch
+                                    checked={cpuLimitEnabled}
+                                    onChange={(e) => setCpuLimitEnabled(e.target.checked)}
+                                  />
+                                }
+                                label={t('inventory.limitCpuUsage')}
+                              />
+                              <FormControlLabel
+                                control={
+                                  <Switch
+                                    checked={numaEnabled}
+                                    onChange={(e) => setNumaEnabled(e.target.checked)}
+                                  />
+                                }
+                                label="Enable NUMA"
+                              />
+                            </Box>
+                            {cpuLimitEnabled && (
+                              <Box sx={{ mt: 2 }}>
+                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                                  <Typography variant="body2" fontWeight={600}>{t('inventory.cpuLimit')}</Typography>
+                                  <NumericTextField
+                                    size="small"
+                                    type="number"
+                                    value={cpuLimit}
+                                    onChange={setCpuLimit}
+                                    fallback={0}
+                                    parse={Number.parseFloat}
+                                    sx={{ width: 100 }}
+                                    inputProps={{ min: 0, max: 128, step: 0.5 }}
+                                  />
+                                </Box>
+                                <Slider
+                                  value={cpuLimit}
+                                  onChange={(_, val) => setCpuLimit(val as number)}
+                                  min={0}
+                                  max={128}
+                                  step={0.5}
+                                  valueLabelDisplay="auto"
+                                />
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('inventory.cpuLimitHint', { max: cpuSockets * cpuCores })}
+                                </Typography>
+                              </Box>
+                            )}
+                          </Box>
+
+                          {/* Extra CPU Flags (collapsible) */}
+                          {(() => {
+                            const activeCount = Object.keys(cpuFlags).length
+                            return (
+                            <Box sx={{ mb: 2, border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+                              <Box
+                                onClick={() => setCpuFlagsOpen(!cpuFlagsOpen)}
+                                sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 2, py: 1, cursor: 'pointer', '&:hover': { bgcolor: 'action.hover' } }}
+                              >
+                                {/* component="div": body2 would render a <p>, and the Chip
+                                    below renders a <div> — invalid nesting, hydration error. */}
+                                <Typography variant="body2" component="div" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                  <i className="ri-flag-line" style={{ fontSize: 16 }} />
+                                  {t('inventory.cpuFlags')}
+                                  {activeCount > 0 && (
+                                    <Chip label={activeCount} size="small" color="primary" sx={{ height: 20, fontSize: '0.7rem', ml: 0.5 }} />
+                                  )}
+                                </Typography>
+                                <i className={cpuFlagsOpen ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 20, opacity: 0.5 }} />
+                              </Box>
+                              <Collapse in={cpuFlagsOpen}>
+                                <Box sx={{ px: 2, pb: 2, pt: 1, display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1 }}>
+                                  {([
+                                    { flag: 'nested-virt', desc: t('inventory.cpuFlagDesc.nestedVirt') },
+                                    { flag: 'md-clear', desc: t('inventory.cpuFlagDesc.mdClear') },
+                                    { flag: 'pcid', desc: t('inventory.cpuFlagDesc.pcid') },
+                                    { flag: 'spec-ctrl', desc: t('inventory.cpuFlagDesc.specCtrl') },
+                                    { flag: 'ssbd', desc: t('inventory.cpuFlagDesc.ssbd') },
+                                    { flag: 'ibpb', desc: t('inventory.cpuFlagDesc.ibpb') },
+                                    { flag: 'virt-ssbd', desc: t('inventory.cpuFlagDesc.virtSsbd') },
+                                    { flag: 'amd-ssbd', desc: t('inventory.cpuFlagDesc.amdSsbd') },
+                                    { flag: 'amd-no-ssb', desc: t('inventory.cpuFlagDesc.amdNoSsb') },
+                                    { flag: 'pdpe1gb', desc: t('inventory.cpuFlagDesc.pdpe1gb') },
+                                    { flag: 'hv-tlbflush', desc: t('inventory.cpuFlagDesc.hvTlbflush') },
+                                    { flag: 'hv-evmcs', desc: t('inventory.cpuFlagDesc.hvEvmcs') },
+                                    { flag: 'aes', desc: t('inventory.cpuFlagDesc.aes') },
+                                  ] as const).map(({ flag, desc }) => {
+                                    const val = cpuFlags[flag] || 'default'
+                                    return (
+                                    <MuiTooltip key={flag} title={desc} placement="top" arrow>
+                                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <ToggleButtonGroup
+                                          size="small"
+                                          exclusive
+                                          value={val}
+                                          onChange={(_, v) => {
+                                            if (!v) return
+                                            setCpuFlags((prev: Record<string, '+' | '-'>) => {
+                                              const next = { ...prev }
+                                              if (v === 'default') {
+                                                delete next[flag]
+                                              } else {
+                                                next[flag] = v
+                                              }
+                                              return next
+                                            })
+                                          }}
+                                          sx={{ height: 28 }}
+                                        >
+                                          <ToggleButton value="-" sx={{
+                                            px: 0.8, fontSize: '0.75rem', fontWeight: 700,
+                                            ...(val === '-' && { bgcolor: 'error.main', color: 'error.contrastText', '&:hover': { bgcolor: 'error.dark' }, '&.Mui-selected': { bgcolor: 'error.main', color: 'error.contrastText', '&:hover': { bgcolor: 'error.dark' } } })
+                                          }}>−</ToggleButton>
+                                          <ToggleButton value="default" sx={{ px: 0.8, fontSize: '0.65rem' }}>off</ToggleButton>
+                                          <ToggleButton value="+" sx={{
+                                            px: 0.8, fontSize: '0.75rem', fontWeight: 700,
+                                            ...(val === '+' && { bgcolor: 'success.main', color: 'success.contrastText', '&:hover': { bgcolor: 'success.dark' }, '&.Mui-selected': { bgcolor: 'success.main', color: 'success.contrastText', '&:hover': { bgcolor: 'success.dark' } } })
+                                          }}>+</ToggleButton>
+                                        </ToggleButtonGroup>
+                                        <Typography variant="caption" sx={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.7rem' }}>
+                                          {flag}
+                                        </Typography>
+                                      </Box>
+                                    </MuiTooltip>
+                                    )
+                                  })}
+                                </Box>
+                              </Collapse>
+                            </Box>
+                            )
+                          })()}
+
+                          {/* Résumé */}
+                          <Box sx={{ p: 2, bgcolor: 'action.hover', borderRadius: 1, mb: 2 }}>
+                            <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                              {t('inventory.totalVcpus', { count: cpuSockets * cpuCores })}
+                            </Typography>
+                            <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                              {t('inventory.socketsCoresBreakdown', { sockets: cpuSockets, cores: cpuCores })}
+                            </Typography>
+                          </Box>
+
+                          {/* Bouton Sauvegarder */}
+                          <Button
+                            variant="contained"
+                            fullWidth
+                            disabled={savingCpu || !cpuModified || hwQuotaBlocked}
+                            onClick={saveCpuConfig}
+                            startIcon={savingCpu ? <CircularProgress size={16} /> : <SaveIcon />}
+                          >
+                            {savingCpu ? t('common.saving') : t('inventory.saveCpuChanges')}
+                          </Button>
+                        </CardContent>
+                          </Collapse>
+                      </Card>
+
+                        {/* Mémoire */}
+                        <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('memory')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('memory') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-database-2-line" style={{ fontSize: 20 }} />
+                              {t('inventory.memory')}
+                              <Chip label={`${((data?.memoryInfo?.memory || memory) / 1024).toFixed(0)} GB`} size="small" sx={{ height: 22, fontSize: 11 }} />
+                              {data?.vmType === 'lxc' && (data?.memoryInfo?.swap ?? 0) > 0 && (
+                                <Chip label={`Swap: ${data.memoryInfo.swap} MB`} size="small" variant="outlined" sx={{ height: 22, fontSize: 11 }} />
+                              )}
+                            </Typography>
+                            <i className={hwSections.has('memory') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                          </Box>
+                          <Collapse in={hwSections.has('memory')}>
+                          <CardContent>
+                          
+                          {/* Avertissement si config RAM en attente de reboot */}
+                          {data?.memoryInfo?.pending && (
+                            <Alert 
+                              severity="warning" 
+                              sx={{ mb: 2 }}
+                              icon={<i className="ri-restart-line" style={{ fontSize: 20 }} />}
+                            >
+                              <Typography variant="body2" fontWeight={600}>
+                                {t('inventory.pendingRestart')}
+                              </Typography>
+                              <Typography variant="body2" sx={{ mt: 0.5, opacity: 0.9 }}>
+                                {data.memoryInfo.pending.memory !== undefined && `${t('inventoryPage.memoryLabel')} ${(data.memoryInfo.memory / 1024).toFixed(0)} GB → ${(data.memoryInfo.pending.memory / 1024).toFixed(0)} GB`}
+                                {data.memoryInfo.pending.memory !== undefined && data.memoryInfo.pending.balloon !== undefined && ' • '}
+                                {data.memoryInfo.pending.balloon !== undefined && `Balloon: ${((data.memoryInfo.balloon || 0) / 1024).toFixed(0)} GB → ${(data.memoryInfo.pending.balloon / 1024).toFixed(0)} GB`}
+                              </Typography>
+                            </Alert>
+                          )}
+                          
+                          {/* RAM Slider */}
+                          <Box sx={{ mb: 3 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                              <Typography variant="body2" fontWeight={600}>{t('inventoryPage.memory')}</Typography>
+                              {/* The field shows GB, the state holds MB: format divides, parse
+                                  multiplies, so `min` is expressed in MB like `memory`. parse uses
+                                  parseFloat, not Number, because Number('') is 0 and would commit
+                                  0 MB on blur instead of falling back to 1 GB. The 512 MB floor
+                                  lives in `min` (applied on blur) rather than in onChange: a
+                                  parent that re-clamped mid-keystroke would rewrite the buffer
+                                  under the user's fingers. */}
+                              <NumericTextField
+                                size="small"
+                                type="number"
+                                value={memory}
+                                format={(v) => String(Math.round(v / 1024))}
+                                parse={(s) => Number.parseFloat(s) * 1024}
+                                onChange={(newMem) => {
+                                  setMemory(newMem)
+                                  if (balloonEnabled && balloon > newMem) setBalloon(newMem)
+                                }}
+                                fallback={1024}
+                                min={512}
+                                InputProps={{
+                                  endAdornment: <InputAdornment position="end">GB</InputAdornment>,
+                                }}
+                                sx={{ width: 170 }}
+                                inputProps={{ min: 0.5 }}
+                              />
+                            </Box>
+                            {(() => {
+                              const hostMemGb = Math.floor((data.nodeCapacity?.maxMem || 64 * 1024 * 1024 * 1024) / (1024 * 1024 * 1024))
+                              const sliderMax = Math.min(hostMemGb, 128)
+                              const step = 1
+                              const marks = [
+                                { value: 1, label: '1' },
+                                ...(sliderMax >= 16 ? [{ value: Math.floor(sliderMax / 4), label: `${Math.floor(sliderMax / 4)}` }] : []),
+                                ...(sliderMax >= 32 ? [{ value: Math.floor(sliderMax / 2), label: `${Math.floor(sliderMax / 2)}` }] : []),
+                                { value: sliderMax, label: `${sliderMax}` },
+                              ]
+                              return (
+                                <Slider
+                                  value={Math.min(memory / 1024, sliderMax)}
+                                  onChange={(_, val) => {
+                                    const newMem = Math.round(val as number) * 1024
+                                    setMemory(newMem)
+                                    if (balloonEnabled && balloon > newMem) setBalloon(newMem)
+                                  }}
+                                  min={1}
+                                  max={sliderMax}
+                                  step={step}
+                                  marks={marks}
+                                  valueLabelDisplay="auto"
+                                  valueLabelFormat={(v) => `${v} GB`}
+                                />
+                              )
+                            })()}
+                          </Box>
+
+                          {/* Ballooning (QEMU only) */}
+                          {data?.vmType !== 'lxc' && (
+                          <Box sx={{ mb: 3 }}>
+                            <FormControlLabel
+                              control={
+                                <Switch
+                                  checked={balloonEnabled}
+                                  onChange={(e) => setBalloonEnabled(e.target.checked)}
+                                />
+                              }
+                              label={t('inventory.enableBallooning')}
+                            />
+                            {balloonEnabled && (
+                              <Box sx={{ mt: 2 }}>
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                                  <Typography variant="body2" fontWeight={600}>{t('inventory.minMemoryBalloon')}</Typography>
+                                  {/* The field shows GB, the state holds MB: format divides, parse
+                                      multiplies, so min/max are expressed in MB like `balloon`.
+                                      The "never above the VM's memory" ceiling is `max` (applied on
+                                      blur) instead of a Math.min in onChange: clamping in the
+                                      parent would rewrite the buffer on every keystroke. */}
+                                  <NumericTextField
+                                    size="small"
+                                    type="number"
+                                    value={balloon}
+                                    format={(v) => (v / 1024).toFixed(0)}
+                                    parse={(s) => Number.parseFloat(s) * 1024}
+                                    onChange={setBalloon}
+                                    fallback={0}
+                                    min={0}
+                                    max={memory}
+                                    InputProps={{
+                                      endAdornment: <InputAdornment position="end">GB</InputAdornment>,
+                                    }}
+                                    sx={{ width: 170 }}
+                                    inputProps={{ min: 0, max: memory / 1024 }}
+                                  />
+                                </Box>
+                                <Slider
+                                  value={balloon / 1024}
+                                  onChange={(_, val) => setBalloon((val as number) * 1024)}
+                                  min={0}
+                                  max={memory / 1024}
+                                  step={1}
+                                  valueLabelDisplay="auto"
+                                  valueLabelFormat={(v) => `${v} GB`}
+                                />
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('inventory.balloonMinHint')}
+                                </Typography>
+                              </Box>
+                            )}
+                          </Box>
+                          )}
+
+                          {data?.vmType !== 'lxc' && (
+                          <Alert severity="info" sx={{ mb: 2 }}>
+                            <Typography variant="caption">
+                              {t('inventory.balloonInfo')}
+                            </Typography>
+                          </Alert>
+                          )}
+
+                          {/* Swap (LXC only) */}
+                          {data?.vmType === 'lxc' && (
+                          <Box sx={{ mb: 3 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                              <Typography variant="body2" fontWeight={600}>
+                                <i className="ri-swap-line" style={{ marginRight: 4 }} />
+                                {t('inventory.swap')}
+                              </Typography>
+                              <NumericTextField
+                                size="small"
+                                type="number"
+                                value={swap}
+                                onChange={setSwap}
+                                fallback={0}
+                                min={0}
+                                InputProps={{
+                                  endAdornment: <InputAdornment position="end">MB</InputAdornment>,
+                                }}
+                                sx={{ width: 170 }}
+                                inputProps={{ min: 0 }}
+                              />
+                            </Box>
+                            <Slider
+                              value={swap}
+                              onChange={(_, val) => setSwap(val as number)}
+                              min={0}
+                              max={8192}
+                              step={128}
+                              marks={[
+                                { value: 0, label: '0' },
+                                { value: 512, label: '512' },
+                                { value: 2048, label: '2048' },
+                                { value: 4096, label: '4096' },
+                                { value: 8192, label: '8192' },
+                              ]}
+                              valueLabelDisplay="auto"
+                              valueLabelFormat={(v) => `${v} MB`}
+                            />
+                            <Typography variant="caption" color="text.secondary">
+                              {t('inventory.swapHint')}
+                            </Typography>
+                          </Box>
+                          )}
+
+                          {/* Bouton Sauvegarder */}
+                          <Button
+                            variant="contained"
+                            fullWidth
+                            disabled={savingMemory || !memoryModified || hwQuotaBlocked}
+                            onClick={saveMemoryConfig}
+                            startIcon={savingMemory ? <CircularProgress size={16} /> : <SaveIcon />}
+                          >
+                            {savingMemory ? t('common.saving') : t('inventory.saveMemoryChanges')}
+                          </Button>
+                        </CardContent>
+                          </Collapse>
+                      </Card>
+                      </Box>
+
+                      {/* Disques et Réseau côte à côte */}
+                      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' }, gap: 1 }}>
+                        {/* Disques */}
+                        <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('disks')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('disks') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-hard-drive-line" style={{ fontSize: 20 }} />
+                              {t('inventory.disks')}
+                              <Chip label={data.disksInfo?.length || 0} size="small" sx={{ height: 22, fontSize: 11 }} />
+                            </Typography>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                <MuiTooltip title={data.optionsInfo?.scsihw || 'virtio-scsi-single'}>
+                                  <IconButton size="small" onClick={(e) => { e.stopPropagation(); setEditScsiControllerDialogOpen(true) }}>
+                                    <i className="ri-settings-3-line" style={{ fontSize: 16 }} />
+                                  </IconButton>
+                                </MuiTooltip>
+                                <MuiTooltip title={t('common.add')}>
+                                  <IconButton size="small" color="primary" onClick={(e) => { e.stopPropagation(); setAddDiskDialogOpen(true) }}>
+                                    <i className="ri-add-line" style={{ fontSize: 18 }} />
+                                  </IconButton>
+                                </MuiTooltip>
+                              <i className={hwSections.has('disks') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                            </Box>
+                          </Box>
+                          <Collapse in={hwSections.has('disks')}>
+                          <CardContent>
+                          {data.disksInfo && data.disksInfo.length > 0 ? (
+                            <List dense>
+                              {data.disksInfo.map((disk: any, idx: number) => (
+                                <ListItemButton
+                                  key={idx}
+                                  sx={{
+                                    bgcolor: 'action.hover',
+                                    borderRadius: 1,
+                                    mb: 1,
+                                    cursor: disk.isCloudInit ? 'default' : undefined,
+                                    '&:last-child': { mb: 0 }
+                                  }}
+                                  onClick={() => {
+                                    // The Cloud-Init drive is generated by UNISPHERE: the ISO editor
+                                    // would overwrite it, so the row stays informative only.
+                                    if (disk.isCloudInit) return
+                                    setSelectedDisk(disk)
+                                    setEditDiskDialogOpen(true)
+                                  }}
+                                >
+                                  <ListItemIcon sx={{ minWidth: 40 }}>
+                                    <i className={disk.isUnused ? "ri-delete-bin-line" : disk.isCloudInit ? "ri-cloud-fill" : disk.isCdrom ? "ri-disc-fill" : disk.isEfi ? "ri-shield-keyhole-line" : disk.isTpm ? "ri-key-2-line" : disk.mountpoint ? "ri-folder-3-fill" : "ri-hard-drive-2-fill"} style={{ fontSize: 24, opacity: disk.isUnused ? 0.5 : disk.isCdrom || disk.isEfi || disk.isTpm ? 1 : 0.7, color: disk.isUnused ? 'var(--mui-palette-warning-main)' : disk.isCloudInit || disk.isEfi || disk.isTpm ? 'var(--mui-palette-info-main)' : disk.isCdrom ? 'var(--mui-palette-secondary-main)' : disk.id === 'rootfs' ? 'var(--mui-palette-success-main)' : undefined }} />
+                                  </ListItemIcon>
+                                  <ListItemText
+                                    primary={
+                                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <Typography variant="body2" fontWeight={600} sx={disk.isUnused ? { opacity: 0.7 } : undefined}>
+                                          {disk.id}
+                                        </Typography>
+                                        {disk.isUnused ? (
+                                          <Chip label={t('inventory.unused')} size="small" color="warning" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                        ) : disk.isCloudInit ? (
+                                          <Chip label={t('inventory.tabs.cloudInit')} size="small" color="info" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                        ) : disk.isCdrom ? (
+                                          <Chip label="CD-ROM" size="small" color="secondary" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                        ) : disk.isEfi ? (
+                                          <Chip label="EFI" size="small" color="info" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                        ) : disk.isTpm ? (
+                                          <Chip label={disk.format || 'TPM'} size="small" color="info" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                        ) : (
+                                          <>
+                                            <Chip label={disk.size} size="small" sx={{ height: 20, fontSize: 11 }} />
+                                            {disk.id === 'rootfs' && (
+                                              <Chip label="rootfs" size="small" color="success" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                            )}
+                                            {disk.mountpoint && disk.id !== 'rootfs' && (
+                                              <Chip label={disk.mountpoint} size="small" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                            )}
+                                          </>
+                                        )}
+                                      </Box>
+                                    }
+                                    secondary={
+                                      <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                        {disk.isUnused
+                                          ? disk.rawValue
+                                          : disk.isCdrom
+                                            ? (disk.storage === 'none' ? t('inventory.noDiskInserted') : disk.storage)
+                                            : <>
+                                                {disk.storage} • {disk.format || 'raw'}
+                                                {disk.cache && ` • Cache: ${disk.cache}`}
+                                                {disk.iothread && ' • IOThread'}
+                                              </>
+                                        }
+                                      </Typography>
+                                    }
+                                  />
+                                  {disk.isUnused ? (
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }} onClick={(e) => e.stopPropagation()}>
+                                      <MuiTooltip title={t('hardware.attach')}>
+                                        <IconButton
+                                          size="small"
+                                          color="primary"
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            setSelectedDisk(disk)
+                                            setEditDiskInitialTab(0)
+                                            setEditDiskDialogOpen(true)
+                                          }}
+                                          aria-label={t('hardware.attach')}
+                                        >
+                                          <i className="ri-link" style={{ fontSize: 18 }} />
+                                        </IconButton>
+                                      </MuiTooltip>
+                                      <MuiTooltip title={t('common.delete')}>
+                                        <IconButton
+                                          size="small"
+                                          color="error"
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            setSelectedDisk(disk)
+                                            setDeleteUnusedTarget(disk)
+                                          }}
+                                          aria-label={t('common.delete')}
+                                        >
+                                          <i className="ri-delete-bin-line" style={{ fontSize: 18 }} />
+                                        </IconButton>
+                                      </MuiTooltip>
+                                    </Box>
+                                  ) : disk.isCloudInit ? null : (disk.isCdrom || disk.isEfi || disk.isTpm) ? (
+                                    <i className="ri-pencil-line" style={{ fontSize: 16, opacity: 0.5 }} />
+                                  ) : (
+                                    <IconButton
+                                      size="small"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setDiskMenuTarget(disk)
+                                        setDiskMenuAnchor(e.currentTarget)
+                                      }}
+                                      aria-label="disk actions"
+                                    >
+                                      <i className="ri-more-2-fill" style={{ fontSize: 18, opacity: 0.6 }} />
+                                    </IconButton>
+                                  )}
+                                </ListItemButton>
+                              ))}
+                            </List>
+                          ) : (
+                            <Alert severity="info">{t('common.noData')}</Alert>
+                          )}
+                        </CardContent>
+                          </Collapse>
+                        </Card>
+
+                        {/* Menu + confirmation dialogs for disk actions */}
+                        <Menu
+                          anchorEl={diskMenuAnchor}
+                          open={Boolean(diskMenuAnchor)}
+                          onClose={() => setDiskMenuAnchor(null)}
+                        >
+                          <MenuItem
+                            onClick={() => {
+                              setDiskMenuAnchor(null)
+                              if (!diskMenuTarget) return
+                              setSelectedDisk(diskMenuTarget)
+                              setEditDiskInitialTab(0)
+                              setEditDiskDialogOpen(true)
+                            }}
+                          >
+                            <ListItemIcon><i className="ri-pencil-line" style={{ fontSize: 16 }} /></ListItemIcon>
+                            {t('common.edit')}
+                          </MenuItem>
+                          <MenuItem
+                            onClick={() => {
+                              setDiskMenuAnchor(null)
+                              if (!diskMenuTarget) return
+                              setSelectedDisk(diskMenuTarget)
+                              setEditDiskInitialTab(2)
+                              setEditDiskDialogOpen(true)
+                            }}
+                          >
+                            <ListItemIcon><i className="ri-expand-diagonal-line" style={{ fontSize: 16 }} /></ListItemIcon>
+                            {t('hardware.resize')}
+                          </MenuItem>
+                          <MenuItem
+                            onClick={() => {
+                              setDiskMenuAnchor(null)
+                              if (!diskMenuTarget) return
+                              setSelectedDisk(diskMenuTarget)
+                              setEditDiskInitialTab(3)
+                              setEditDiskDialogOpen(true)
+                            }}
+                          >
+                            <ListItemIcon><i className="ri-folder-transfer-line" style={{ fontSize: 16 }} /></ListItemIcon>
+                            {t('hardware.moveStorage')}
+                          </MenuItem>
+                          <Divider />
+                          <MenuItem
+                            onClick={() => {
+                              setDiskMenuAnchor(null)
+                              if (!diskMenuTarget) return
+                              setSelectedDisk(diskMenuTarget)
+                              setDetachConfirmOpen(true)
+                            }}
+                            sx={{ color: 'warning.main' }}
+                          >
+                            <ListItemIcon><i className="ri-link-unlink" style={{ fontSize: 16, color: 'var(--mui-palette-warning-main)' }} /></ListItemIcon>
+                            {t('hardware.detach')}
+                          </MenuItem>
+                        </Menu>
+                        {selectedDisk && (
+                          <DetachConfirmDialog
+                            open={detachConfirmOpen}
+                            diskId={selectedDisk.id}
+                            onClose={() => setDetachConfirmOpen(false)}
+                            onConfirm={async () => { await handleDetachDisk() }}
+                          />
+                        )}
+                        {deleteUnusedTarget && (
+                          <DeleteUnusedDiskDialog
+                            open={Boolean(deleteUnusedTarget)}
+                            diskId={deleteUnusedTarget.id}
+                            volume={deleteUnusedTarget.rawValue || ''}
+                            onClose={() => setDeleteUnusedTarget(null)}
+                            onConfirm={async () => { await handleDetachDisk() }}
+                          />
+                        )}
+
+                        {/* Interfaces réseau */}
+                        <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('network')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('network') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-global-line" style={{ fontSize: 20 }} />
+                              {t('inventory.tabs.network')}
+                              <Chip label={data.networkInfo?.length || 0} size="small" sx={{ height: 22, fontSize: 11 }} />
+                            </Typography>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                <MuiTooltip title={t('common.add')}>
+                                  <IconButton size="small" color="primary" onClick={(e) => { e.stopPropagation(); setAddNetworkDialogOpen(true) }}>
+                                    <i className="ri-add-line" style={{ fontSize: 18 }} />
+                                  </IconButton>
+                                </MuiTooltip>
+                              <i className={hwSections.has('network') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                            </Box>
+                          </Box>
+                          <Collapse in={hwSections.has('network')}>
+                          <CardContent>
+                            {data.networkInfo && data.networkInfo.length > 0 ? (
+                              <List dense>
+                                {data.networkInfo.map((net: any, idx: number) => (
+                                  <ListItemButton
+                                    key={idx}
+                                    sx={{
+                                      bgcolor: net.linkDown ? 'rgba(245,158,11,0.08)' : 'action.hover',
+                                      borderRadius: 1,
+                                      mb: 1,
+                                      '&:last-child': { mb: 0 },
+                                      ...(net.linkDown && { borderLeft: '3px solid', borderColor: 'warning.main' }),
+                                    }}
+                                    onClick={() => {
+                                      setSelectedNetwork({
+                                        id: net.id,
+                                        model: net.model,
+                                        bridge: net.bridge,
+                                        mac: net.macaddr,
+                                        macaddr: net.macaddr,
+                                        vlan: net.tag,
+                                        firewall: net.firewall,
+                                        linkDown: net.linkDown,
+                                        rate: net.rate,
+                                        mtu: net.mtu,
+                                        queues: net.queues,
+                                        // LXC-only — pre-populate when opening on a container
+                                        name: net.name,
+                                        ip: net.ip,
+                                        gw: net.gw,
+                                        ip6: net.ip6,
+                                        gw6: net.gw6,
+                                        hostmanaged: net.hostmanaged,
+                                      })
+                                    setEditNetworkDialogOpen(true)
+                                  }}
+                                >
+                                  <ListItemIcon sx={{ minWidth: 40 }}>
+                                    <i className={net.linkDown ? 'ri-wifi-off-line' : 'ri-wifi-line'} style={{ fontSize: 24, opacity: 0.7, color: net.linkDown ? '#f59e0b' : undefined }} />
+                                  </ListItemIcon>
+                                  <ListItemText
+                                    primary={
+                                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <Typography variant="body2" fontWeight={600} sx={{ opacity: net.linkDown ? 0.6 : 1 }}>
+                                          {net.id}
+                                        </Typography>
+                                        <Chip label={net.model || (net.name ? 'veth' : '—')} size="small" sx={{ height: 20, fontSize: 11 }} />
+                                        {net.linkDown && (
+                                          <Chip
+                                            icon={<i className="ri-link-unlink" style={{ fontSize: 12 }} />}
+                                            label="Disconnected"
+                                            size="small"
+                                            color="warning"
+                                            sx={{ height: 20, fontSize: 11 }}
+                                          />
+                                        )}
+                                        {net.firewall && (
+                                          <Chip
+                                            icon={<i className="ri-shield-check-line" style={{ fontSize: 12 }} />}
+                                            label="Firewall"
+                                            size="small"
+                                            color="success"
+                                            sx={{ height: 20, fontSize: 11 }}
+                                          />
+                                        )}
+                                      </Box>
+                                    }
+                                    secondary={
+                                      <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                        Bridge: {net.bridge}
+                                        {net.tag && ` • VLAN: ${net.tag}`}
+                                        {net.rate && ` • Limit: ${net.rate} MB/s`}
+                                        {net.macaddr && (
+                                          <>
+                                            <br />
+                                            MAC: {net.macaddr}
+                                          </>
+                                        )}
+                                      </Typography>
+                                    }
+                                  />
+                                  <i className="ri-pencil-line" style={{ fontSize: 16, opacity: 0.5 }} />
+                                </ListItemButton>
+                              ))}
+                            </List>
+                          ) : (
+                            <Alert severity="info">{t('common.noData')}</Alert>
+                          )}
+                        </CardContent>
+                          </Collapse>
+                      </Card>
+                      </Box>
+
+                      {/* Other Hardware (EFI, TPM, USB, PCI, Serial, Audio, RNG) */}
+                      <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('other')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('other') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-settings-3-line" style={{ fontSize: 20 }} />
+                              {t('inventory.otherHardware')}
+                              <Chip label={data.otherHardwareInfo?.length || 0} size="small" sx={{ height: 22, fontSize: 11 }} />
+                            </Typography>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                <MuiTooltip title={t('common.add')}>
+                                  <IconButton size="small" color="primary" onClick={(e) => { e.stopPropagation(); setAddOtherHardwareDialogOpen(true) }}>
+                                    <i className="ri-add-line" style={{ fontSize: 18 }} />
+                                  </IconButton>
+                                </MuiTooltip>
+                            <i className={hwSections.has('other') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                            </Box>
+                          </Box>
+                          <Collapse in={hwSections.has('other')}>
+                        <CardContent>
+                          {data.otherHardwareInfo && data.otherHardwareInfo.length > 0 ? (
+                            <List dense>
+                              {data.otherHardwareInfo.map((hw: any, idx: number) => {
+                                const iconMap: Record<string, string> = {
+                                  efidisk: 'ri-shield-keyhole-line',
+                                  tpmstate: 'ri-key-2-line',
+                                  usb: 'ri-usb-line',
+                                  pci: 'ri-cpu-line',
+                                  serial: 'ri-terminal-line',
+                                  audio: 'ri-volume-up-line',
+                                  rng: 'ri-shuffle-line',
+                                }
+                                // efidisk and tpmstate are VM firmware devices — eSage does not
+                                // expose an edit UI for them either, so we keep them read-only here.
+                                const isEditable = ['usb', 'pci', 'serial', 'audio', 'rng'].includes(hw.type)
+                                const openEdit = () => {
+                                  setSelectedOtherHardware({
+                                    id: hw.id,
+                                    type: hw.type,
+                                    label: hw.label,
+                                    rawValue: hw.rawValue,
+                                  })
+                                  setEditOtherHardwareDialogOpen(true)
+                                }
+                                return (
+                                  <ListItem
+                                    key={idx}
+                                    onClick={isEditable ? openEdit : undefined}
+                                    sx={{
+                                      bgcolor: 'action.hover',
+                                      borderRadius: 1,
+                                      mb: 1,
+                                      '&:last-child': { mb: 0 },
+                                      ...(isEditable && {
+                                        cursor: 'pointer',
+                                        '&:hover': { bgcolor: 'action.selected' },
+                                      }),
+                                    }}
+                                    secondaryAction={isEditable ? (
+                                      <MuiTooltip title={t('common.edit')}>
+                                        <IconButton
+                                          size="small"
+                                          onClick={(e) => { e.stopPropagation(); openEdit() }}
+                                        >
+                                          <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                        </IconButton>
+                                      </MuiTooltip>
+                                    ) : undefined}
+                                  >
+                                    <ListItemIcon sx={{ minWidth: 40 }}>
+                                      <i className={iconMap[hw.type] || 'ri-settings-3-line'} style={{ fontSize: 24, opacity: 0.7 }} />
+                                    </ListItemIcon>
+                                    <ListItemText
+                                      primary={
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                          <Typography variant="body2" fontWeight={600}>
+                                            {hw.id}
+                                          </Typography>
+                                          <Chip label={hw.label} size="small" sx={{ height: 20, fontSize: 11 }} />
+                                          {hw.storage && (
+                                            <Chip label={hw.storage} size="small" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+                                          )}
+                                        </Box>
+                                      }
+                                      secondary={
+                                        <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                          {hw.rawValue}
+                                        </Typography>
+                                      }
+                                    />
+                                  </ListItem>
+                                )
+                              })}
+                            </List>
+                          ) : (
+                            <Typography variant="body2" sx={{ opacity: 0.5, fontStyle: 'italic' }}>
+                              {t('inventory.noOtherHardware')}
+                            </Typography>
+                          )}
+                        </CardContent>
+                          </Collapse>
+                      </Card>
+
+                      {/* System Hardware (BIOS, Machine, Display, SCSI Controller) */}
+                      {data.vmType === 'qemu' && data.systemInfo && (
+                        <Card variant="outlined" sx={{ borderRadius: 2, overflow: 'hidden' }}>
+                          <Box
+                            onClick={() => toggleHwSection('system')}
+                            sx={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                              px: 2, py: 1.5, cursor: 'pointer',
+                              bgcolor: 'action.hover',
+                              '&:hover': { bgcolor: 'action.selected' },
+                              borderBottom: hwSections.has('system') ? '1px solid' : 'none',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <i className="ri-computer-line" style={{ fontSize: 20 }} />
+                              {t('inventory.systemHardware')}
+                            </Typography>
+                            <i className={hwSections.has('system') ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 22, opacity: 0.5 }} />
+                          </Box>
+                          <Collapse in={hwSections.has('system')}>
+                            <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+                              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                <tbody>
+                                  {[
+                                    {
+                                      key: 'bios',
+                                      icon: 'ri-shield-keyhole-line',
+                                      label: 'BIOS',
+                                      value: (data.systemInfo.bios || 'seabios').toUpperCase() === 'OVMF' ? 'OVMF (UEFI)' : 'SeaBIOS',
+                                      editValue: data.systemInfo.bios || 'seabios',
+                                      options: [{ value: 'seabios', label: 'SeaBIOS' }, { value: 'ovmf', label: 'OVMF (UEFI)' }],
+                                    },
+                                    {
+                                      key: 'machine',
+                                      icon: 'ri-instance-line',
+                                      label: t('inventory.machineType'),
+                                      // Option values are the strings we PUT back to UNISPHERE: they carry the
+                                      // whole property string (version pin, viommu, enable-s3/s4…) and
+                                      // spell the i440fx machine `pc` — `i440fx` fails UNISPHERE's regex (#657).
+                                      ...machineTypeRow(data.systemInfo.machine),
+                                    },
+                                    {
+                                      key: 'vga',
+                                      icon: 'ri-monitor-line',
+                                      label: t('inventory.display'),
+                                      type: 'vga',
+                                      value: (() => {
+                                        const vga = data.systemInfo.vga || 'std'
+                                        const vgaLabels: Record<string, string> = {
+                                          std: 'Default (std)', cirrus: 'Cirrus Logic', vmware: 'VMware compatible',
+                                          qxl: 'SPICE (qxl)', serial0: 'Serial terminal 0', serial1: 'Serial terminal 1',
+                                          serial2: 'Serial terminal 2', serial3: 'Serial terminal 3',
+                                          virtio: 'VirtIO-GPU', 'virtio-gl': 'VirtIO-GPU (virgl)', none: 'None',
+                                        }
+                                        const parts = vga.split(',').map((p: string) => p.trim()).filter(Boolean)
+                                        const typeKey = parts[0] || 'std'
+                                        const label = vgaLabels[typeKey] || typeKey
+                                        const memPart = parts.slice(1).find((p: string) => p.startsWith('memory='))
+                                        const mem = memPart ? Number.parseInt(memPart.split('=')[1], 10) : Number.NaN
+                                        return Number.isFinite(mem) ? `${label} · ${mem} MB` : label
+                                      })(),
+                                      editValue: data.systemInfo.vga || 'std',
+                                      options: [
+                                        { value: 'std', label: 'Default (std)' }, { value: 'cirrus', label: 'Cirrus Logic' },
+                                        { value: 'vmware', label: 'VMware compatible' }, { value: 'qxl', label: 'SPICE (qxl)' },
+                                        { value: 'virtio', label: 'VirtIO-GPU' }, { value: 'virtio-gl', label: 'VirtIO-GPU (virgl)' },
+                                        { value: 'serial0', label: 'Serial terminal 0' }, { value: 'serial1', label: 'Serial terminal 1' },
+                                        { value: 'serial2', label: 'Serial terminal 2' }, { value: 'serial3', label: 'Serial terminal 3' },
+                                        { value: 'none', label: 'None' },
+                                      ],
+                                    },
+                                    {
+                                      key: 'scsihw',
+                                      icon: 'ri-hard-drive-3-line',
+                                      label: t('inventory.scsiController'),
+                                      value: (() => {
+                                        const hw = data.systemInfo.scsihw || 'virtio-scsi-single'
+                                        const labels: Record<string, string> = {
+                                          'lsi': 'LSI 53C895A', 'lsi53c810': 'LSI 53C810',
+                                          'megasas': 'MegaRAID SAS 8708EM2', 'pvscsi': 'VMware PVSCSI',
+                                          'virtio-scsi-pci': 'VirtIO SCSI', 'virtio-scsi-single': 'VirtIO SCSI single',
+                                        }
+                                        return labels[hw] || hw
+                                      })(),
+                                      editValue: data.systemInfo.scsihw || 'virtio-scsi-single',
+                                      options: [
+                                        { value: 'virtio-scsi-single', label: 'VirtIO SCSI single' },
+                                        { value: 'virtio-scsi-pci', label: 'VirtIO SCSI' },
+                                        { value: 'lsi', label: 'LSI 53C895A' },
+                                        { value: 'lsi53c810', label: 'LSI 53C810' },
+                                        { value: 'megasas', label: 'MegaRAID SAS 8708EM2' },
+                                        { value: 'pvscsi', label: 'VMware PVSCSI' },
+                                      ],
+                                    },
+                                  ].map((row) => (
+                                    <tr key={row.key}>
+                                      <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                          <i className={row.icon} style={{ fontSize: 16, opacity: 0.6 }} />
+                                          {row.label}
+                                        </Box>
+                                      </td>
+                                      <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                        <Typography variant="body2" sx={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 13 }}>
+                                          {row.value}
+                                        </Typography>
+                                      </td>
+                                      <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center', width: 48 }}>
+                                        <MuiTooltip title={t('common.edit')}>
+                                          <IconButton size="small" onClick={() => setEditOptionDialog({ key: row.key, label: row.label, value: row.editValue, type: (row as any).type || 'select', options: row.options })}>
+                                            <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                          </IconButton>
+                                        </MuiTooltip>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </CardContent>
+                          </Collapse>
+                        </Card>
+                      )}
+                    </Stack>
+                  )}
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 2 - OPTIONS ==================== */}
+              {detailTab === 2 && (
+                <Box sx={{ py: 2 }}>
+                  {loading ? (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                      <CircularProgress />
+                    </Box>
+                  ) : (
+                    <Stack spacing={1}>
+                    {/* Revert pending options button — same pattern as Hardware tab */}
+                    {data?.optionsInfo?.pendingKeys?.length > 0 && (
+                      <Button
+                        fullWidth
+                        variant="contained"
+                        startIcon={<i className="ri-arrow-go-back-line" />}
+                        onClick={async () => {
+                          try {
+                            const { connId, node, type, vmid } = parseVmId(selection?.id || '')
+                            await fetch(
+                              `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/config`,
+                              {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ revert: data.optionsInfo.pendingKeys.join(',') }),
+                              },
+                            )
+                            if (refreshData) await refreshData()
+                          } catch {}
+                        }}
+                      >
+                        {t('inventory.revertPendingChanges')}
+                      </Button>
+                    )}
+                    {(() => {
+                      // Helper to highlight option rows that have pending changes.
+                      // Returns extra inline styles for the <tr> (orange left border
+                      // + subtle tint) and a small "pending" chip to append in the
+                      // value cell. Defined once here and used by each row below.
+                      const pv = data?.optionsInfo?.pendingValues || {}
+                      const isPending = (key: string) => pv[key] !== undefined
+                      const pendingRowStyle = (key: string): React.CSSProperties => isPending(key)
+                        ? { borderLeft: '3px solid #ed6c02', backgroundColor: 'rgba(237, 108, 2, 0.06)' }
+                        : {}
+                      const pendingChip = (key: string) => isPending(key)
+                        ? <MuiTooltip title={t('inventory.pendingRestart')} arrow placement="top"><span style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', display: 'inline-flex', alignItems: 'center', cursor: 'default' }}><i className="ri-error-warning-fill" style={{ fontSize: 14, color: '#ed6c02' }}></i></span></MuiTooltip>
+                        : null
+                      // Containers share this table with VMs: the rows below are
+                      // gated so a CT only shows what UNISPHERE exposes for it (#566).
+                      const isLxc = data.vmType === 'lxc'
+                      return (
+                    <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                      <CardContent sx={{ p: 0 }}>
+                        <Box sx={{ overflowX: 'auto' }}>
+                          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                            <thead>
+                              <tr style={{ backgroundColor: 'var(--mui-palette-action-hover)' }}>
+                                <th style={{ padding: '4px 12px', textAlign: 'left', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)', width: '30%' }}>{t('inventory.option')}</th>
+                                <th style={{ padding: '4px 12px', textAlign: 'left', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)' }}>{t('inventory.value')}</th>
+                                <th style={{ padding: '4px 12px', textAlign: 'center', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)', width: '60px' }}>{t('inventory.actions')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-file-text-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('common.name')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>{data.name || data.title || 'N/A'}</td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog(guestNameOptionEdit(data.vmType, data.name, t))}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-sticky-note-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('common.description')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.description ? 1 : 0.5, fontStyle: data.description ? 'normal' : 'italic' }}>
+                                  {data.description ? (
+                                    <Box
+                                      component="span"
+                                      sx={{ '& p': { m: 0 }, '& a': { color: 'primary.main' }, '& code': { bgcolor: 'action.hover', px: 0.5, borderRadius: 0.5, fontFamily: 'monospace', fontSize: '0.9em' } }}
+                                      dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(parseMarkdown(data.description)) }}
+                                    />
+                                  ) : t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'description', label: t('common.description'), value: data.description || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-price-tag-3-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    Tags
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                    {localTags && localTags.length > 0 ? (
+                                      localTags.map(tag => {
+                                        const c = getTagColor(tag).bg
+
+                                        
+return (
+                                          <Chip
+                                            key={tag}
+                                            size="small"
+                                            label={tag}
+                                            sx={{
+                                              height: 22,
+                                              bgcolor: `${c}22`,
+                                              color: c,
+                                              border: '1px solid',
+                                              borderColor: `${c}66`,
+                                            }}
+                                          />
+                                        )
+                                      })
+                                    ) : (
+                                      <Typography variant="caption" sx={{ opacity: 0.5 }}>{t('common.none')}</Typography>
+                                    )}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'tags', label: t('inventory.tags'), value: (localTags || []).join(','), type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-play-circle-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('common.enabled')} boot
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.onboot ? t('common.yes') : t('common.no')}
+                                    color={data.optionsInfo?.onboot ? 'success' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('onboot')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'onboot', label: t('common.enabled'), value: data.optionsInfo?.onboot ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-sort-asc" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.startupOrder')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontFamily: 'monospace', fontSize: '0.9rem' }}>
+                                  {data.optionsInfo?.startupOrder || 'order=any'}
+                                  {pendingChip('startup')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'startup', label: t('inventory.startupOrder'), value: data.optionsInfo?.startupOrder || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-window-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.osType')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  {formatOsType(data.optionsInfo?.ostype)}
+                                  {pendingChip('ostype')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  {isLxc ? (
+                                    <MuiTooltip title={t('inventory.notEditable')}>
+                                      <span>
+                                        <IconButton size="small" disabled>
+                                          <i className="ri-lock-line" style={{ fontSize: 16 }} />
+                                        </IconButton>
+                                      </span>
+                                    </MuiTooltip>
+                                  ) : (
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'ostype', label: t('inventory.osType'), value: data.optionsInfo?.ostype || 'other', type: 'select', options: [
+                                      { value: 'l26', label: 'Linux 6.x - 2.6 Kernel' },
+                                      { value: 'l24', label: 'Linux 2.4 Kernel' },
+                                      { value: 'win11', label: 'Windows 11/2022/2025' },
+                                      { value: 'win10', label: 'Windows 10/2016/2019' },
+                                      { value: 'win8', label: 'Windows 8.x/2012/2012r2' },
+                                      { value: 'win7', label: 'Windows 7/2008r2' },
+                                      { value: 'wvista', label: 'Windows Vista/2008' },
+                                      { value: 'w2k3', label: 'Windows XP/2003' },
+                                      { value: 'wxp', label: 'Windows XP/2003' },
+                                      { value: 'w2k', label: 'Windows 2000' },
+                                      { value: 'solaris', label: 'Solaris Kernel' },
+                                      { value: 'other', label: 'Other' },
+                                    ] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                  )}
+                                </td>
+                              </tr>
+                              {!isLxc && (<>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-restart-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.bootOrder')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontFamily: 'monospace', fontSize: '0.9rem' }}>
+                                  {(() => {
+                                    const boot = data.optionsInfo?.bootOrder || ''
+                                    const match = boot.match(/order=(.+)/)
+                                    if (!match) return boot || t('common.noData')
+                                    return match[1].split(';').map((d: string, i: number) => (
+                                      <Chip key={d} label={d} size="small" sx={{ mr: 0.5, height: 22, fontSize: '0.75rem', fontFamily: 'monospace' }}
+                                        icon={<Typography variant="caption" sx={{ fontWeight: 700, ml: 0.5, minWidth: 14, textAlign: 'center' }}>{i + 1}</Typography>}
+                                      />
+                                    ))
+                                  })()}
+                                  {pendingChip('boot')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => {
+                                      // Build device list from all disks + networks
+                                      const boot = data.optionsInfo?.bootOrder || ''
+                                      const match = boot.match(/order=(.+)/)
+                                      const enabledDevices = match ? match[1].split(';') : []
+                                      const allDeviceIds = [
+                                        ...(data.disksInfo || []).filter((d: any) => !d.isUnused).map((d: any) => d.id),
+                                        ...(data.networkInfo || []).map((n: any) => n.id),
+                                      ]
+                                      // Enabled devices first (in order), then remaining devices (disabled)
+                                      const ordered: Array<{ id: string; enabled: boolean }> = []
+                                      enabledDevices.forEach(id => {
+                                        if (allDeviceIds.includes(id)) ordered.push({ id, enabled: true })
+                                      })
+                                      allDeviceIds.forEach(id => {
+                                        if (!enabledDevices.includes(id)) ordered.push({ id, enabled: false })
+                                      })
+                                      setBootDevices(ordered)
+                                      setBootOrderOpen(true)
+                                    }}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-cursor-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.usbTablet')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.useTablet !== false ? t('common.enabled') : t('common.disabled')}
+                                    color={data.optionsInfo?.useTablet !== false ? 'success' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('tablet')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'tablet', label: t('inventory.usbTablet'), value: data.optionsInfo?.useTablet !== false ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-plug-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    Hotplug
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                    {(data.optionsInfo?.hotplug || 'disk,network,usb').split(',').map((h: string) => h.trim().toLowerCase()).filter(Boolean).map((h: string) => {
+                                      const device = hotplugDevice(h)
+
+                                      return (
+                                        <Chip
+                                          key={h}
+                                          icon={device ? <Box component="i" className={device.icon} sx={{ fontSize: 14 }} /> : undefined}
+                                          label={device?.label || h}
+                                          size="small"
+                                          variant="outlined"
+                                          sx={{ fontSize: '0.75rem', height: 22 }}
+                                        />
+                                      )
+                                    })}
+                                  </Box>
+                                  {pendingChip('hotplug')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'hotplug', label: 'Hotplug', value: data.optionsInfo?.hotplug || 'disk,network,usb', type: 'hotplug' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-flashlight-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    ACPI
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.acpi !== false ? t('common.enabled') : t('common.disabled')}
+                                    color={data.optionsInfo?.acpi !== false ? 'success' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('acpi')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'acpi', label: 'ACPI', value: data.optionsInfo?.acpi !== false ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-speed-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    KVM Hardware
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.kvmEnabled !== false ? t('common.enabled') : t('common.disabled')}
+                                    color={data.optionsInfo?.kvmEnabled !== false ? 'success' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('kvm')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'kvm', label: 'KVM Hardware Virtualization', value: data.optionsInfo?.kvmEnabled !== false ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-snowflake-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.freezeCpuOnStartup')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.freezeCpu ? t('common.yes') : t('common.no')}
+                                    color={data.optionsInfo?.freezeCpu ? 'warning' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('freeze')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'freeze', label: t('inventory.freezeCpuOnStartup'), value: data.optionsInfo?.freezeCpu ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-time-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.rtcLocalTime')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  {data.optionsInfo?.useLocalTime === 'yes' ? t('common.yes') : t('common.no')}
+                                  {pendingChip('localtime')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'localtime', label: t('inventory.rtcLocalTime'), value: data.optionsInfo?.useLocalTime || '', type: 'select', options: [{ value: '', label: t('common.default') }, { value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-calendar-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.rtcDate')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  {data.optionsInfo?.rtcStartDate || 'now'}
+                                  {pendingChip('startdate')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'startdate', label: t('inventory.rtcDate'), value: data.optionsInfo?.rtcStartDate || 'now', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-fingerprint-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    SMBIOS (type1)
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontFamily: 'monospace', fontSize: '0.85rem' }}>
+                                  {data.optionsInfo?.smbiosUuid ? `uuid=${data.optionsInfo.smbiosUuid}` : t('inventory.autoGenerated')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('inventory.notEditable')}>
+                                    <span>
+                                      <IconButton size="small" disabled>
+                                        <i className="ri-lock-line" style={{ fontSize: 16 }} />
+                                      </IconButton>
+                                    </span>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-robot-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    QEMU Guest Agent
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.agentEnabled ? t('common.enabled') : t('common.disabled')}
+                                    color={data.optionsInfo?.agentEnabled ? 'success' : 'warning'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('agent')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'agent', label: 'QEMU Guest Agent', value: data.optionsInfo?.agentEnabled ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.enabled') }, { value: '0', label: t('common.disabled') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              </>)}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-shield-check-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    Protection
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  <Chip
+                                    size="small"
+                                    label={data.optionsInfo?.protection ? t('common.enabled') : t('common.disabled')}
+                                    color={data.optionsInfo?.protection ? 'success' : 'default'}
+                                    variant="outlined"
+                                  />
+                                  {pendingChip('protection')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'protection', label: t('inventory.protection'), value: data.optionsInfo?.protection ? '1' : '0', type: 'select', options: [{ value: '1', label: t('common.yes') }, { value: '0', label: t('common.no') }] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              {isLxc && <LxcOptionRows optionsInfo={data.optionsInfo} pendingChip={pendingChip} onEdit={setEditOptionDialog} />}
+                              {!isLxc && (<>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-tv-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    Spice Enhancements
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  {data.optionsInfo?.spiceEnhancements || 'none'}
+                                  {pendingChip('spice_enhancements')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'spice_enhancements', label: t('inventory.spiceEnhancements'), value: data.optionsInfo?.spiceEnhancements || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-save-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    VM State Storage
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                  {data.optionsInfo?.vmStateStorage || t('inventoryPage.automatic')}
+                                  {pendingChip('vmstatestorage')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'vmstatestorage', label: t('inventory.vmStateStorage'), value: data.optionsInfo?.vmStateStorage || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td style={{ padding: '6px 16px', fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-lock-password-line" style={{ fontSize: 16, opacity: 0.6 }} />{' '}
+                                    AMD SEV
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '6px 16px' }}>
+                                  {data.optionsInfo?.amdSEV === 'enabled' ? t('common.enabled') : t('common.disabled')}
+                                  {pendingChip('amd_sev')}
+                                </td>
+                                <td style={{ padding: '6px 16px', textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'amd_sev', label: 'AMD SEV', value: data.optionsInfo?.amdSEV || '', type: 'select', options: [
+                                      { value: '', label: t('common.default') },
+                                      { value: 'sev', label: 'AMD SEV' },
+                                      { value: 'sev-es', label: 'AMD SEV-ES (highly experimental)' },
+                                      { value: 'sev-snp', label: 'AMD SEV-SNP (highly experimental)' },
+                                    ] })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              </>)}
+                            </tbody>
+                          </table>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                      )
+                    })()}
+                    </Stack>
+                  )}
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 3 - HISTORIQUE DES TÂCHES ==================== */}
+              {detailTab === 3 && (
+                <Box sx={{ py: 2 }}>
+                  <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                    <CardContent sx={{ p: 0 }}>
+                      <Box sx={{ p: 2, borderBottom: '1px solid var(--mui-palette-divider)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <Typography variant="h6" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <i className="ri-history-line" style={{ fontSize: 20 }} />
+                          {t('inventory.tabs.history')}
+                          {tasks.length > 0 && (
+                            <Chip size="small" label={tasks.length} sx={{ height: 20, fontSize: 11, ml: 1 }} />
+                          )}
+                        </Typography>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          startIcon={tasksLoading ? <CircularProgress size={14} /> : <i className="ri-refresh-line" />}
+                          onClick={() => { setTasksLoaded(false); loadTasks(); }}
+                          disabled={tasksLoading}
+                        >
+                          {t('common.refresh')}
+                        </Button>
+                      </Box>
+                      
+                      {/* Loading */}
+                      {tasksLoading && tasks.length === 0 && (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                          <CircularProgress size={32} />
+                        </Box>
+                      )}
+
+                      {/* Error */}
+                      {tasksError && (
+                        <Alert severity="warning" sx={{ m: 2 }}>{tasksError}</Alert>
+                      )}
+
+                      {/* Tableau des taches */}
+                      {!tasksLoading && !tasksError && (
+                        <Box sx={{ overflowX: 'auto' }}>
+                          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                            <thead>
+                              <tr style={{ backgroundColor: 'var(--mui-palette-action-hover)' }}>
+                                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--mui-palette-divider)', fontSize: '0.8rem' }}>{t('inventory.startTime')}</th>
+                                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--mui-palette-divider)', fontSize: '0.8rem' }}>{t('inventory.endTime')}</th>
+                                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--mui-palette-divider)', fontSize: '0.8rem' }}>{t('inventory.userName')}</th>
+                                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--mui-palette-divider)', fontSize: '0.8rem' }}>{t('common.description')}</th>
+                                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--mui-palette-divider)', fontSize: '0.8rem', width: '180px' }}>{t('updates.status')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tasks.length === 0 ? (
+                                <tr>
+                                  <td colSpan={5} style={{ padding: '40px 16px', textAlign: 'center' }}>
+                                    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, opacity: 0.6 }}>
+                                      <i className="ri-task-line" style={{ fontSize: 48, opacity: 0.3 }} />
+                                      <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                                        {t('common.noData')}
+                                      </Typography>
+                                      <Typography variant="caption" sx={{ maxWidth: 400 }}>
+                                        {t('inventory.tabs.historyEmpty')}
+                                      </Typography>
+                                    </Box>
+                                  </td>
+                                </tr>
+                              ) : (
+                                tasks.map((task, idx) => {
+                                  const isError = task.status === 'error'
+                                  const rowBgColor = isError ? 'rgba(211, 47, 47, 0.15)' : 'transparent'
+
+                                  return (
+                                    <tr key={task.upid || idx} style={{ backgroundColor: rowBgColor }}>
+                                      <td style={{ padding: '8px 12px', borderBottom: '1px solid var(--mui-palette-divider)' }}>
+                                        <Typography variant="body2" sx={{ fontSize: '0.8rem', fontFamily: 'monospace' }}>
+                                          {task.starttime ? formatDateTime(task.starttime * 1000, locale) : '-'}
+                                        </Typography>
+                                      </td>
+                                      <td style={{ padding: '8px 12px', borderBottom: '1px solid var(--mui-palette-divider)' }}>
+                                        <Typography variant="body2" sx={{ fontSize: '0.8rem', fontFamily: 'monospace' }}>
+                                          {task.endtime ? formatDateTime(task.endtime * 1000, locale) : '-'}
+                                        </Typography>
+                                      </td>
+                                      <td style={{ padding: '8px 12px', borderBottom: '1px solid var(--mui-palette-divider)' }}>
+                                        <Typography variant="body2" sx={{ fontSize: '0.8rem' }}>
+                                          {task.user}
+                                        </Typography>
+                                      </td>
+                                      <td style={{ padding: '8px 12px', borderBottom: '1px solid var(--mui-palette-divider)' }}>
+                                        <Typography variant="body2" sx={{ fontSize: '0.8rem' }}>
+                                          {data?.kindLabel}/{data?.vmType?.toUpperCase()} {selection?.id?.split(':').pop()} - {t(`tasks.types.${task.type}`, { defaultValue: task.type })}
+                                        </Typography>
+                                      </td>
+                                      <td style={{ padding: '8px 12px', borderBottom: '1px solid var(--mui-palette-divider)' }}>
+                                        <Typography
+                                          variant="body2"
+                                          sx={{
+                                            fontSize: '0.8rem',
+                                            color: isError ? 'error.main' : 'inherit',
+                                            fontWeight: isError ? 500 : 400
+                                          }}
+                                        >
+                                          {task.statusText || t('tasks.status.running')}
+                                        </Typography>
+                                      </td>
+                                    </tr>
+                                  )
+                                })
+                              )}
+                            </tbody>
+                          </table>
+                        </Box>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 4 - SAUVEGARDES ==================== */}
+              {detailTab === 4 && (
+                <Box>
+                  {/* Header avec bouton de création */}
+                  {!selectedBackup && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2, gap: 2 }}>
+                      <Typography variant="h6" sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }}>
+                        <i className="ri-hard-drive-2-line" style={{ fontSize: 20 }} />
+                        {t('inventory.tabs.backups')}
+                      </Typography>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }}>
+                        {availableBackupNamespaces.length > 1 && (
+                          <FormControl size="small" sx={{ minWidth: 200 }}>
+                            <InputLabel>Namespace</InputLabel>
+                            <Select
+                              value={vmBackupNamespaceFilter}
+                              label="Namespace"
+                              onChange={e => setVmBackupNamespaceFilter(e.target.value)}
+                            >
+                              <MenuItem value="all">{t('backups.allNamespaces')}</MenuItem>
+                              {availableBackupNamespaces.map(ns => (
+                                <MenuItem key={ns || '__root__'} value={ns}>
+                                  {ns || t('backups.rootNamespace')}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                        )}
+                        <Button
+                          variant="contained"
+                          size="small"
+                          startIcon={<AddIcon />}
+                          onClick={() => {
+                            // Charger les storages de backup disponibles
+                            if (selection?.type === 'vm') {
+                              const { connId, node } = parseVmId(selection.id)
+
+                              fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/storages?content=backup`)
+                                .then(res => res.json())
+                                .then(json => setBackupStorages(json.data || []))
+                                .catch(() => setBackupStorages([]))
+                            }
+
+                            setBackupStorage('')
+                            setBackupMode('snapshot')
+                            setBackupCompress('zstd')
+                            setBackupNote('')
+                            setCreateBackupDialogOpen(true)
+                          }}
+                        >
+                          {t('inventory.newBackup')}
+                        </Button>
+                      </Box>
+                    </Box>
+                  )}
+                  
+                  {/* Loading */}
+                  {backupsLoading && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                      <CircularProgress size={32} />
+                    </Box>
+                  )}
+
+                  {/* Error */}
+                  {backupsError && (
+                    <Alert severity="warning" sx={{ mb: 2 }}>{backupsError}</Alert>
+                  )}
+
+                  {backupsWarnings?.length > 0 && (
+                    <Alert severity="warning" sx={{ mb: 2 }}>
+                      {backupsWarnings.map((w: string, i: number) => (
+                        <div key={i}>{w}</div>
+                      ))}
+                    </Alert>
+                  )}
+
+                  {/* Stats */}
+                  {!backupsLoading && backupsStats && backupsStats.total > 0 && !selectedBackup && (
+                    <Card variant="outlined" sx={{ mb: 2 }}>
+                      <CardContent sx={{ pb: '16px !important' }}>
+                        <Box sx={{ display: 'grid', gridTemplateColumns: backupsStats.pbsTotal > 0 ? '1fr 1fr 1fr' : '1fr 1fr', gap: 2 }}>
+                          <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'action.hover', borderRadius: 2 }}>
+                            <Typography variant="h6" sx={{ fontWeight: 700, color: primaryColor }}>{backupsStats.total}</Typography>
+                            <Typography variant="caption" sx={{ opacity: 0.6 }}>Total</Typography>
+                          </Box>
+                          {/* "Verified" only means something for PBS snapshots: a vzdump
+                              archive is never verified, so counting it in would read as
+                              a failed verification. */}
+                          {backupsStats.pbsTotal > 0 && (
+                            <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'action.hover', borderRadius: 2 }}>
+                              <Typography variant="h6" sx={{ fontWeight: 700, color: 'success.main' }}>{backupsStats.verifiedCount || 0}</Typography>
+                              <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('backups.verified')}</Typography>
+                            </Box>
+                          )}
+                          {/* Sans PBS, la tuile « Vérifiées » disparaît et
+                              celle-ci jouxte le compteur : deux « Total »
+                              côte à côte ne disent plus lequel est lequel. */}
+                          <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'action.hover', borderRadius: 2 }}>
+                            <Typography variant="h6" sx={{ fontWeight: 700 }}>{backupsStats.totalSizeFormatted}</Typography>
+                            <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('common.size')}</Typography>
+                          </Box>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Liste des backups groupés par PBS/datastore */}
+                  {!backupsLoading && !selectedBackup && (() => {
+                    if (backups.length === 0) {
+                      // On a aussi balayé les stockages du cluster sans rien
+                      // trouver : dire « pas de PBS » serait trompeur.
+                      if (backupsPbsConfigured === false && backupsVzdumpScanned) {
+                        return (
+                          <Alert severity="info" sx={{ mt: 2 }}>
+                            <Typography variant="body2" fontWeight={600}>
+                              {t('backups.noBackupsAnywhereTitle')}
+                            </Typography>
+                            <Typography variant="body2" sx={{ mt: 0.5 }}>
+                              {t('backups.noBackupsAnywhereHint')}
+                            </Typography>
+                            <Typography variant="body2" sx={{ mt: 0.5, opacity: 0.7 }}>
+                              {t('backups.noPbsConfiguredHint')}
+                            </Typography>
+                          </Alert>
+                        )
+                      }
+
+                      if (backupsPbsConfigured === false) {
+                        return (
+                          <Alert severity="info" sx={{ mt: 2 }}>
+                            <Typography variant="body2" fontWeight={600}>
+                              {t('backups.noPbsConfiguredTitle')}
+                            </Typography>
+                            <Typography variant="body2" sx={{ mt: 0.5 }}>
+                              {t('backups.noPbsConfiguredHint')}
+                            </Typography>
+                          </Alert>
+                        )
+                      }
+
+                      return (
+                        <Alert severity="info" sx={{ mt: 2 }}>
+                          {t('backups.noGuestBackups')}
+                        </Alert>
+                      )
+                    }
+
+                    // Apply the namespace filter before grouping so the rest of
+                    // the UI (counts, totals) stays consistent with what is shown.
+                    // vzdump archives have no namespace at all, so they stay
+                    // visible whichever namespace is selected.
+                    const visibleBackups = vmBackupNamespaceFilter === 'all'
+                      ? backups
+                      : backups.filter((b: any) =>
+                          b.source === 'vzdump' || (b.namespace || '') === vmBackupNamespaceFilter)
+
+                    if (visibleBackups.length === 0) {
+                      return (
+                        <Alert severity="info" sx={{ mt: 2 }}>
+                          {t('backups.noGuestBackups')}
+                        </Alert>
+                      )
+                    }
+
+                    // Group by PBS/datastore for PBS snapshots, by node/storage for
+                    // vzdump archives. The source is part of the key so the two
+                    // families never land in the same group.
+                    const groupMap = new Map<string, any[]>()
+                    for (const backup of visibleBackups) {
+                      const groupKey = backup.source === 'vzdump'
+                        ? `vzdump|${backup.node}|${backup.storage}`
+                        : `pbs|${backup.pbsName || 'PBS'}|${backup.datastore || 'default'}`
+
+                      if (!groupMap.has(groupKey)) groupMap.set(groupKey, [])
+                      groupMap.get(groupKey)!.push(backup)
+                    }
+
+                    // Sort each group by date desc
+                    for (const [, group] of groupMap) {
+                      group.sort((a: any, b: any) => (b.backupTime || 0) - (a.backupTime || 0))
+                    }
+
+                    const sortedGroups = Array.from(groupMap.entries())
+                      .sort((a, b) => (b[1][0]?.backupTime || 0) - (a[1][0]?.backupTime || 0))
+
+                    return (
+                      <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                        <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+                          {sortedGroups.map(([groupId, groupBackups]) => {
+                            const isExpanded = expandedVmBackupGroups.has(groupId)
+                            const totalSize = groupBackups.reduce((sum: number, b: any) => sum + (b.size || 0), 0)
+                            const verifiedCount = groupBackups.filter((b: any) => b.verified).length
+                            const [groupSource, groupPrimary, groupSecondary] = groupId.split('|')
+                            const isVzdumpGroup = groupSource === 'vzdump'
+
+                            return (
+                              <Box key={groupId}>
+                                {/* Group header */}
+                                <Box
+                                  onClick={() => {
+                                    setExpandedVmBackupGroups(prev => {
+                                      const next = new Set(prev)
+                                      if (next.has(groupId)) next.delete(groupId)
+                                      else next.add(groupId)
+                                      return next
+                                    })
+                                  }}
+                                  sx={{
+                                    display: 'flex', alignItems: 'center', gap: 1,
+                                    px: 2, py: 0.5,
+                                    borderBottom: '1px solid', borderColor: 'divider',
+                                    cursor: 'pointer',
+                                    '&:hover': { bgcolor: 'action.hover' },
+                                    bgcolor: isExpanded ? 'action.selected' : 'transparent',
+                                  }}
+                                >
+                                  <i className={isExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                                  <i className="ri-shield-check-line" style={{ fontSize: 16, color: primaryColor }} />
+                                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+                                      <Typography variant="body2" fontWeight={600} noWrap sx={{ fontSize: 12 }}>
+                                        {groupPrimary}
+                                      </Typography>
+                                      <Chip
+                                        size="small"
+                                        label={isVzdumpGroup ? t('backups.sourceVzdump') : 'PBS'}
+                                        sx={{ height: 18, fontSize: 10 }}
+                                      />
+                                    </Box>
+                                    <Typography variant="caption" sx={{ opacity: 0.5, fontSize: 10 }}>
+                                      {groupSecondary}
+                                    </Typography>
+                                  </Box>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                                    <Typography variant="body2" sx={{ opacity: 0.7, fontSize: 12 }}>
+                                      {isVzdumpGroup
+                                        ? t('backups.archivesCount', { count: groupBackups.length })
+                                        : `${groupBackups.length} snapshot${groupBackups.length > 1 ? 's' : ''}`}
+                                    </Typography>
+                                    {/* A vzdump archive is never verified: showing the group
+                                        verification state would read as "nothing verified". */}
+                                    {!isVzdumpGroup && (
+                                      verifiedCount === groupBackups.length ? (
+                                        <MuiTooltip title={t('inventory.pbsAllVerified')}>
+                                          <i className="ri-checkbox-circle-fill" style={{ fontSize: 16, color: '#4caf50' }} />
+                                        </MuiTooltip>
+                                      ) : verifiedCount > 0 ? (
+                                        <MuiTooltip title={`${verifiedCount}/${groupBackups.length}`}>
+                                          <i className="ri-checkbox-circle-line" style={{ fontSize: 16, color: '#ff9800' }} />
+                                        </MuiTooltip>
+                                      ) : (
+                                        <i className="ri-checkbox-blank-circle-line" style={{ fontSize: 16, opacity: 0.3 }} />
+                                      )
+                                    )}
+                                    <Typography variant="body2" sx={{ opacity: 0.6, minWidth: 70, textAlign: 'right', fontFamily: 'monospace', fontSize: 12 }}>
+                                      {formatBytes(totalSize)}
+                                    </Typography>
+                                  </Box>
+                                </Box>
+
+                                {/* Expanded snapshots */}
+                                {isExpanded && (
+                                  <Box sx={{ bgcolor: 'action.hover' }}>
+                                    {/* Column headers */}
+                                    <Box sx={{
+                                      display: 'grid',
+                                      gridTemplateColumns: '1fr 90px 70px 40px',
+                                      gap: 1, px: 2, pl: 5.5, py: 0.5,
+                                      borderBottom: '1px solid', borderColor: 'divider',
+                                      bgcolor: 'background.paper',
+                                    }}>
+                                      <Typography variant="caption" fontWeight={600} sx={{ opacity: 0.6, fontSize: 10 }}>{t('common.date')}</Typography>
+                                      <Typography variant="caption" fontWeight={600} sx={{ opacity: 0.6, fontSize: 10 }}>{t('common.size')}</Typography>
+                                      <Typography variant="caption" fontWeight={600} sx={{ opacity: 0.6, fontSize: 10, textAlign: 'center' }}>{t('common.status')}</Typography>
+                                      <Typography variant="caption" fontWeight={600} sx={{ opacity: 0.6, fontSize: 10, textAlign: 'center' }}></Typography>
+                                    </Box>
+                                    {groupBackups.map((backup: any, idx: number) => {
+                                      // A vzdump archive cannot be browsed: the row is inert,
+                                      // only its Restore button stays active.
+                                      const isVzdump = backup.source === 'vzdump'
+
+                                      return (
+                                      <Box
+                                        key={backup.id || idx}
+                                        sx={{
+                                          display: 'grid',
+                                          gridTemplateColumns: '1fr 90px 70px 40px 32px',
+                                          gap: 1, px: 2, pl: 5.5, py: 0.25,
+                                          borderBottom: idx < groupBackups.length - 1 ? '1px solid' : 'none',
+                                          borderColor: 'divider',
+                                          alignItems: 'center',
+                                          cursor: isVzdump ? 'default' : 'pointer',
+                                          '&:hover': isVzdump ? undefined : { bgcolor: 'action.focus' },
+                                          minHeight: 28,
+                                        }}
+                                        onClick={isVzdump ? undefined : () => {
+                                          setSelectedBackup(backup)
+                                          loadBackupContent(backup)
+                                        }}
+                                      >
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                          <i className="ri-time-line" style={{ fontSize: 13, opacity: 0.5 }} />
+                                          <Typography variant="body2" sx={{ fontSize: 12 }}>
+                                            {backup.backupTime ? formatDateTime(backup.backupTime * 1000, locale) : '-'}
+                                          </Typography>
+                                        </Box>
+                                        <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: 12, opacity: 0.7 }}>
+                                          {backup.sizeFormatted}
+                                        </Typography>
+                                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 0.5 }}>
+                                          {backup.verified ? (
+                                            <MuiTooltip title={t('backups.verified')}>
+                                              <i className="ri-checkbox-circle-fill" style={{ fontSize: 15, color: '#4caf50' }} />
+                                            </MuiTooltip>
+                                          ) : isVzdump ? null : (
+                                            <i className="ri-checkbox-blank-circle-line" style={{ fontSize: 15, opacity: 0.3 }} />
+                                          )}
+                                          {backup.protected && (
+                                            <MuiTooltip title={t('common.protected')}>
+                                              <i className="ri-lock-fill" style={{ fontSize: 14, color: '#ff9800' }} />
+                                            </MuiTooltip>
+                                          )}
+                                        </Box>
+                                        <Box sx={{ display: 'flex', justifyContent: 'center' }}>
+                                          {isVzdump ? (
+                                            <MuiTooltip title={t('backups.vzdumpNoBrowsing')}>
+                                              <i className="ri-information-line" style={{ fontSize: 15, opacity: 0.4 }} />
+                                            </MuiTooltip>
+                                          ) : (
+                                            <i className="ri-arrow-right-s-line" style={{ fontSize: 16, opacity: 0.4 }} />
+                                          )}
+                                        </Box>
+                                        <Box sx={{ display: 'flex', justifyContent: 'center' }}>
+                                          <MuiTooltip title={t('inventory.pbsRestoreVm') ?? 'Restore'}>
+                                            <IconButton
+                                              size="small"
+                                              sx={{ p: 0.25 }}
+                                              onClick={(ev) => { ev.stopPropagation(); setRestoreDialog({ backup }) }}
+                                            >
+                                              <i className="ri-history-line" style={{ fontSize: 14 }} />
+                                            </IconButton>
+                                          </MuiTooltip>
+                                        </Box>
+                                      </Box>
+                                      )
+                                    })}
+                                  </Box>
+                                )}
+                              </Box>
+                            )
+                          })}
+                        </CardContent>
+                      </Card>
+                    )
+                  })()}
+
+                  {/* Détails d'un backup sélectionné */}
+                  {selectedBackup && (
+                    <>
+                      {/* Header avec bouton retour */}
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+                        <IconButton size="small" onClick={backToBackupsList}>
+                          <i className="ri-arrow-left-line" />
+                        </IconButton>
+                        <Box sx={{ flex: 1 }}>
+                          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                            {selectedBackup.backupTime ? formatDateTime(selectedBackup.backupTime * 1000, locale) : '-'}
+                          </Typography>
+                          <Typography variant="caption" sx={{ opacity: 0.6 }}>
+                            {selectedBackup.pbsName} • {selectedBackup.datastore}
+                          </Typography>
+                        </Box>
+                        <Chip size="small" label={selectedBackup.sizeFormatted} variant="outlined" />
+                      </Box>
+
+                      {/* Explorateur de fichiers */}
+                      <Card variant="outlined">
+                        <CardContent sx={{ pb: '16px !important' }}>
+                          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                              <i className="ri-folder-open-line" style={{ marginRight: 8 }} />
+                              {t('inventory.backupContent')}
+                            </Typography>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              {selectedUnisphereStorage && (
+                                <Chip
+                                  size="small"
+                                  label={selectedUnisphereStorage.storage}
+                                  color="primary"
+                                  variant="outlined"
+                                  onDelete={() => {
+                                    setSelectedUnisphereStorage(null)
+                                    setExplorerArchives([])
+                                    setExplorerFiles([])
+                                    setExplorerArchive(null)
+                                  }}
+                                  sx={{ height: 20, fontSize: 10 }}
+                                />
+                              )}
+                              <Chip
+                                size="small"
+                                label={explorerMode === 'unisphere' ? 'via UNISPHERE' : 'via PBS'}
+                                color={explorerMode === 'unisphere' ? 'success' : 'default'}
+                                variant="outlined"
+                                sx={{ height: 20, fontSize: 10 }}
+                              />
+                            </Stack>
+                          </Box>
+
+                          {explorerLoading && (
+                            <Box sx={{ display: 'flex', justifyContent: 'center', py: 3 }}>
+                              <CircularProgress size={24} />
+                            </Box>
+                          )}
+
+                          {explorerError && (
+                            <Alert severity="warning" sx={{ mb: 2 }}>{explorerError}</Alert>
+                          )}
+
+                          {/* Sélecteur de storage UNISPHERE */}
+                          {!explorerLoading && !explorerArchive && compatibleStorages.length > 0 && !selectedUnisphereStorage && (
+                            <Box sx={{ mb: 2 }}>
+                              <Alert 
+                                severity={compatibleStorages[0]?.matchType === 'exact' ? 'success' : 'info'} 
+                                sx={{ mb: 2 }}
+                              >
+                                <Typography variant="body2" sx={{ fontWeight: 600, mb: 1 }}>
+                                  {compatibleStorages.length === 1 ? 'PBS Storage' : 'PBS Storages'}
+                                </Typography>
+                                <Typography variant="caption">
+                                  {t('common.select')}:
+                                </Typography>
+                              </Alert>
+                              <List dense sx={{ mx: -1 }}>
+                                {compatibleStorages.map((storage: any, idx: number) => (
+                                  <ListItem key={idx} disablePadding>
+                                    <ListItemButton
+                                      onClick={() => exploreWithUnisphereStorage(selectedBackup, storage)}
+                                      sx={{ borderRadius: 1 }}
+                                    >
+                                      <ListItemIcon sx={{ minWidth: 36 }}>
+                                        <i className="ri-database-2-line" style={{ 
+                                          color: storage.matchType === 'exact' ? '#66BB6A' : '#42A5F5', 
+                                          fontSize: 20 
+                                        }} />
+                                      </ListItemIcon>
+                                      <ListItemText
+                                        primary={
+                                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                            {storage.storage}
+                                            {storage.matchType === 'exact' && (
+                                              <Chip label={t('inventory.recommended')} size="small" color="success" sx={{ height: 18, fontSize: 10 }} />
+                                            )}
+                                          </Box>
+                                        }
+                                        secondary={`${storage.server || '?'} → ${storage.datastore || '?'}`}
+                                      />
+                                      <i className="ri-arrow-right-s-line" style={{ opacity: 0.5 }} />
+                                    </ListItemButton>
+                                  </ListItem>
+                                ))}
+                              </List>
+                              <Button
+                                size="small"
+                                variant="text"
+                                onClick={() => loadBackupContentViaPbs(selectedBackup)}
+                                sx={{ mt: 1 }}
+                              >
+                                {t('inventory.usePbsDirectly')}
+                              </Button>
+                            </Box>
+                          )}
+
+                          {/* Liste des archives (niveau racine) */}
+                          {!explorerArchive && !explorerLoading && (explorerArchives.length > 0 || explorerMode === 'pbs' || selectedUnisphereStorage) && (
+                            <>
+                              <Typography variant="caption" sx={{ opacity: 0.6, display: 'block', mb: 1 }}>
+                                {explorerMode === 'unisphere' ? t('inventory.drivesAndArchives') : t('inventory.backupArchives')}
+                              </Typography>
+                              <List dense sx={{ mx: -1 }}>
+                                {explorerArchives.map((file: any, idx: number) => (
+                                  <ListItem key={idx} disablePadding>
+                                    <ListItemButton
+                                      onClick={() => file.browsable && browseArchive(file.name, '/')}
+                                      disabled={!file.browsable}
+                                      sx={{ borderRadius: 1 }}
+                                    >
+                                      <ListItemIcon sx={{ minWidth: 36 }}>
+                                        {file.isRawDiskImage ? (
+                                          <i className="ri-hard-drive-2-fill" style={{ color: '#90A4AE', fontSize: 20 }} />
+                                        ) : file.type === 'virtual' ? (
+                                          <i className="ri-hard-drive-2-fill" style={{ color: '#42A5F5', fontSize: 20 }} />
+                                        ) : file.type === 'directory' ? (
+                                          <i className="ri-folder-fill" style={{ color: '#FFB74D', fontSize: 20 }} />
+                                        ) : (
+                                          <i className="ri-file-fill" style={{ color: '#90A4AE', fontSize: 20 }} />
+                                        )}
+                                      </ListItemIcon>
+                                      <ListItemText
+                                        primary={file.name}
+                                        secondary={
+                                          file.isRawDiskImage ? t('inventory.diskImageNotBrowsable') :
+                                          file.type === 'virtual' ? t('inventory.drivePartition') :
+                                          file.browsable ? t('inventory.clickToExplore') :
+                                          file.sizeFormatted || t('inventory.notBrowsable')
+                                        }
+                                      />
+                                      {file.browsable && (
+                                        <i className="ri-arrow-right-s-line" style={{ opacity: 0.5 }} />
+                                      )}
+                                    </ListItemButton>
+                                  </ListItem>
+                                ))}
+                                {explorerArchives.length === 0 && !explorerLoading && (
+                                  <Typography variant="body2" sx={{ opacity: 0.5, py: 2, textAlign: 'center' }}>
+                                    {t('common.noData')}
+                                  </Typography>
+                                )}
+                              </List>
+                            </>
+                          )}
+
+                          {/* Navigation dans une archive */}
+                          {explorerArchive && !explorerLoading && (
+                            <>
+                              {/* Breadcrumb */}
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+                                <IconButton size="small" onClick={backToArchives}>
+                                  <i className="ri-arrow-left-line" />
+                                </IconButton>
+                                <Breadcrumbs separator="›" sx={{ flex: 1, fontSize: 12 }}>
+                                  <Typography
+                                    variant="body2"
+                                    sx={{ cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
+                                    onClick={backToArchives}
+                                  >
+                                    {explorerArchive.replaceAll('.pxar.didx', '')}
+                                  </Typography>
+                                  {explorerPath !== '/' && explorerPath.split('/').filter(Boolean).map((part, idx) => (
+                                    <Typography
+                                      key={idx}
+                                      variant="body2"
+                                      sx={{ cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
+                                      onClick={() => navigateToBreadcrumb(idx)}
+                                    >
+                                      {part}
+                                    </Typography>
+                                  ))}
+                                </Breadcrumbs>
+                              </Box>
+
+                              {/* Bouton remonter */}
+                              {explorerPath !== '/' && (
+                                <ListItemButton onClick={navigateUp} sx={{ mb: 1, borderRadius: 1, mx: -1 }}>
+                                  <ListItemIcon sx={{ minWidth: 36 }}>
+                                    <i className="ri-arrow-up-line" style={{ fontSize: 20 }} />
+                                  </ListItemIcon>
+                                  <ListItemText primary=".." />
+                                </ListItemButton>
+                              )}
+
+                              {/* Champ de recherche */}
+                              {explorerFiles.length > 5 && (
+                                <TextField
+                                  size="small"
+                                  placeholder={t('inventory.searchFile')}
+                                  value={explorerSearch}
+                                  onChange={(e) => setExplorerSearch(e.target.value)}
+                                  InputProps={{
+                                    startAdornment: (
+                                      <i className="ri-search-line" style={{ marginRight: 8, opacity: 0.5 }} />
+                                    ),
+                                    endAdornment: explorerSearch && (
+                                      <IconButton size="small" onClick={() => setExplorerSearch('')}>
+                                        <CloseIcon sx={{ fontSize: 16 }} />
+                                      </IconButton>
+                                    )
+                                  }}
+                                  sx={{ mb: 1, width: '100%' }}
+                                />
+                              )}
+
+                              {/* Compteur de résultats */}
+                              {explorerSearch && (
+                                <Typography variant="caption" sx={{ opacity: 0.6, display: 'block', mb: 1 }}>
+                                  {filteredExplorerFiles.length} / {explorerFiles.length}
+                                </Typography>
+                              )}
+
+                              {/* Liste des fichiers */}
+                              <List dense sx={{ maxHeight: 300, overflow: 'auto', mx: -1 }}>
+                                {filteredExplorerFiles.map((file: any, idx: number) => {
+                                  const isNavigable = file.type === 'directory' || file.type === 'virtual' || file.leaf === false || file.leaf === 0
+                                  const canDownload = explorerMode === 'unisphere' && selectedUnisphereStorage
+                                  const canPreviewFile = canDownload && !isNavigable && canPreview(file.name)
+
+                                  
+return (
+                                    <ListItem 
+                                      key={idx} 
+                                      disablePadding
+                                      secondaryAction={
+                                        canDownload && (
+                                          <Stack direction="row" spacing={0}>
+                                            {canPreviewFile && (
+                                              <MuiTooltip title={t('common.view')}>
+                                                <IconButton 
+                                                  size="small"
+                                                  onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    previewFile(file.name)
+                                                  }}
+                                                >
+                                                  <i className="ri-eye-line" style={{ fontSize: 18 }} />
+                                                </IconButton>
+                                              </MuiTooltip>
+                                            )}
+                                            <MuiTooltip title={t('common.download')}>
+                                              <IconButton 
+                                                edge="end" 
+                                                size="small"
+                                                onClick={(e) => {
+                                                  e.stopPropagation()
+                                                  downloadFile(file.name, isNavigable)
+                                                }}
+                                              >
+                                                <i className="ri-download-2-line" style={{ fontSize: 18 }} />
+                                              </IconButton>
+                                            </MuiTooltip>
+                                          </Stack>
+                                        )
+                                      }
+                                    >
+                                      <ListItemButton
+                                        onClick={() => isNavigable && navigateToFolder(file.name)}
+                                        disabled={!isNavigable && file.type !== 'file'}
+                                        sx={{ borderRadius: 1, pr: canDownload ? (canPreviewFile ? 10 : 6) : 2 }}
+                                      >
+                                        <ListItemIcon sx={{ minWidth: 36 }}>
+                                          {file.type === 'directory' || file.type === 'virtual' ? (
+                                            <i className="ri-folder-fill" style={{ color: '#FFB74D', fontSize: 20 }} />
+                                          ) : (
+                                            <i className="ri-file-fill" style={{ color: '#90A4AE', fontSize: 20 }} />
+                                          )}
+                                        </ListItemIcon>
+                                        <ListItemText
+                                          primary={file.name}
+                                          secondary={
+                                            file.sizeFormatted && file.sizeFormatted !== '0 B' 
+                                              ? file.sizeFormatted
+                                              : isNavigable ? t('inventory.folder') : '-'
+                                          }
+                                        />
+                                        {isNavigable && (
+                                          <i className="ri-arrow-right-s-line" style={{ opacity: 0.5 }} />
+                                        )}
+                                      </ListItemButton>
+                                    </ListItem>
+                                  )
+                                })}
+                                {filteredExplorerFiles.length === 0 && explorerFiles.length > 0 && (
+                                  <Typography variant="body2" sx={{ opacity: 0.5, py: 2, textAlign: 'center' }}>
+                                    {t('common.noResults')}
+                                  </Typography>
+                                )}
+                                {explorerFiles.length === 0 && (
+                                  <Typography variant="body2" sx={{ opacity: 0.5, py: 2, textAlign: 'center' }}>
+                                    {t('inventory.emptyFolder')}
+                                  </Typography>
+                                )}
+                              </List>
+                            </>
+                          )}
+                        </CardContent>
+                      </Card>
+                    </>
+                  )}
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 5 - SNAPSHOTS ==================== */}
+              {detailTab === 5 && (
+                <Box sx={{ pt: 2 }}>
+                  {/* Loading */}
+                  {snapshotsLoading && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                      <CircularProgress size={32} />
+                    </Box>
+                  )}
+
+                  {/* Error */}
+                  {snapshotsError && (
+                    <Alert severity="warning" sx={{ mb: 2 }}>{snapshotsError}</Alert>
+                  )}
+
+                  {/* Header avec bouton créer */}
+                  {!snapshotsLoading && (
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <i className="ri-camera-line" style={{ fontSize: 20, opacity: 0.7 }} />
+                        <Typography variant="subtitle1" fontWeight={600}>
+                          {t('inventory.tabs.snapshots')}
+                        </Typography>
+                        {snapshots.length > 0 && (
+                          <Chip 
+                            size="small" 
+                            label={`${snapshots.filter(s => s.name !== 'current').length} snapshot${snapshots.filter(s => s.name !== 'current').length > 1 ? 's' : ''}`}
+                            sx={{ height: 20, fontSize: '0.7rem' }}
+                          />
+                        )}
+                      </Box>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                        {snapshotFeatureAvailable !== false && snapshots.filter(s => s.name !== 'current').length > 0 && (
+                          <MuiTooltip
+                            title={deleteAllBusy
+                              ? `${t('inventory.deletingSnapshots')} ${deleteAllProgress.done}/${deleteAllProgress.total}`
+                              : snapshotTaskBusy
+                                ? t('inventory.snapshotTaskRunning')
+                                : t('inventory.deleteAllSnapshots')}
+                          >
+                            <span>
+                              <IconButton
+                                size="small"
+                                color="error"
+                                onClick={deleteAllSnapshots}
+                                disabled={snapshotActionBusy || deleteAllBusy || snapshotTaskBusy}
+                                aria-label={t('inventory.deleteAllSnapshots')}
+                              >
+                                {deleteAllBusy
+                                  ? (
+                                    <CircularProgress
+                                      size={18}
+                                      variant="determinate"
+                                      value={deleteAllProgress.total > 0 ? Math.round((deleteAllProgress.done / deleteAllProgress.total) * 100) : 0}
+                                    />
+                                  )
+                                  : <i className="ri-delete-bin-line" style={{ fontSize: 18 }} />}
+                              </IconButton>
+                            </span>
+                          </MuiTooltip>
+                        )}
+                        {!showCreateSnapshot && snapshotFeatureAvailable !== false && (
+                          <MuiTooltip title={snapshotTaskBusy ? t('inventory.snapshotTaskRunning') : t('inventory.takeSnapshot')}>
+                            <span>
+                              <IconButton
+                                size="small"
+                                color="primary"
+                                onClick={() => setShowCreateSnapshot(true)}
+                                disabled={snapshotActionBusy || snapshotTaskBusy}
+                                aria-label={t('inventory.takeSnapshot')}
+                              >
+                                {/* UNISPHERE keeps the VM locked for the whole snapshot task: show the
+                                    wait instead of a bare greyed-out button. */}
+                                {snapshotTaskBusy
+                                  ? <CircularProgress size={18} />
+                                  : <i className="ri-add-line" style={{ fontSize: 18 }} />}
+                              </IconButton>
+                            </span>
+                          </MuiTooltip>
+                        )}
+                      </Box>
+                    </Box>
+                  )}
+
+                  {/* Info: snapshot feature not available (LXC with incompatible storage) */}
+                  {!snapshotsLoading && snapshotFeatureAvailable === false && (
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      {t('inventory.snapshotNotAvailable')}
+                    </Alert>
+                  )}
+
+                  {/* Formulaire de création */}
+                  {!snapshotsLoading && showCreateSnapshot && snapshotFeatureAvailable !== false && (
+                    <Card variant="outlined" sx={{ mb: 2, bgcolor: 'action.hover' }}>
+                      <CardContent sx={{ pb: '16px !important' }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 2, display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <i className="ri-camera-lens-line" style={{ fontSize: 18 }} />
+                          {t('audit.actions.snapshot')}
+                        </Typography>
+                        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+                          <TextField
+                            size="small"
+                            label={t('common.name')}
+                            value={newSnapshotName}
+                            onChange={(e) => setNewSnapshotName(e.target.value.replaceAll(/[^a-zA-Z0-9_-]/g, ''))}
+                            placeholder="my-snapshot"
+                            helperText={t('inventory.snapshotNameHelp')}
+                            fullWidth
+                          />
+                          <TextField
+                            size="small"
+                            label={`${t('common.description')} (${t('common.optional')})`}
+                            value={newSnapshotDesc}
+                            onChange={(e) => setNewSnapshotDesc(e.target.value)}
+                            fullWidth
+                          />
+                        </Box>
+                        <Box sx={{ mt: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <FormControlLabel
+                            control={
+                              <Switch
+                                checked={newSnapshotRam}
+                                onChange={(e) => setNewSnapshotRam(e.target.checked)}
+                                size="small"
+                              />
+                            }
+                            label={
+                              <Typography variant="body2">
+                                {t('inventory.includeRam')}
+                                <Typography component="span" variant="caption" sx={{ ml: 0.5, opacity: 0.6 }}>
+                                  ({t('inventory.vmMustBeRunning')})
+                                </Typography>
+                              </Typography>
+                            }
+                          />
+                          <Stack direction="row" spacing={1}>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              onClick={() => {
+                                setShowCreateSnapshot(false)
+                                setNewSnapshotName('')
+                                setNewSnapshotDesc('')
+                                setNewSnapshotRam(false)
+                              }}
+                            >
+                              {t('common.cancel')}
+                            </Button>
+                            <Button
+                              variant="contained"
+                              size="small"
+                              onClick={createSnapshot}
+                              disabled={!newSnapshotName.trim() || snapshotActionBusy || snapshotTaskBusy}
+                              startIcon={snapshotActionBusy || snapshotTaskBusy ? <CircularProgress size={14} /> : <i className="ri-camera-line" />}
+                            >
+                              {t('common.create')}
+                            </Button>
+                          </Stack>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Timeline des snapshots */}
+                  {!snapshotsLoading && (
+                    <Box sx={{ position: 'relative' }}>
+                      {/* Overlay loader during create/delete/rollback */}
+                      {snapshotActionBusy && (
+                        <Box sx={{
+                          position: 'absolute', inset: 0, zIndex: 2,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.6)',
+                          borderRadius: 1, backdropFilter: 'blur(2px)'
+                        }}>
+                          <CircularProgress size={28} />
+                        </Box>
+                      )}
+                      {snapshots.filter(s => s.name !== 'current').length === 0 ? (
+                        <Card variant="outlined" sx={{ textAlign: 'center', py: 4, bgcolor: 'transparent' }}>
+                          <i className="ri-camera-off-line" style={{ fontSize: 48, opacity: 0.2 }} />
+                          <Typography variant="body2" sx={{ mt: 1, opacity: 0.6 }}>
+                            {t('common.noData')}
+                          </Typography>
+                          <Typography variant="caption" sx={{ opacity: 0.4, display: 'block', mt: 0.5 }}>
+                            {t('inventory.deleteSnapshotDesc')}
+                          </Typography>
+                        </Card>
+                      ) : (
+                        <Box sx={{ position: 'relative' }}>
+                          {/* Ligne de timeline */}
+                          <Box sx={{ 
+                            position: 'absolute', 
+                            left: 19, 
+                            top: 24, 
+                            bottom: 24, 
+                            width: 2, 
+                            bgcolor: 'divider',
+                            borderRadius: 1
+                          }} />
+                          
+                          {/* État actuel (current) */}
+                          <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 2, mb: 1, position: 'relative' }}>
+                            <Box sx={{ 
+                              width: 40, 
+                              height: 40, 
+                              borderRadius: '50%', 
+                              bgcolor: 'success.main',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              color: 'success.contrastText',
+                              zIndex: 1,
+                              boxShadow: 2
+                            }}>
+                              <i className="ri-play-circle-fill" style={{ fontSize: 20 }} />
+                            </Box>
+                            <Box sx={{ flex: 1, pt: 0.5 }}>
+                              <Typography variant="body2" fontWeight={600}>
+                                {t('common.active')}
+                              </Typography>
+                              <Typography variant="caption" sx={{ opacity: 0.6 }}>
+                                {t('common.configuration')}
+                              </Typography>
+                            </Box>
+                          </Box>
+
+                          {/* Liste des snapshots */}
+                          {snapshots
+                            .filter(s => s.name !== 'current')
+                            .sort((a, b) => (b.snaptime || 0) - (a.snaptime || 0))
+                            .map((snap, idx, arr) => {
+                              const isOldest = idx === arr.length - 1
+                              // The UNISPHERE task behind this row is still running: UNISPHERE writes
+                              // the snapshot entry into the VM config before the task ends
+                              // (create/rollback), and a deleted row legitimately stays in
+                              // the list until the merge finishes — show it as in progress
+                              // instead of letting it look frozen or already done.
+                              const rowTask = snapshotRowTasks[snap.name]
+                              const rowTaskLabels = { delete: 'common.deleting', create: 'common.creating', rollback: 'common.restoring' } as const
+
+                              
+return (
+                                <Box 
+                                  key={snap.name}
+                                  sx={{ 
+                                    display: 'flex', 
+                                    alignItems: 'flex-start', 
+                                    gap: 2, 
+                                    mb: 1,
+                                    position: 'relative',
+                                    '&:hover .snapshot-actions': { opacity: 1 }
+                                  }}
+                                >
+                                  {/* Point de timeline */}
+                                  <Box sx={{
+                                    width: 40,
+                                    height: 40,
+                                    borderRadius: '50%',
+                                    bgcolor: snap.vmstate ? 'primary.main' : 'background.paper',
+                                    border: '2px solid',
+                                    borderColor: snap.vmstate ? 'primary.main' : 'divider',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    color: snap.vmstate ? 'primary.contrastText' : 'text.secondary',
+                                    zIndex: 1
+                                  }}>
+                                    {rowTask
+                                      ? <CircularProgress size={18} color="inherit" />
+                                      : <i className={snap.vmstate ? "ri-save-3-fill" : "ri-camera-fill"} style={{ fontSize: 18 }} />}
+                                  </Box>
+                                  
+                                  {/* Contenu */}
+                                  <Card 
+                                    variant="outlined" 
+                                    sx={{ 
+                                      flex: 1,
+                                      bgcolor: 'transparent',
+                                      opacity: rowTask ? 0.6 : 1,
+                                      '&:hover': { bgcolor: rowTask ? 'transparent' : 'action.hover' }
+                                    }}
+                                  >
+                                    <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
+                                      <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                                        <Box sx={{ flex: 1 }}>
+                                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                                            <Typography variant="body2" fontWeight={600}>
+                                              {snap.name}
+                                            </Typography>
+                                            {snap.vmstate && (
+                                              <Chip
+                                                size="small"
+                                                label="RAM"
+                                                color="primary"
+                                                icon={<i className="ri-ram-line" style={{ fontSize: 12 }} />}
+                                                sx={{ height: 20, fontSize: '0.65rem' }}
+                                              />
+                                            )}
+                                            {isOldest && (
+                                              <Chip 
+                                                size="small" 
+                                                label={t('inventory.oldest')}
+                                                variant="outlined"
+                                                sx={{ height: 20, fontSize: '0.65rem' }} 
+                                              />
+                                            )}
+                                            {rowTask && (
+                                              <Chip
+                                                size="small"
+                                                label={t(rowTaskLabels[rowTask])}
+                                                variant="outlined"
+                                                sx={{ height: 20, fontSize: '0.65rem' }}
+                                              />
+                                            )}
+                                          </Box>
+                                          
+                                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5, flexWrap: 'wrap' }}>
+                                            <Typography variant="caption" sx={{ opacity: 0.6, display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                              <i className="ri-time-line" style={{ fontSize: 12 }} />
+                                              {snap.snaptime ? formatDateTime(snap.snaptime * 1000, locale) : '-'}
+                                            </Typography>
+                                            {snap.description && (
+                                              <>
+                                                <Typography variant="caption" sx={{ opacity: 0.3 }}>•</Typography>
+                                                <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                                  {snap.description}
+                                                </Typography>
+                                              </>
+                                            )}
+                                          </Box>
+                                        </Box>
+                                        
+                                        {/* Actions */}
+                                        <Stack 
+                                          direction="row" 
+                                          spacing={0.5} 
+                                          className="snapshot-actions"
+                                          sx={{ opacity: { xs: 1, md: 0 }, transition: 'opacity 0.2s' }}
+                                        >
+                                          <MuiTooltip title={t('audit.actions.restore')}>
+                                            <IconButton
+                                              size="small"
+                                              onClick={() => rollbackSnapshot(snap.name, snap.vmstate)}
+                                              disabled={snapshotActionBusy || snapshotTaskBusy}
+                                              sx={{
+                                                color: 'warning.main',
+                                                '&:hover': { bgcolor: 'warning.main', color: 'warning.contrastText' }
+                                              }}
+                                            >
+                                              <i className="ri-history-line" style={{ fontSize: 18 }} />
+                                            </IconButton>
+                                          </MuiTooltip>
+                                          <MuiTooltip title={t('inventory.deleteSnapshot')}>
+                                            <IconButton
+                                              size="small"
+                                              onClick={() => deleteSnapshot(snap.name)}
+                                              disabled={snapshotActionBusy || snapshotTaskBusy}
+                                              sx={{
+                                                color: 'error.main',
+                                                '&:hover': { bgcolor: 'error.main', color: 'error.contrastText' }
+                                              }}
+                                            >
+                                              <i className="ri-delete-bin-line" style={{ fontSize: 18 }} />
+                                            </IconButton>
+                                          </MuiTooltip>
+                                        </Stack>
+                                      </Box>
+                                    </CardContent>
+                                  </Card>
+                                </Box>
+                              )
+                            })}
+                        </Box>
+                      )}
+                    </Box>
+                  )}
+
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 6 - NOTES ==================== */}
+              {detailTab === 6 && (
+                <Box sx={{ py: 2 }}>
+                  <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                    <CardContent>
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+                        <Typography variant="h6" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <i className="ri-sticky-note-line" style={{ fontSize: 20 }} />
+                          {t('inventory.tabs.notes')}
+                        </Typography>
+                        {!notesEditing && (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            startIcon={<i className="ri-edit-line" />}
+                            onClick={() => setNotesEditing(true)}
+                          >
+                            {t('common.edit')}
+                          </Button>
+                        )}
+                      </Box>
+
+                      {/* Loading */}
+                      {notesLoading && (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                          <CircularProgress size={32} />
+                        </Box>
+                      )}
+
+                      {/* Error */}
+                      {notesError && (
+                        <Alert severity="warning" sx={{ mb: 2 }}>{notesError}</Alert>
+                      )}
+
+                      {/* Contenu des notes */}
+                      {!notesLoading && !notesError && (
+                        <>
+                          {notesEditing ? (
+                            <Box>
+                              <TextField
+                                fullWidth
+                                multiline
+                                minRows={8}
+                                maxRows={20}
+                                value={vmNotes}
+                                onChange={(e) => setVmNotes(e.target.value)}
+                                placeholder={t('inventory.notesPlaceholder')}
+                                sx={{ mb: 2 }}
+                              />
+                              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                                <Button
+                                  variant="outlined"
+                                  onClick={() => {
+                                    setNotesEditing(false)
+                                    loadNotes() // Recharger les notes originales
+                                  }}
+                                  disabled={notesSaving}
+                                >
+                                  {t('common.cancel')}
+                                </Button>
+                                <Button
+                                  variant="contained"
+                                  onClick={saveNotes}
+                                  disabled={notesSaving}
+                                  startIcon={notesSaving ? <CircularProgress size={16} /> : <SaveIcon />}
+                                >
+                                  {notesSaving ? t('common.saving') : t('common.save')}
+                                </Button>
+                              </Stack>
+                            </Box>
+                          ) : (
+                            <Box
+                              sx={{
+                                p: 2,
+                                bgcolor: 'action.hover',
+                                borderRadius: 1,
+                                minHeight: 150,
+                                fontFamily: 'inherit',
+                              }}
+                            >
+                              {vmNotes ? (
+                                <Box
+                                  sx={{ lineHeight: 1.8, fontSize: '0.875rem', ...markdownSx }}
+                                  dangerouslySetInnerHTML={{
+                                    __html: DOMPurify.sanitize(parseMarkdown(vmNotes), { ALLOWED_TAGS: ['h1','h2','h3','h4','h5','h6','p','br','b','i','u','strong','em','a','ul','ol','li','table','thead','tbody','tr','th','td','hr','pre','code','blockquote','span','div','img','sup','sub','dl','dt','dd'], ALLOWED_ATTR: ['href','src','alt','title','class','style','target','width','height','colspan','rowspan'], ADD_ATTR: ['target'] })
+                                  }}
+                                />
+                              ) : (
+                                <Typography variant="body2" sx={{ opacity: 0.5, fontStyle: 'italic' }}>
+                                  {t('inventory.noNotes')}
+                                </Typography>
+                              )}
+                            </Box>
+                          )}
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 7 - RÉPLICATION ==================== */}
+              {detailTab === 7 && (
+                <Box sx={{ py: 2 }}>
+                  <Stack spacing={2}>
+                    {/* ZFS Replication (Native eSage) */}
+                    <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                      <CardContent>
+                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+                          <Typography variant="h6" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                            <i className="ri-database-2-line" style={{ fontSize: 20 }} />
+                            {t('replication.zfsReplication')}
+                          </Typography>
+                          <Button
+                            size="small"
+                            variant="contained"
+                            startIcon={<AddIcon />}
+                            onClick={() => {
+                              setReplicationTargetNode('')
+                              setReplicationSchedule('*/15')
+                              setReplicationRateLimit('')
+                              setReplicationComment('')
+                              setAddReplicationDialogOpen(true)
+                            }}
+                            disabled={availableTargetNodes.length === 0}
+                          >
+                            {t('replication.addJob')}
+                          </Button>
+                        </Box>
+
+                        {replicationLoading ? (
+                          <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                            <CircularProgress size={24} />
+                          </Box>
+                        ) : replicationJobs.length > 0 ? (
+                          <TableContainer>
+                            <Table size="small">
+                              <TableHead>
+                                <TableRow>
+                                  <TableCell>{t('replication.target')}</TableCell>
+                                  <TableCell>{t('replication.schedule')}</TableCell>
+                                  <TableCell>{t('replication.lastSync')}</TableCell>
+                                  <TableCell>{t('replication.nextSync')}</TableCell>
+                                  <TableCell align="center">{t('updates.status')}</TableCell>
+                                  <TableCell align="center">{t('inventory.actions')}</TableCell>
+                                </TableRow>
+                              </TableHead>
+                              <TableBody>
+                                {replicationJobs.map((job: any) => (
+                                  <TableRow key={job.id}>
+                                    <TableCell>
+                                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <i className="ri-server-line" style={{ fontSize: 16, opacity: 0.7 }} />
+                                        <Typography variant="body2" fontWeight={600}>{job.target}</Typography>
+                                      </Box>
+                                    </TableCell>
+                                    <TableCell>
+                                      <Chip 
+                                        size="small" 
+                                        label={job.schedule || '*/15'} 
+                                        sx={{ height: 22, fontSize: 11 }}
+                                      />
+                                    </TableCell>
+                                    <TableCell>
+                                      <Typography variant="body2" sx={{ fontSize: 12 }}>
+                                        {job.lastSync ? new Date(job.lastSync * 1000).toLocaleString() : '—'}
+                                      </Typography>
+                                    </TableCell>
+                                    <TableCell>
+                                      <Typography variant="body2" sx={{ fontSize: 12 }}>
+                                        {job.nextSync ? new Date(job.nextSync * 1000).toLocaleString() : '—'}
+                                      </Typography>
+                                    </TableCell>
+                                    <TableCell align="center">
+                                      {job.error ? (
+                                        <MuiTooltip title={typeof job.error === 'string' ? job.error : JSON.stringify(job.error)}>
+                                          <Chip 
+                                            size="small" 
+                                            label={t('replication.error')} 
+                                            color="error"
+                                            icon={<i className="ri-error-warning-fill" style={{ fontSize: 14 }} />}
+                                            sx={{ height: 22 }}
+                                          />
+                                        </MuiTooltip>
+                                      ) : job.disable ? (
+                                        <Chip 
+                                          size="small" 
+                                          label={t('common.disabled')} 
+                                          color="default"
+                                          sx={{ height: 22 }}
+                                        />
+                                      ) : (
+                                        <Chip 
+                                          size="small" 
+                                          label={t('replication.active')} 
+                                          color="success"
+                                          icon={<i className="ri-checkbox-circle-fill" style={{ fontSize: 14 }} />}
+                                          sx={{ height: 22 }}
+                                        />
+                                      )}
+                                    </TableCell>
+                                    <TableCell align="center">
+                                      <Stack direction="row" spacing={0.5} justifyContent="center">
+                                        <MuiTooltip title={t('replication.viewLog')}>
+                                          <IconButton
+                                            size="small"
+                                            onClick={async () => {
+                                              const { connId, node } = parseVmId(selection?.id || '')
+
+                                              setReplicationLogJob(job)
+                                              setReplicationLogOpen(true)
+                                              setReplicationLogLoading(true)
+                                              try {
+                                                const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/replication/${encodeURIComponent(job.id)}?limit=200`, { cache: 'no-store' })
+
+                                                if (res.ok) {
+                                                  const json = await res.json()
+
+                                                  setReplicationLogData(Array.isArray(json.data) ? json.data : [])
+                                                } else {
+                                                  setReplicationLogData([])
+                                                }
+                                              } catch {
+                                                setReplicationLogData([])
+                                              } finally {
+                                                setReplicationLogLoading(false)
+                                              }
+                                            }}
+                                          >
+                                            <i className="ri-file-list-line" style={{ fontSize: 16 }} />
+                                          </IconButton>
+                                        </MuiTooltip>
+                                        <MuiTooltip title={t('replication.runNow')}>
+                                          <IconButton
+                                            size="small"
+                                            onClick={async () => {
+                                              const { connId, node } = parseVmId(selection?.id || '')
+                                              try {
+                                                await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/replication/${encodeURIComponent(job.id)}/schedule_now`, {
+                                                  method: 'POST'
+                                                })
+                                                setReplicationLoaded(false)
+                                              } catch {}
+                                            }}
+                                          >
+                                            <i className="ri-play-fill" style={{ fontSize: 16 }} />
+                                          </IconButton>
+                                        </MuiTooltip>
+                                        <MuiTooltip title={t('common.delete')}>
+                                          <IconButton
+                                            size="small"
+                                            color="error"
+                                            onClick={() => setDeleteReplicationId(job.id)}
+                                          >
+                                            <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />
+                                          </IconButton>
+                                        </MuiTooltip>
+                                      </Stack>
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </TableContainer>
+                        ) : (
+                          <Alert severity="info" icon={<i className="ri-information-line" />}>
+                            <Typography variant="body2">
+                              {t('replication.noJobs')}
+                            </Typography>
+                            {availableTargetNodes.length === 0 && (
+                              <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.8 }}>
+                                {t('replication.noTargetNodes')}
+                              </Typography>
+                            )}
+                          </Alert>
+                        )}
+                      </CardContent>
+                    </Card>
+
+                  </Stack>
+
+
+                  {/* Dialog Ajouter Réplication ZFS */}
+                  <Dialog 
+                    open={addReplicationDialogOpen} 
+                    onClose={() => setAddReplicationDialogOpen(false)}
+                    maxWidth="sm"
+                    fullWidth
+                  >
+                    <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className="ri-repeat-line" style={{ fontSize: 24 }} />
+                      {t('replication.createJob')}
+                    </DialogTitle>
+                    <DialogContent>
+                      <Stack spacing={2} sx={{ mt: 1 }}>
+                        <Box>
+                          <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                            CT/VM ID
+                          </Typography>
+                          <TextField
+                            fullWidth
+                            size="small"
+                            value={selection?.id ? parseVmId(selection.id).vmid : ''}
+                            disabled
+                          />
+                        </Box>
+
+                        <FormControl fullWidth size="small">
+                          <InputLabel>{t('replication.target')}</InputLabel>
+                          <Select
+                            value={replicationTargetNode}
+                            label={t('replication.target')}
+                            onChange={(e) => setReplicationTargetNode(e.target.value)}
+                          >
+                            {availableTargetNodes.map((node) => (
+                              <MenuItem key={node} value={node}>{node}</MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+
+                        <FormControl fullWidth size="small">
+                          <InputLabel>{t('replication.schedule')}</InputLabel>
+                          <Select
+                            value={replicationSchedule}
+                            label={t('replication.schedule')}
+                            onChange={(e) => setReplicationSchedule(e.target.value)}
+                          >
+                            <MenuItem value="*/5">*/5 - {t('replication.every5min')}</MenuItem>
+                            <MenuItem value="*/15">*/15 - {t('replication.every15min')}</MenuItem>
+                            <MenuItem value="*/30">*/30 - {t('replication.every30min')}</MenuItem>
+                            <MenuItem value="0">0 - {t('replication.everyHour')}</MenuItem>
+                            <MenuItem value="0 */2">0 */2 - {t('replication.every2hours')}</MenuItem>
+                            <MenuItem value="0 */6">0 */6 - {t('replication.every6hours')}</MenuItem>
+                            <MenuItem value="0 0">0 0 - {t('replication.daily')}</MenuItem>
+                          </Select>
+                        </FormControl>
+
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label={t('replication.rateLimit')}
+                          value={replicationRateLimit}
+                          onChange={(e) => setReplicationRateLimit(e.target.value)}
+                          placeholder="unlimited"
+                          InputProps={{
+                            endAdornment: <InputAdornment position="end">MB/s</InputAdornment>,
+                          }}
+                        />
+
+                        <TextField
+                          fullWidth
+                          size="small"
+                          label={t('replication.comment')}
+                          value={replicationComment}
+                          onChange={(e) => setReplicationComment(e.target.value)}
+                          multiline
+                          rows={2}
+                        />
+                      </Stack>
+                    </DialogContent>
+                    <DialogActions>
+                      <Button onClick={() => setAddReplicationDialogOpen(false)}>
+                        {t('common.cancel')}
+                      </Button>
+                      <Button
+                        variant="contained"
+                        disabled={!replicationTargetNode || savingReplication}
+                        startIcon={savingReplication ? <CircularProgress size={16} /> : <AddIcon />}
+                        onClick={async () => {
+                          if (!selection?.id || !replicationTargetNode) return
+                          setSavingReplication(true)
+                          const { connId, node, vmid } = parseVmId(selection.id)
+                          try {
+                            const body: any = {
+                              target: replicationTargetNode,
+                              schedule: replicationSchedule,
+                            }
+                            if (replicationRateLimit) body.rate = replicationRateLimit
+                            if (replicationComment) body.comment = replicationComment
+
+                            const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/replication`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ ...body, guest: vmid }),
+                            })
+                            
+                            if (res.ok) {
+                              setAddReplicationDialogOpen(false)
+                              setReplicationLoaded(false)
+                            }
+                          } catch (e) {
+                            console.error('Error creating replication job:', e)
+                          } finally {
+                            setSavingReplication(false)
+                          }
+                        }}
+                      >
+                        {t('replication.create')}
+                      </Button>
+                    </DialogActions>
+                  </Dialog>
+
+                  {/* Dialog Confirmer suppression */}
+                  <Dialog 
+                    open={!!deleteReplicationId} 
+                    onClose={() => setDeleteReplicationId(null)}
+                    maxWidth="xs"
+                    fullWidth
+                  >
+                    <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className="ri-error-warning-line" style={{ fontSize: 24, color: '#f44336' }} />
+                      {t('replication.deleteJob')}
+                    </DialogTitle>
+                    <DialogContent>
+                      <Typography variant="body2">
+                        {t('replication.confirmDelete')}
+                      </Typography>
+                    </DialogContent>
+                    <DialogActions>
+                      <Button onClick={() => setDeleteReplicationId(null)}>
+                        {t('common.cancel')}
+                      </Button>
+                      <Button
+                        variant="contained"
+                        color="error"
+                        onClick={async () => {
+                          if (!selection?.id || !deleteReplicationId) return
+                          const { connId, node } = parseVmId(selection.id)
+                          try {
+                            await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/replication/${encodeURIComponent(deleteReplicationId)}`, {
+                              method: 'DELETE',
+                            })
+                            setDeleteReplicationId(null)
+                            setReplicationLoaded(false)
+                          } catch (e) {
+                            console.error('Error deleting replication job:', e)
+                          }
+                        }}
+                      >
+                        {t('common.delete')}
+                      </Button>
+                    </DialogActions>
+                  </Dialog>
+
+                  {/* Dialog Replication Log */}
+                  <Dialog
+                    open={replicationLogOpen}
+                    onClose={() => setReplicationLogOpen(false)}
+                    maxWidth="md"
+                    fullWidth
+                  >
+                    <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className="ri-file-list-line" style={{ fontSize: 20 }} />
+                      {t('replication.logTitle', { id: replicationLogJob?.id || '' })}
+                    </DialogTitle>
+                    <DialogContent dividers>
+                      {replicationLogLoading ? (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                          <CircularProgress size={24} />
+                        </Box>
+                      ) : replicationLogData.length > 0 ? (
+                        <Box
+                          component="pre"
+                          sx={{
+                            fontSize: 12,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-all',
+                            m: 0,
+                            p: 2,
+                            bgcolor: 'background.default',
+                            borderRadius: 1,
+                            maxHeight: '60vh',
+                            overflow: 'auto',
+                          }}
+                        >
+                          {replicationLogData.join('\n')}
+                        </Box>
+                      ) : (
+                        <Box sx={{ p: 4, textAlign: 'center', opacity: 0.6 }}>
+                          <Typography variant="body2">{t('replication.noLog')}</Typography>
+                        </Box>
+                      )}
+                    </DialogContent>
+                    <DialogActions>
+                      <Button onClick={() => setReplicationLogOpen(false)}>{t('common.close')}</Button>
+                    </DialogActions>
+                  </Dialog>
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 8 - CLOUD-INIT ==================== */}
+              {detailTab === 8 && (
+                <Box sx={{ py: 2 }}>
+                  {loading ? (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                      <CircularProgress />
+                    </Box>
+                  ) : !data.cloudInitConfig ? (
+                    <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                      <CardContent sx={{ py: 6, textAlign: 'center' }}>
+                        <i className="ri-cloud-off-line" style={{ fontSize: 48, opacity: 0.3 }} />
+                        <Typography variant="h6" sx={{ mt: 2, fontWeight: 600 }}>
+                          {t('inventory.cloudInit.noCloudInit')}
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1, maxWidth: 480, mx: 'auto' }}>
+                          {t('inventory.cloudInit.noCloudInitDesc')}
+                        </Typography>
+                      </CardContent>
+                    </Card>
+                  ) : (
+                    <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                      <CardContent sx={{ p: 0 }}>
+                        <Box sx={{ overflowX: 'auto' }}>
+                          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                            <thead>
+                              <tr style={{ backgroundColor: 'var(--mui-palette-action-hover)' }}>
+                                <th style={{ padding: '4px 12px', textAlign: 'left', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)', width: '30%' }}>{t('inventory.option')}</th>
+                                <th style={{ padding: '4px 12px', textAlign: 'left', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)' }}>{t('inventory.value')}</th>
+                                <th style={{ padding: '4px 12px', textAlign: 'center', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--mui-palette-divider)', width: '60px' }}>{t('inventory.actions')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {/* User */}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-user-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.cloudInit.user')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.cloudInitConfig.ciuser ? 1 : 0.5, fontStyle: data.cloudInitConfig.ciuser ? 'normal' : 'italic' }}>
+                                  {data.cloudInitConfig.ciuser || t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'ciuser', label: t('inventory.cloudInit.user'), value: data.cloudInitConfig.ciuser || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              {/* Password */}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-lock-password-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.cloudInit.password')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.cloudInitConfig.cipassword ? 1 : 0.5, fontStyle: data.cloudInitConfig.cipassword ? 'normal' : 'italic' }}>
+                                  {data.cloudInitConfig.cipassword ? t('inventory.cloudInit.passwordMasked') : t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'cipassword', label: t('inventory.cloudInit.password'), value: '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              {/* SSH Public Keys */}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-key-2-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.cloudInit.sshKeys')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.cloudInitConfig.sshkeys ? 1 : 0.5, fontStyle: data.cloudInitConfig.sshkeys ? 'normal' : 'italic' }}>
+                                  {data.cloudInitConfig.sshkeys ? (
+                                    <Box component="pre" sx={{ m: 0, fontSize: 12, fontFamily: 'JetBrains Mono, monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 120, overflow: 'auto' }}>
+                                      {data.cloudInitConfig.sshkeys}
+                                    </Box>
+                                  ) : t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'sshkeys', label: t('inventory.cloudInit.sshKeys'), value: data.cloudInitConfig.sshkeys || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              {/* IP Configurations */}
+                              {data.cloudInitConfig.ipconfigs && Object.entries(data.cloudInitConfig.ipconfigs)
+                                .sort(([a], [b]) => {
+                                  const na = Number.parseInt(a.replaceAll('ipconfig', ''))
+                                  const nb = Number.parseInt(b.replaceAll('ipconfig', ''))
+                                  return na - nb
+                                })
+                                .map(([key, val]: [string, any]) => (
+                                <tr key={key}>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                      <i className="ri-global-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                      {t('inventory.cloudInit.ipConfig')} ({key.replaceAll('ipconfig', '')})
+                                    </Box>
+                                  </td>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, position: 'relative' as const }}>
+                                    <Typography variant="body2" sx={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}>{String(val)}</Typography>
+                                    <Typography variant="caption" color="text.secondary">{t('inventory.cloudInit.ipConfigHelp')}</Typography>
+                                  </td>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                    <MuiTooltip title={t('common.edit')}>
+                                      <IconButton size="small" onClick={() => setEditOptionDialog({ key, label: `${t('inventory.cloudInit.ipConfig')} (${key.replaceAll('ipconfig', '')})`, value: String(val), type: 'text' })}>
+                                        <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                      </IconButton>
+                                    </MuiTooltip>
+                                  </td>
+                                </tr>
+                              ))}
+                              {/* If no ipconfigs yet, show ipconfig0 placeholder */}
+                              {(!data.cloudInitConfig.ipconfigs || Object.keys(data.cloudInitConfig.ipconfigs).length === 0) && (
+                                <tr>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                      <i className="ri-global-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                      {t('inventory.cloudInit.ipConfig')} (0)
+                                    </Box>
+                                  </td>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: 0.5, fontStyle: 'italic' }}>
+                                    {t('common.noData')}
+                                  </td>
+                                  <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                    <MuiTooltip title={t('common.edit')}>
+                                      <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'ipconfig0', label: `${t('inventory.cloudInit.ipConfig')} (0)`, value: '', type: 'text' })}>
+                                        <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                      </IconButton>
+                                    </MuiTooltip>
+                                  </td>
+                                </tr>
+                              )}
+                              {/* DNS Server */}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-dns-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.cloudInit.nameserver')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.cloudInitConfig.nameserver ? 1 : 0.5, fontStyle: data.cloudInitConfig.nameserver ? 'normal' : 'italic' }}>
+                                  {data.cloudInitConfig.nameserver || t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'nameserver', label: t('inventory.cloudInit.nameserver'), value: data.cloudInitConfig.nameserver || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                              {/* Search Domain */}
+                              <tr>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, fontWeight: 500 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <i className="ri-search-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                                    {t('inventory.cloudInit.searchdomain')}
+                                  </Box>
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, opacity: data.cloudInitConfig.searchdomain ? 1 : 0.5, fontStyle: data.cloudInitConfig.searchdomain ? 'normal' : 'italic' }}>
+                                  {data.cloudInitConfig.searchdomain || t('common.noData')}
+                                </td>
+                                <td style={{ padding: '3px 12px', borderBottom: '1px solid var(--mui-palette-divider)', fontSize: 12, textAlign: 'center' }}>
+                                  <MuiTooltip title={t('common.edit')}>
+                                    <IconButton size="small" onClick={() => setEditOptionDialog({ key: 'searchdomain', label: t('inventory.cloudInit.searchdomain'), value: data.cloudInitConfig.searchdomain || '', type: 'text' })}>
+                                      <i className="ri-pencil-line" style={{ fontSize: 16 }} />
+                                    </IconButton>
+                                  </MuiTooltip>
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                  )}
+                </Box>
+              )}
+
+              {/* ==================== ONGLET 9 - HA (seulement pour les clusters) ==================== */}
+              {detailTab === 9 && selectedVmIsCluster && (() => {
+                const haStateColor = (s?: string): 'success' | 'warning' | 'error' | 'default' => {
+                  switch (s) {
+                    case 'started':
+                    case 'enabled': return 'success'
+                    case 'stopped': return 'warning'
+                    case 'disabled': return 'error'
+                    default: return 'default'
+                  }
+                }
+                const failbackOn = haConfig && Number(haConfig.failback ?? 1) === 1
+
+                return (
+                <Box sx={{ py: 2 }}>
+                  <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                    <CardContent>
+                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+                        <Typography variant="h6" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <i className="ri-shield-check-line" style={{ fontSize: 20 }} />
+                          High Availability (HA)
+                        </Typography>
+                        {haConfig && !haEditing && (
+                          <Box sx={{ display: 'flex', gap: 1 }}>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="error"
+                              startIcon={<i className="ri-delete-bin-line" />}
+                              onClick={removeHaConfig}
+                              disabled={haSaving}
+                            >
+                              {t('audit.actions.disable')}
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="contained"
+                              startIcon={<i className="ri-edit-line" />}
+                              onClick={() => setHaEditing(true)}
+                            >
+                              {t('common.edit')}
+                            </Button>
+                          </Box>
+                        )}
+                      </Box>
+
+                      {/* Loading */}
+                      {haLoading && (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                          <CircularProgress size={32} />
+                        </Box>
+                      )}
+
+                      {/* Error */}
+                      {haError && (
+                        <Alert severity="error" sx={{ mb: 2 }}>{haError}</Alert>
+                      )}
+
+                      {/* Contenu HA */}
+                      {!haLoading && !haError && (
+                        <>
+                          {haEditing ? (
+                            <Box>
+                              <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
+                                <FormControl fullWidth size="small">
+                                  <InputLabel>{t('inventory.group')}</InputLabel>
+                                  <Select
+                                    value={haGroup}
+                                    onChange={(e) => setHaGroup(e.target.value)}
+                                    label={t('inventory.group')}
+                                  >
+                                    <MenuItem value="">
+                                      <em>{t('common.none')}</em>
+                                    </MenuItem>
+                                    {haGroups.map((g: any) => (
+                                      <MenuItem key={g.group} value={g.group}>
+                                        {g.group}
+                                      </MenuItem>
+                                    ))}
+                                  </Select>
+                                </FormControl>
+                                <FormControl fullWidth size="small">
+                                  <InputLabel>{t('inventory.haRequestState')}</InputLabel>
+                                  <Select
+                                    value={haState}
+                                    onChange={(e) => setHaState(e.target.value)}
+                                    label={t('inventory.haRequestState')}
+                                  >
+                                    <MenuItem value="started">started</MenuItem>
+                                    <MenuItem value="stopped">stopped</MenuItem>
+                                    <MenuItem value="enabled">enabled</MenuItem>
+                                    <MenuItem value="disabled">disabled</MenuItem>
+                                    <MenuItem value="ignored">ignored</MenuItem>
+                                  </Select>
+                                </FormControl>
+
+                                <NumericTextField
+                                  label={t('cluster.maxRestart')}
+                                  type="number"
+                                  size="small"
+                                  value={haMaxRestart}
+                                  onChange={setHaMaxRestart}
+                                  fallback={0}
+                                  inputProps={{ min: 0, max: 10 }}
+                                />
+                                <NumericTextField
+                                  label={t('cluster.maxRelocate')}
+                                  type="number"
+                                  size="small"
+                                  value={haMaxRelocate}
+                                  onChange={setHaMaxRelocate}
+                                  fallback={0}
+                                  inputProps={{ min: 0, max: 10 }}
+                                />
+
+                                <Box
+                                  sx={{
+                                    gridColumn: '1 / -1',
+                                    border: '1px solid',
+                                    borderColor: 'divider',
+                                    borderRadius: 1,
+                                    px: 2,
+                                    py: 1,
+                                  }}
+                                >
+                                  <FormControlLabel
+                                    control={
+                                      <Switch
+                                        checked={haFailback}
+                                        onChange={(e) => setHaFailback(e.target.checked)}
+                                        disabled={haSaving}
+                                      />
+                                    }
+                                    label={
+                                      <Box>
+                                        <Typography variant="body2" fontWeight={600}>{t('inventory.haFailback')}</Typography>
+                                        <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                          {t('inventory.haFailbackHelp')}
+                                        </Typography>
+                                      </Box>
+                                    }
+                                    sx={{ m: 0, alignItems: 'center' }}
+                                  />
+                                </Box>
+
+                                <TextField
+                                  label={t('inventory.comment')}
+                                  size="small"
+                                  value={haComment}
+                                  onChange={(e) => setHaComment(e.target.value)}
+                                  sx={{ gridColumn: '1 / -1' }}
+                                />
+                              </Box>
+
+                              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                                <Button
+                                  variant="outlined"
+                                  onClick={() => {
+                                    setHaEditing(false)
+                                    loadHaConfig() // Recharger la config originale
+                                  }}
+                                  disabled={haSaving}
+                                >
+                                  {t('common.cancel')}
+                                </Button>
+                                <Button
+                                  variant="contained"
+                                  onClick={saveHaConfig}
+                                  disabled={haSaving}
+                                  startIcon={haSaving ? <CircularProgress size={16} /> : <SaveIcon />}
+                                >
+                                  {haSaving ? t('common.saving') : (haConfig ? t('common.save') : t('inventory.haEnable'))}
+                                </Button>
+                              </Stack>
+                            </Box>
+                          ) : haConfig ? (
+                            <Box
+                              sx={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                                gap: 1.5,
+                              }}
+                            >
+                              <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                                <Typography variant="caption" sx={{ opacity: 0.7, display: 'block', mb: 0.5 }}>
+                                  {t('inventory.state')}
+                                </Typography>
+                                <Chip
+                                  label={haConfig.state || 'started'}
+                                  size="small"
+                                  color={haStateColor(haConfig.state)}
+                                />
+                              </Box>
+                              <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                                <Typography variant="caption" sx={{ opacity: 0.7, display: 'block', mb: 0.5 }}>
+                                  {t('inventory.group')}
+                                </Typography>
+                                <Typography variant="body2" fontWeight={600}>
+                                  {haConfig.group || <span style={{ opacity: 0.5, fontWeight: 400 }}>{t('common.none')}</span>}
+                                </Typography>
+                              </Box>
+                              <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                                <Typography variant="caption" sx={{ opacity: 0.7, display: 'block', mb: 0.5 }}>
+                                  {t('cluster.maxRestart')}
+                                </Typography>
+                                <Typography variant="body2" fontWeight={600}>
+                                  {haConfig.max_restart ?? 1}
+                                </Typography>
+                              </Box>
+                              <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                                <Typography variant="caption" sx={{ opacity: 0.7, display: 'block', mb: 0.5 }}>
+                                  {t('cluster.maxRelocate')}
+                                </Typography>
+                                <Typography variant="body2" fontWeight={600}>
+                                  {haConfig.max_relocate ?? 1}
+                                </Typography>
+                              </Box>
+                              {haConfig.failback !== undefined && (
+                                <Box sx={{ gridColumn: '1 / -1', p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                  <Box>
+                                    <Typography variant="body2" fontWeight={600}>{t('inventory.haFailback')}</Typography>
+                                    <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                      {t('inventory.haFailbackHelp')}
+                                    </Typography>
+                                  </Box>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                    <i
+                                      className={failbackOn ? 'ri-checkbox-circle-fill' : 'ri-close-circle-fill'}
+                                      style={{ fontSize: 18, color: failbackOn ? 'var(--mui-palette-success-main)' : 'var(--mui-palette-text-disabled)' }}
+                                    />
+                                    <Typography variant="body2" fontWeight={600}>
+                                      {failbackOn ? t('common.enabled') : t('common.disabled')}
+                                    </Typography>
+                                  </Box>
+                                </Box>
+                              )}
+                              {haConfig.comment && (
+                                <Box sx={{ gridColumn: '1 / -1', p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 1 }}>
+                                  <Typography variant="caption" sx={{ opacity: 0.7, display: 'block', mb: 0.5 }}>
+                                    {t('inventory.comment')}
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    {haConfig.comment}
+                                  </Typography>
+                                </Box>
+                              )}
+                            </Box>
+                          ) : (
+                            <Box
+                              sx={{
+                                p: 4,
+                                border: '1px dashed',
+                                borderColor: 'divider',
+                                borderRadius: 1,
+                                textAlign: 'center',
+                              }}
+                            >
+                              <i className="ri-shield-cross-line" style={{ fontSize: 56, opacity: 0.3 }} />
+                              <Typography variant="subtitle1" fontWeight={600} sx={{ mt: 1.5 }}>
+                                {t('inventory.haNotEnabled')}
+                              </Typography>
+                              <Typography variant="body2" sx={{ opacity: 0.7, mt: 0.5, maxWidth: 480, mx: 'auto' }}>
+                                {t('inventory.haEnableDescription')}
+                              </Typography>
+                              <Button
+                                variant="contained"
+                                size="small"
+                                startIcon={<i className="ri-shield-check-line" />}
+                                onClick={() => setHaEditing(true)}
+                                sx={{ mt: 2 }}
+                              >
+                                {t('inventory.haEnable')}
+                              </Button>
+                            </Box>
+                          )}
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Box>
+                )
+              })()}
+
+              {/* ==================== ONGLET FIREWALL (10 si cluster, 9 sinon) ==================== */}
+              {((selectedVmIsCluster && detailTab === 10) || (!selectedVmIsCluster && detailTab === 9)) && selection?.type === 'vm' && (
+                <VmFirewallTab
+                  connectionId={parseVmId(selection.id).connId}
+                  node={parseVmId(selection.id).node}
+                  vmType={data.vmType as 'qemu' | 'lxc'}
+                  vmid={Number.parseInt(parseVmId(selection.id).vmid)}
+                  vmName={data.name}
+                />
+              )}
+
+              {/* ==================== ONGLET CHANGE TRACKING (11 si cluster, 10 sinon) ==================== */}
+              {((selectedVmIsCluster && detailTab === 11) || (!selectedVmIsCluster && detailTab === 10)) && selection?.type === 'vm' && (
+                <ChangeTrackingTab
+                  connectionId={parseVmId(selection.id).connId}
+                  resourceType={data.vmType === 'lxc' ? 'ct' : 'vm'}
+                  resourceId={parseVmId(selection.id).vmid}
+                />
+              )}
+              </Box>
+            </Box>
+          )}
+      {/* Boot Order Dialog */}
+      <Dialog open={bootOrderOpen} onClose={() => setBootOrderOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <i className="ri-restart-line" style={{ fontSize: 22 }} />
+          {t('inventory.bootOrder')}
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            {t('inventory.bootOrderHint')}
+          </Typography>
+          <List dense sx={{ '& .MuiListItem-root': { px: 1, py: 0.5, mb: 0.5, bgcolor: 'action.hover', borderRadius: 1 } }}>
+            {bootDevices.map((dev, idx) => (
+              <ListItem
+                key={dev.id}
+                draggable
+                onDragStart={() => setDragIdx(idx)}
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  e.currentTarget.style.borderTop = '2px solid var(--mui-palette-primary-main)'
+                }}
+                onDragLeave={(e) => { e.currentTarget.style.borderTop = '' }}
+                onDrop={(e) => {
+                  e.currentTarget.style.borderTop = ''
+                  if (dragIdx === null || dragIdx === idx) return
+                  setBootDevices(prev => {
+                    const next = [...prev]
+                    const [moved] = next.splice(dragIdx, 1)
+                    next.splice(idx, 0, moved)
+                    return next
+                  })
+                  setDragIdx(null)
+                }}
+                onDragEnd={() => setDragIdx(null)}
+                sx={{
+                  cursor: 'grab',
+                  opacity: dev.enabled ? 1 : 0.5,
+                  '&:active': { cursor: 'grabbing' },
+                }}
+                secondaryAction={
+                  <Typography variant="caption" sx={{ fontFamily: 'monospace', opacity: 0.5 }}>
+                    {(() => {
+                      if (!dev.id.match(/^(scsi|virtio|ide|sata)/)) return t('inventory.tabs.network').toLowerCase()
+                      const d = data.disksInfo?.find((x: any) => x.id === dev.id)
+
+                      if (dev.id.match(/^ide/) && d?.isCdrom) return d?.isCloudInit ? t('inventory.tabs.cloudInit') : 'CD-ROM'
+
+                      return t('inventory.disks').toLowerCase()
+                    })()}
+                  </Typography>
+                }
+              >
+                <ListItemIcon sx={{ minWidth: 36 }}>
+                  <i className="ri-draggable" style={{ fontSize: 18, opacity: 0.4, cursor: 'grab' }} />
+                </ListItemIcon>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={dev.enabled}
+                      onChange={(e) => {
+                        setBootDevices(prev => prev.map((d, i) => i === idx ? { ...d, enabled: e.target.checked } : d))
+                      }}
+                    />
+                  }
+                  label={
+                    <Typography variant="body2" fontWeight={600} sx={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+                      {dev.id}
+                    </Typography>
+                  }
+                  sx={{ mr: 0 }}
+                />
+              </ListItem>
+            ))}
+          </List>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setBootOrderOpen(false)} disabled={bootSaving}>{t('common.cancel')}</Button>
+          <Button
+            variant="contained"
+            disabled={bootSaving}
+            startIcon={bootSaving ? <CircularProgress size={16} /> : <i className="ri-save-line" />}
+            onClick={async () => {
+              if (!selection) return
+              setBootSaving(true)
+              try {
+                const { connId, node, type, vmid } = parseVmId(selection.id)
+                const enabledIds = bootDevices.filter(d => d.enabled).map(d => d.id)
+                const bootValue = enabledIds.length > 0 ? `order=${enabledIds.join(';')}` : ''
+                const res = await fetch(
+                  `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/config`,
+                  { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boot: bootValue }) }
+                )
+                if (!res.ok) {
+                  const err = await res.json().catch(() => ({}))
+                  throw new Error(err?.error || `HTTP ${res.status}`)
+                }
+                setBootOrderOpen(false)
+                if (refreshData) await refreshData()
+              } catch (e: any) {
+                toast.error(`${t('common.error')}: ${e.message}`)
+              } finally {
+                setBootSaving(false)
+              }
+            }}
+          >
+            {bootSaving ? t('common.saving') : t('common.save')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      {restoreDialog && selection?.type === 'vm' && (() => {
+        const { connId, node, type, vmid } = parseVmId(selection.id)
+
+        // Une archive vzdump sur un stockage non partagé n'est lisible que
+        // depuis le nœud qui la détient : après migration du guest, son nœud
+        // courant n'est pas celui de l'archive.
+        const restoreNode = restoreDialog.backup?.source === 'vzdump' && restoreDialog.backup?.node
+          ? restoreDialog.backup.node
+          : node
+
+        return (
+          <RestoreVmDialog
+            open
+            onClose={() => setRestoreDialog(null)}
+            connectionId={connId}
+            node={restoreNode}
+            type={(type === 'lxc' ? 'lxc' : 'qemu')}
+            backup={restoreDialog.backup}
+            sourceVmid={Number(vmid)}
+          />
+        )
+      })()}
+    </>
+  )
+}

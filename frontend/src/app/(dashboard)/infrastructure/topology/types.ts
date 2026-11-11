@@ -1,0 +1,231 @@
+export type NodeStatus = 'ok' | 'warning' | 'critical' | 'offline'
+
+export interface TopologyFilters {
+  connectionId?: string
+  vmStatus?: 'running' | 'stopped' | 'all'
+  vmThreshold: number // collapse VMs above this number per node
+  groupByVlan?: boolean
+  viewMode?: 'infra' | 'network' | 'geo'
+  groupByTag?: boolean
+}
+
+// Inventory API types (matches /api/v1/inventory response)
+export interface InventoryGuest {
+  vmid: string | number
+  name?: string
+  status: string // 'running' | 'stopped' | 'paused'
+  type: string // 'qemu' | 'lxc'
+  cpu?: number
+  mem?: number
+  maxmem?: number
+  maxcpu?: number
+  node: string
+  tags?: string
+}
+
+export interface InventoryNode {
+  node: string
+  status: string
+  cpu?: number
+  maxcpu?: number
+  mem?: number // bytes used
+  maxmem?: number // bytes total
+  uptime?: number
+  guests: InventoryGuest[]
+}
+
+export interface InventoryCluster {
+  id: string
+  name: string
+  type: string
+  isCluster: boolean
+  status: 'online' | 'degraded' | 'offline'
+  latitude?: number | null
+  longitude?: number | null
+  locationLabel?: string | null
+  nodes: InventoryNode[]
+}
+
+export interface InventoryPbsDatastore {
+  name: string
+  totalSize: number
+  usedSize: number
+  backupCount: number
+}
+
+export interface InventoryPbsServer {
+  id: string
+  name: string
+  type: 'pbs'
+  status: 'online' | 'offline'
+  version?: string
+  uptime?: number
+  datastores: InventoryPbsDatastore[]
+  stats: {
+    totalSize: number
+    totalUsed: number
+    datastoreCount: number
+    backupCount: number
+  }
+}
+
+export interface InventoryData {
+  clusters: InventoryCluster[]
+  pbsServers?: InventoryPbsServer[]
+}
+
+// Custom node data types — index signature required by React Flow v12
+export interface ClusterNodeData {
+  [key: string]: unknown
+  label: string
+  host: string
+  connectionId: string
+  nodeCount: number
+  vmCount: number
+  cpuUsage: number
+  ramUsage: number
+  status: NodeStatus
+  width: number
+  height: number
+}
+
+export interface HostNodeData {
+  [key: string]: unknown
+  label: string
+  connectionId: string
+  nodeName: string
+  cpuUsage: number
+  ramUsage: number
+  vmCount: number
+  uptime: number
+  status: NodeStatus
+  width: number
+  height: number
+}
+
+export interface VmNodeData {
+  [key: string]: unknown
+  label: string
+  connectionId: string
+  vmid: number
+  vmType: string // 'qemu' | 'lxc'
+  vmStatus: string // 'running' | 'stopped' | 'paused'
+  cpuUsage: number
+  ramUsage: number
+  nodeName: string
+  width: number
+  height: number
+}
+
+export interface VmSummaryNodeData {
+  [key: string]: unknown
+  label: string
+  connectionId: string
+  nodeName: string
+  total: number
+  running: number
+  stopped: number
+  width: number
+  height: number
+}
+
+/**
+ * Segment identity shared by the two VLAN bucket nodes. A bucket is one SDN
+ * VNet, one VLAN id, or the segment-less catch-all: `vlanTag` alone cannot say
+ * which, because a VXLAN VNet has no VLAN id and two VNets of different zones
+ * may carry the same one.
+ */
+export interface TopologySegmentFields {
+  /** Bucket key: `vnet-<id>`, `vlan-<n>`, or `no-vlan`. */
+  segmentKey: string
+  /** Segment id whatever its kind: a VLAN id, or a VXLAN VNI. */
+  segmentTag: number | null
+  /** SDN VNet id, only when the bucket is a VNet. */
+  vnet?: string
+  /** Zone id of that VNet. */
+  zone?: string
+  /** Zone type of that VNet: 'vlan' | 'vxlan' | 'qinq' | 'evpn' | 'simple' | ''. */
+  zoneType?: string
+}
+
+export interface VlanGroupNodeData extends TopologySegmentFields {
+  [key: string]: unknown
+  label: string
+  connectionId: string
+  nodeName: string
+  /** The 802.1Q VLAN id, null for a VXLAN/EVPN/simple VNet or no segment. */
+  vlanTag: number | null
+  bridge: string
+  vmCount: number
+  width: number
+  height: number
+}
+
+export interface TagGroupNodeData {
+  [key: string]: unknown
+  label: string
+  connectionId: string
+  nodeName: string
+  tag: string
+  vmCount: number
+  width: number
+  height: number
+}
+
+export interface VlanContainerVm {
+  vmid: number
+  name: string
+  vmType: string
+  vmStatus: string
+  nodeName: string
+  ip: string | null
+}
+
+export interface VlanContainerNodeData extends TopologySegmentFields {
+  [key: string]: unknown
+  label: string
+  /** The 802.1Q VLAN id, null for a VXLAN/EVPN/simple VNet or no segment. */
+  vlanTag: number | null
+  bridge: string
+  subnet: string | null
+  vms: VlanContainerVm[]
+  width: number
+  height: number
+}
+
+export interface UniCenterNodeData {
+  [key: string]: unknown
+  label: string
+  clusterCount: number
+  totalNodes: number
+  totalVms: number
+  pbsCount?: number
+  width: number
+  height: number
+}
+
+export interface PbsServerNodeData {
+  [key: string]: unknown
+  label: string
+  serverId: string
+  status: 'online' | 'offline'
+  version?: string
+  datastoreCount: number
+  backupCount: number
+  totalSize: number
+  totalUsed: number
+  width: number
+  height: number
+}
+
+// Selected node info for sidebar
+export type SelectedNodeInfo =
+  | { type: 'cluster'; data: ClusterNodeData }
+  | { type: 'host'; data: HostNodeData }
+  | { type: 'vm'; data: VmNodeData }
+  | { type: 'vmSummary'; data: VmSummaryNodeData }
+  | { type: 'vlanGroup'; data: VlanGroupNodeData }
+  | { type: 'tagGroup'; data: TagGroupNodeData }
+  | { type: 'vlanContainer'; data: VlanContainerNodeData }
+  | { type: 'unicenter'; data: UniCenterNodeData }
+  | { type: 'pbsServer'; data: PbsServerNodeData }

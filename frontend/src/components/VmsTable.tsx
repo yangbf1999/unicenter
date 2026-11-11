@@ -1,0 +1,2252 @@
+'use client'
+
+import React, { useMemo, useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import { getOsSvgIcon } from '@/lib/utils/osIcons'
+import { useTagColors } from '@/contexts/TagColorContext'
+import { vmIconOpacity } from '@/app/(dashboard)/infrastructure/inventory/helpers'
+import { NodeIcon } from '@/app/(dashboard)/infrastructure/inventory/components/TreeIcons'
+import { useTenant } from '@/contexts/TenantContext'
+
+import { createPortal } from 'react-dom'
+import {
+  Avatar,
+  Box,
+  Button,
+  Chip,
+  CircularProgress,
+  Checkbox,
+  Divider,
+  FormControlLabel,
+  IconButton,
+  LinearProgress,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
+  Skeleton,
+  Stack,
+  Tooltip,
+  Typography,
+  useTheme,
+  useMediaQuery
+} from '@mui/material'
+import { DataGrid, GridColDef, GridRowSelectionModel } from '@mui/x-data-grid'
+import { zhCN } from '@mui/x-data-grid/locales'
+import { AreaChart, Area, XAxis, YAxis, Tooltip as RTooltip } from 'recharts'
+import ChartContainer from '@/components/ChartContainer'
+// XLSX is dynamically imported in handleExportExcel to reduce bundle size
+
+// RemixIcon replacements for @mui/icons-material
+const PlayArrowIcon = (props: any) => <i className="ri-play-fill" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const StopIcon = (props: any) => <i className="ri-stop-fill" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const PowerSettingsNewIcon = (props: any) => <i className="ri-shut-down-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const PauseIcon = (props: any) => <i className="ri-pause-fill" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const RestartAltIcon = (props: any) => <i className="ri-restart-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const TerminalIcon = (props: any) => <i className="ri-terminal-box-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const ContentCopyIcon = (props: any) => <i className="ri-file-copy-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+const MoveUpIcon = (props: any) => <i className="ri-upload-2-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: props?.sx?.color, ...props?.style }} />
+
+/* -----------------------------
+  Types
+------------------------------ */
+
+type VmContextMenu = {
+  mouseX: number
+  mouseY: number
+  vm: VmRow
+} | null
+
+/* -----------------------------
+  Helpers
+------------------------------ */
+
+const pct = (v: any) => Math.max(0, Math.min(100, Number(v ?? 0)))
+
+const bytesToGb = (b: any) => Math.round((Number(b || 0) / 1024 / 1024 / 1024) * 10) / 10
+
+const secondsToUptime = (s: any) => {
+  if (typeof s === 'string' && s.match(/^\d+[dhdms]/)) return s
+
+  const sec = Number(s || 0)
+
+  if (!sec || Number.isNaN(sec)) return '—'
+  const d = Math.floor(sec / 86400)
+  const h = Math.floor((sec % 86400) / 3600)
+
+  if (d > 0) return `${d}d ${h}h`
+  const m = Math.floor((sec % 3600) / 60)
+
+  if (h > 0) return `${h}h ${m}m`
+
+return `${m}m`
+}
+
+/* -----------------------------
+  Tag Colors (via context)
+------------------------------ */
+
+/* -----------------------------
+  Sub-components
+------------------------------ */
+
+const VmIcon = ({ type, template }: { type: string; template?: boolean }) => {
+  let iconClass = 'ri-computer-fill'
+
+  if (template) {
+    iconClass = 'ri-file-copy-fill'
+  } else if (type === 'lxc') {
+    iconClass = 'ri-instance-fill'
+  }
+
+
+return (
+    <i
+      className={iconClass}
+      style={{ fontSize: 16, opacity: 0.7 }}
+    />
+  )
+}
+
+const StatusChip = ({ status, compact = false }: { status: string; compact?: boolean }) => {
+  const s = status?.toLowerCase()
+  const sx = { height: compact ? 18 : 20, fontSize: compact ? '0.6rem' : '0.65rem' }
+
+  if (s === 'running') return <Chip size='small' color='success' label={compact ? 'Run' : 'Running'} sx={sx} />
+  if (s === 'stopped') return <Chip size='small' color='default' label={compact ? 'Stop' : 'Stopped'} sx={sx} />
+  if (s === 'paused') return <Chip size='small' color='warning' label={compact ? 'Pause' : 'Paused'} sx={sx} />
+  
+return <Chip size='small' color='default' label={status || '—'} sx={sx} />
+}
+
+const METRIC_GRADIENT = 'linear-gradient(90deg, #22c55e 0%, #eab308 50%, #ef4444 100%)'
+
+const MetricBar = ({ value, metric }: { value: number; metric: 'cpu' | 'memory' }) => {
+  const v = pct(value)
+
+  return (
+    <Box sx={{ width: '100%', position: 'relative', display: 'flex', alignItems: 'center' }}>
+      <Box sx={{ width: '100%', position: 'relative' }}>
+        <LinearProgress
+          className='nebula-linear-progress'
+          variant='determinate'
+          value={v}
+          sx={{
+            '--nebula-progress-color': metric === 'cpu' ? 'var(--nebula-brand-blue)' : 'var(--nebula-brand-cyan)',
+            height: 18,
+            borderRadius: 0,
+            bgcolor: (theme) => theme.palette.mode === 'light' ? 'rgba(0,0,0,0.1)' : 'rgba(255,255,255,0.12)',
+            '& .MuiLinearProgress-bar': {
+              borderRadius: 0,
+              background: METRIC_GRADIENT,
+              backgroundSize: v > 0 ? `${(100 / v) * 100}% 100%` : '100% 100%',
+            },
+          }}
+        />
+        <Typography variant='caption' sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>
+          {Math.round(value)}%
+        </Typography>
+      </Box>
+    </Box>
+  )
+}
+
+const TagsCell = ({ tags, getTagColor, shape }: { tags: string[]; getTagColor: (tag: string) => { bg: string; fg: string }; shape: string }) => {
+  const validTags = useMemo(() => (tags || []).filter(tag => tag && tag.trim().length > 0), [tags])
+  const containerRef = useRef<HTMLDivElement>(null)
+  const badgeRef = useRef<HTMLSpanElement>(null)
+
+  // DOM-only measurement: hide overflowing tags and show "+N" badge, no React state
+  const measure = useCallback(() => {
+    const container = containerRef.current
+    const badge = badgeRef.current
+    if (!container || !badge) return
+
+    const tagEls = Array.from(container.querySelectorAll('[data-tag]')) as HTMLElement[]
+    if (tagEls.length === 0) return
+    const containerRight = container.getBoundingClientRect().right
+
+    // Reset: show all tags, hide badge
+    tagEls.forEach(el => { el.style.display = '' })
+    badge.style.display = 'none'
+
+    // Check if all tags fit
+    const lastEl = tagEls[tagEls.length - 1]
+    if (lastEl && lastEl.getBoundingClientRect().right <= containerRight) return
+
+    // Not all fit - find how many fit with space for the badge
+    badge.textContent = `+${tagEls.length}`
+    badge.style.display = ''
+    const badgeWidth = badge.getBoundingClientRect().width + 4 // +4 for gap
+
+    let fitCount = 0
+    for (let i = 0; i < tagEls.length; i++) {
+      if (tagEls[i].getBoundingClientRect().right > containerRight - badgeWidth) break
+      fitCount++
+    }
+    fitCount = Math.max(1, fitCount)
+
+    // Hide overflow tags, update badge
+    for (let i = fitCount; i < tagEls.length; i++) {
+      tagEls[i].style.display = 'none'
+    }
+    const hiddenCount = tagEls.length - fitCount
+    if (hiddenCount > 0) {
+      badge.textContent = `+${hiddenCount}`
+    } else {
+      badge.style.display = 'none'
+    }
+  }, [])
+
+  useLayoutEffect(measure)
+
+  // Re-measure on column resize — observe the DataGrid cell wrapper
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    // The DataGrid cell element that actually resizes
+    const cell = container.closest('.MuiDataGrid-cell') || container.parentElement || container
+    const ro = new ResizeObserver(measure)
+    ro.observe(cell)
+
+    return () => ro.disconnect()
+  }, [measure])
+
+  if (validTags.length === 0 || shape === 'none') return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+
+  // Tooltip: all tags with colored dots
+  const tooltipContent = (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, p: 0.5 }}>
+      {validTags.map(tag => {
+        const c = getTagColor(tag)
+
+        return (
+          <Box key={tag} sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+            <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: c.bg, flexShrink: 0 }} />
+            <Typography sx={{ fontSize: '0.7rem', color: 'inherit' }}>{tag}</Typography>
+          </Box>
+        )
+      })}
+    </Box>
+  )
+
+  return (
+    <Tooltip title={tooltipContent}>
+      <Box ref={containerRef} sx={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 0.5, overflow: 'hidden', width: '100%' }}>
+        {validTags.map(tag => {
+          const { bg, fg } = getTagColor(tag)
+
+          if (shape === 'circle') {
+            return (
+              <Box key={tag} data-tag="" sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: bg, flexShrink: 0 }} />
+            )
+          }
+
+          if (shape === 'dense') {
+            return (
+              <Box key={tag} data-tag="" sx={{ width: 14, height: 10, borderRadius: 0, bgcolor: bg, flexShrink: 0 }} />
+            )
+          }
+
+          return (
+            <Chip
+              key={tag}
+              data-tag=""
+              label={tag}
+              size='small'
+              sx={{
+                height: 18,
+                fontSize: '0.65rem',
+                bgcolor: bg,
+                color: fg,
+                borderRadius: 0.5,
+                minWidth: 0,
+                maxWidth: 80,
+                flexShrink: 0,
+                '& .MuiChip-label': { px: 0.75, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+              }}
+            />
+          )
+        })}
+        <Typography
+          ref={badgeRef}
+          component="span"
+          variant='caption'
+          style={{ display: 'none' }}
+          sx={{ fontSize: '0.65rem', opacity: 0.7, flexShrink: 0, whiteSpace: 'nowrap' }}
+        />
+      </Box>
+    </Tooltip>
+  )
+}
+
+/* -----------------------------
+  Trend Tooltip Component
+------------------------------ */
+
+function formatRate(bytes: number) {
+  if (bytes <= 0) return '0 B/s'
+  if (bytes < 1024) return `${bytes.toFixed(0)} B/s`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB/s`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB/s`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB/s`
+}
+
+function IoNetTooltip({ active, payload, label }: any) {
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      setMousePos({ x: e.clientX, y: e.clientY })
+    }
+    window.addEventListener('mousemove', handleMouseMove)
+    return () => window.removeEventListener('mousemove', handleMouseMove)
+  }, [])
+
+  if (!active || !payload || payload.length === 0) return null
+  if (typeof window === 'undefined') return null
+
+  const diskread = payload.find((p: any) => p.dataKey === 'diskread')?.value
+  const diskwrite = payload.find((p: any) => p.dataKey === 'diskwrite')?.value
+  const netin = payload.find((p: any) => p.dataKey === 'netin')?.value
+  const netout = payload.find((p: any) => p.dataKey === 'netout')?.value
+
+  const tooltipContent = (
+    <div
+      style={{
+        position: 'fixed',
+        left: mousePos.x + 15,
+        top: mousePos.y - 90,
+        background: '#1a1a2e',
+        border: '1px solid #444',
+        color: 'white',
+        padding: '8px 12px',
+        borderRadius: 6,
+        fontSize: 11,
+        lineHeight: 1.5,
+        boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+        zIndex: 99999,
+        pointerEvents: 'none',
+        whiteSpace: 'nowrap'
+      }}
+    >
+      <div style={{ opacity: 0.7, marginBottom: 4, fontWeight: 600, borderBottom: '1px solid #444', paddingBottom: 4 }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: '#2196f3', display: 'inline-block' }}></span>
+        <span>Disk R: <b>{typeof diskread === 'number' ? formatRate(diskread) : '—'}</b></span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: '#1565c0', display: 'inline-block' }}></span>
+        <span>Disk W: <b>{typeof diskwrite === 'number' ? formatRate(diskwrite) : '—'}</b></span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: '#4caf50', display: 'inline-block' }}></span>
+        <span>Net In: <b>{typeof netin === 'number' ? formatRate(netin) : '—'}</b></span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: '#2e7d32', display: 'inline-block' }}></span>
+        <span>Net Out: <b>{typeof netout === 'number' ? formatRate(netout) : '—'}</b></span>
+      </div>
+    </div>
+  )
+
+  return createPortal(tooltipContent, document.body)
+}
+
+function TrendTooltip({ active, payload, label }: any) {
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      setMousePos({ x: e.clientX, y: e.clientY })
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    
+return () => window.removeEventListener('mousemove', handleMouseMove)
+  }, [])
+
+  if (!active || !payload || payload.length === 0) return null
+  if (typeof window === 'undefined') return null
+  
+  const cpu = payload.find((p: any) => p.dataKey === 'cpu')?.value
+  const ram = payload.find((p: any) => p.dataKey === 'ram')?.value
+
+  const cpuColor = '#e57000'
+  const ramColor = '#b35500'
+
+  const tooltipContent = (
+    <div
+      style={{
+        position: 'fixed',
+        left: mousePos.x + 15,
+        top: mousePos.y - 70,
+        background: '#1a1a2e',
+        border: '1px solid #444',
+        color: 'white',
+        padding: '8px 12px',
+        borderRadius: 6,
+        fontSize: 11,
+        lineHeight: 1.5,
+        boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+        zIndex: 99999,
+        pointerEvents: 'none',
+        whiteSpace: 'nowrap'
+      }}
+    >
+      <div style={{ opacity: 0.7, marginBottom: 4, fontWeight: 600, borderBottom: '1px solid #444', paddingBottom: 4 }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: cpuColor, display: 'inline-block' }}></span>
+        <span>CPU: <b>{typeof cpu === 'number' ? cpu.toFixed(1) : '—'}%</b></span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ width: 10, height: 3, borderRadius: 2, backgroundColor: ramColor, display: 'inline-block' }}></span>
+        <span>RAM: <b>{typeof ram === 'number' ? ram.toFixed(0) : '—'}%</b></span>
+      </div>
+    </div>
+  )
+
+  return createPortal(tooltipContent, document.body)
+}
+
+/* -----------------------------
+  Types
+------------------------------ */
+
+export type TrendPoint = {
+  t: string
+  cpu: number
+  ram: number
+  netin?: number
+  netout?: number
+  diskread?: number
+  diskwrite?: number
+}
+
+export type OsInfo = {
+  type: 'linux' | 'windows' | 'other'
+  name: string | null
+  version: string | null
+  kernel: string | null
+}
+
+export type VmRow = {
+  id: string
+  connId: string
+  node: string
+  vmid: string | number
+  name: string
+  type: 'qemu' | 'lxc'
+  status: string
+  cpu?: number
+  maxcpu?: number
+  ram?: number
+  mem?: number
+  maxmem?: number
+  disk?: number
+  maxdisk?: number
+  uptime?: number | string | null
+  ip?: string | null
+  snapshots?: number
+  tags?: string[]
+  template?: boolean
+  trend?: TrendPoint[]
+  hastate?: string
+  hagroup?: string
+  isCluster?: boolean
+  osInfo?: OsInfo | null
+  lock?: string
+  vdcName?: string
+}
+
+type VmsTableProps = {
+  vms: VmRow[]
+  loading?: boolean
+  onVmClick?: (vm: VmRow) => void
+  onVmAction?: (vm: VmRow, action: 'start' | 'resume' | 'shutdown' | 'stop' | 'pause' | 'suspend' | 'reboot' | 'console' | 'details' | 'clone') => void
+  onMigrate?: (vm: VmRow) => void  // Callback pour ouvrir le dialog de migration
+  onContextMenu?: (event: React.MouseEvent, vm: VmRow) => void  // Menu contextuel
+  onNodeClick?: (connId: string, node: string) => void  // Callback pour clic sur le node
+  compact?: boolean
+  expanded?: boolean
+  maxHeight?: number | string
+  showNode?: boolean
+  nodeStatuses?: Map<string, string | undefined>  // #666: node column pastille, keyed `${connId}:${node}`
+  showTrends?: boolean
+  showActions?: boolean
+  showIpSnap?: boolean  // Afficher les colonnes IP et Snapshots
+  ipSnapLoading?: boolean  // Loading en cours pour IP/Snap
+  onLoadIpSnap?: () => void  // Callback pour charger IP/Snap
+  onLoadTrends?: (vm: VmRow) => Promise<TrendPoint[]>
+  onLoadTrendsBatch?: (vms: VmRow[]) => Promise<Record<string, TrendPoint[]>>  // Batch loading
+  autoPageSize?: boolean  // Calculer automatiquement le nombre de lignes
+  showDensityToggle?: boolean  // Afficher le bouton compact/normal
+  highlightedId?: string | null  // ID de la VM à mettre en surbrillance
+  // Favoris
+  favorites?: Set<string>  // IDs des VMs favorites
+  onToggleFavorite?: (vm: VmRow) => void  // Callback pour ajouter/retirer des favoris
+  // Migration
+  migratingVmIds?: Set<string>  // IDs des VMs en cours de migration (format: "connId:vmid")
+  // Colonnes masquées par défaut (en plus de vmid)
+  defaultHiddenColumns?: string[]
+  // vDC — tenant IaaS union view only (see the column block in the columns useMemo)
+  showVdcColumn?: boolean
+  selectable?: boolean
+  rowSelectionModel?: GridRowSelectionModel
+  onRowSelectionModelChange?: (model: GridRowSelectionModel) => void
+  defaultPageSize?: 10 | 20 | 25 | 50 | 100
+  pageSizeOptions?: number[]
+}
+
+/* -----------------------------
+  Component
+------------------------------ */
+
+function VmsTable({
+  vms,
+  loading = false,
+  onVmClick,
+  onVmAction,
+  onMigrate,
+  onContextMenu,
+  onNodeClick,
+  compact: compactProp = true,
+  expanded = false,
+  maxHeight = 400,
+  showNode = false,
+  nodeStatuses,
+  showTrends = false,
+  showActions = false,
+  showIpSnap = false,
+  ipSnapLoading = false,
+  onLoadIpSnap,
+  onLoadTrends,
+  onLoadTrendsBatch,
+  autoPageSize = false,
+  showDensityToggle = false,
+  highlightedId = null,
+  favorites,
+  onToggleFavorite,
+  migratingVmIds,
+  defaultHiddenColumns,
+  showVdcColumn = false,
+  selectable = false,
+  rowSelectionModel,
+  onRowSelectionModelChange,
+  defaultPageSize = 10,
+  pageSizeOptions = [10, 25, 50, 100]
+}: VmsTableProps) {
+  const theme = useTheme()
+  const t = useTranslations()
+  const isChinese = useLocale().startsWith('zh')
+  const { getColor, getShape, loadConnection } = useTagColors()
+  const primaryColor = theme.palette.primary.main
+  // Migration is allowed for provider AND MSP tenants (full-cluster view).
+  // MSP users only see connections they own; the backend enforces ownership,
+  // so enabling the button here cannot migrate another tenant's VM.
+  // vDC / iaas tenants still cannot migrate (placement is the provider's job).
+  const { loading: tenantLoading, isFullClusterView } = useTenant()
+  const canMigrate = !tenantLoading && isFullClusterView
+  const effectiveOnMigrate = canMigrate ? onMigrate : undefined
+  
+  // Load tag color overrides for all connections in the table
+  useEffect(() => {
+    const connIds = new Set(vms.map(vm => vm.connId))
+    connIds.forEach(id => loadConnection(id))
+  }, [vms, loadConnection])
+
+  // Helper to get tag color (bg + fg) for a specific connection's tag
+  const getTagColor = useCallback((tag: string, connId?: string) => {
+    return getColor(tag, connId)
+  }, [getColor])
+
+  // Helper pour vérifier si une VM est en migration
+  const isVmMigrating = useCallback((connId: string, vmid: string | number) => {
+    if (!migratingVmIds) return false
+    
+return migratingVmIds.has(`${connId}:${vmid}`)
+  }, [migratingVmIds])
+  
+  // Responsive breakpoints - noSsr: true pour éviter les problèmes de hydratation
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'), { noSsr: true })  // < 600px
+  const isTablet = useMediaQuery(theme.breakpoints.down('md'), { noSsr: true })  // < 900px
+  const isSmallDesktop = useMediaQuery(theme.breakpoints.down('lg'), { noSsr: true })  // < 1200px
+  const isLargeDesktop = useMediaQuery(theme.breakpoints.up('xl'), { noSsr: true })  // >= 1536px
+  
+  // État local pour la densité (compact par défaut)
+  const [isCompact, setIsCompact] = useState(compactProp)
+  
+  // État pour le menu de sélection des colonnes
+  const [columnsMenuAnchor, setColumnsMenuAnchor] = useState<null | HTMLElement>(null)
+
+  const [visibleColumns, setVisibleColumns] = useState<Record<string, boolean>>(() => {
+    const defaults: Record<string, boolean> = {
+      vmid: false,
+      favorite: true,
+      name: true,
+      type: true,
+      status: true,
+      node: true,
+      vdcName: true,
+      ha: true,
+      cpu: true,
+      ram: true,
+      maxmem: true,
+      disk: true,
+      tags: true,
+      ip: true,
+      snapshots: true,
+      osInfo: true,
+      uptime: true,
+      trend: true,
+      actions: true,
+    }
+
+    if (defaultHiddenColumns) {
+      for (const col of defaultHiddenColumns) {
+        defaults[col] = false
+      }
+    }
+
+    // Restore from localStorage
+    try {
+      const saved = localStorage.getItem('unicenter_vmtable_columns')
+      if (saved) return { ...defaults, ...JSON.parse(saved) }
+    } catch {}
+
+    return defaults
+  })
+
+  // Persist column visibility to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('unicenter_vmtable_columns', JSON.stringify(visibleColumns))
+    } catch {}
+  }, [visibleColumns])
+
+  // Persist column widths to localStorage
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem('unicenter_vmtable_colwidths')
+      if (saved) return JSON.parse(saved)
+    } catch {}
+    return {}
+  })
+
+  const handleColumnWidthChange = useCallback((params: any) => {
+    setColumnWidths(prev => {
+      const next = { ...prev, [params.colDef.field]: params.width }
+      try { localStorage.setItem('unicenter_vmtable_colwidths', JSON.stringify(next)) } catch {}
+      return next
+    })
+  }, [])
+
+  // État pour le menu contextuel (clic droit)
+  const [contextMenu, setContextMenu] = useState<VmContextMenu>(null)
+  
+  // Handlers pour le menu contextuel
+  const handleContextMenu = useCallback((event: React.MouseEvent, vm: VmRow) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setContextMenu({
+      mouseX: event.clientX,
+      mouseY: event.clientY,
+      vm
+    })
+  }, [])
+  
+  const handleCloseContextMenu = useCallback(() => {
+    setContextMenu(null)
+  }, [])
+  
+  const handleContextAction = useCallback((action: 'start' | 'resume' | 'shutdown' | 'stop' | 'pause' | 'suspend' | 'reboot' | 'console' | 'details' | 'clone') => {
+    if (!contextMenu || !onVmAction) return
+    onVmAction(contextMenu.vm, action)
+    handleCloseContextMenu()
+  }, [contextMenu, onVmAction, handleCloseContextMenu])
+  
+  const handleContextMigrate = useCallback(() => {
+    if (!contextMenu || !effectiveOnMigrate) return
+    effectiveOnMigrate(contextMenu.vm)
+    handleCloseContextMenu()
+  }, [contextMenu, effectiveOnMigrate, handleCloseContextMenu])
+  
+  // Calculer le pageSize selon la hauteur - remplir l'écran
+  const calculatedPageSize = useMemo(() => {
+    // Estimer la hauteur d'une ligne
+    const rowHeight = isCompact ? 36 : 52
+    const headerHeight = 56
+    const footerHeight = 56
+    const toggleHeight = showDensityToggle ? 44 : 0
+    
+    // Hauteur disponible estimée (viewport - éléments fixes)
+    const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 900
+    const availableHeight = viewportHeight - 180 - headerHeight - footerHeight - toggleHeight
+    
+    const rows = Math.floor(availableHeight / rowHeight)
+
+    
+return Math.max(10, Math.min(rows, 50))
+  }, [isCompact, showDensityToggle])
+  
+  // État local pour les trends
+  const [trendsData, setTrendsData] = useState<Record<string, TrendPoint[]>>({})
+  const [trendsLoading, setTrendsLoading] = useState<Record<string, boolean>>({})
+  const [paginationModel, setPaginationModel] = useState<{ page: number; pageSize: number }>({
+    page: 0,
+    pageSize: defaultPageSize,
+  })
+  
+  // Calculer les VMs visibles sur la page actuelle
+  const visibleVms = useMemo(() => {
+    const start = paginationModel.page * paginationModel.pageSize
+    const end = start + paginationModel.pageSize
+
+    
+return vms.slice(start, end)
+  }, [vms, paginationModel.page, paginationModel.pageSize])
+  
+  // Charger les trends uniquement pour les VMs visibles et running
+  useEffect(() => {
+    if (!showTrends) return
+    if (!onLoadTrendsBatch && !onLoadTrends) return
+    
+    // VMs running visibles qui n'ont pas encore de données
+    const vmsToLoad = visibleVms.filter(
+      vm => vm.status === 'running' && !trendsData[vm.id] && !trendsLoading[vm.id]
+    )
+    
+    if (vmsToLoad.length === 0) return
+    
+    // Marquer SEULEMENT les VMs qu'on va charger comme loading
+    const loadingState: Record<string, boolean> = {}
+
+    vmsToLoad.forEach(vm => { loadingState[vm.id] = true })
+    setTrendsLoading(prev => ({ ...prev, ...loadingState }))
+    
+    const loadTrends = async () => {
+      let results: Record<string, TrendPoint[]> = {}
+      
+      // Préférer le batch loading s'il est disponible
+      if (onLoadTrendsBatch) {
+        try {
+          results = await onLoadTrendsBatch(vmsToLoad)
+        } catch (e) {
+          console.error('Failed to batch load trends:', e)
+        }
+      } else if (onLoadTrends) {
+        // Fallback: charger un par un
+        const promises = await Promise.allSettled(
+          vmsToLoad.map(async (vm) => {
+            try {
+              const data = await onLoadTrends(vm)
+
+              
+return { id: vm.id, data }
+            } catch (e) {
+              return { id: vm.id, data: [] }
+            }
+          })
+        )
+
+        promises.forEach((result) => {
+          if (result.status === 'fulfilled') {
+            results[result.value.id] = result.value.data
+          }
+        })
+      }
+      
+      // Mettre à jour les états
+      const newTrends: Record<string, TrendPoint[]> = {}
+      const newLoading: Record<string, boolean> = {}
+      
+      vmsToLoad.forEach(vm => {
+        newTrends[vm.id] = results[vm.id] || []
+        newLoading[vm.id] = false
+      })
+      
+      setTrendsData(prev => ({ ...prev, ...newTrends }))
+      setTrendsLoading(prev => ({ ...prev, ...newLoading }))
+    }
+    
+    loadTrends()
+  }, [showTrends, visibleVms, onLoadTrends, onLoadTrendsBatch]) // Ne dépend que des VMs visibles
+
+  // Fonction d'export Excel
+  const handleExportExcel = useCallback(async () => {
+    const ExcelJS = await import('exceljs')
+    const wb = new ExcelJS.Workbook()
+    const ws = wb.addWorksheet('VMs')
+
+    const columns = [
+      { header: 'ID', key: 'id', width: 8 },
+      { header: 'Name', key: 'name', width: 25 },
+      { header: 'Type', key: 'type', width: 10 },
+      { header: 'Status', key: 'status', width: 10 },
+      { header: 'Node', key: 'node', width: 20 },
+      { header: 'HA', key: 'ha', width: 10 },
+      { header: 'HA Group', key: 'hagroup', width: 15 },
+      { header: 'vCPU (allocated)', key: 'vcpu', width: 14 },
+      { header: 'CPU Usage (%)', key: 'cpu', width: 12 },
+      { header: 'RAM Allocated (GB)', key: 'ramalloc', width: 16 },
+      { header: 'RAM Used (GB)', key: 'ramused', width: 14 },
+      { header: 'RAM Usage (%)', key: 'ram', width: 12 },
+      { header: 'Disk Allocated (GB)', key: 'diskalloc', width: 16 },
+      { header: 'Disk Used (GB)', key: 'diskused', width: 14 },
+      { header: 'Disk Usage (%)', key: 'diskpct', width: 12 },
+      { header: 'Uptime', key: 'uptime', width: 12 },
+      { header: 'IP', key: 'ip', width: 15 },
+      { header: 'Snapshots', key: 'snapshots', width: 10 },
+      { header: 'Tags', key: 'tags', width: 20 },
+      { header: 'Template', key: 'template', width: 10 },
+    ]
+
+    ws.columns = columns
+
+    for (const vm of vms) {
+      const ramAllocGB = vm.maxmem ? Math.round(vm.maxmem / 1073741824 * 10) / 10 : ''
+      const ramUsedGB = vm.maxmem && vm.ram !== undefined ? Math.round((vm.ram / 100) * vm.maxmem / 1073741824 * 10) / 10 : ''
+      const diskAllocGB = vm.maxdisk ? Math.round(vm.maxdisk / 1073741824 * 10) / 10 : ''
+      const diskUsedGB = vm.disk ? Math.round(vm.disk / 1073741824 * 10) / 10 : ''
+      const diskPct = vm.maxdisk && vm.disk ? Math.round((vm.disk / vm.maxdisk) * 100) : ''
+
+      ws.addRow({
+        id: vm.vmid,
+        name: vm.name,
+        type: vm.template ? 'Template' : (vm.type === 'lxc' ? 'LXC' : 'VM'),
+        status: vm.status,
+        node: vm.node,
+        ha: vm.hastate || '',
+        hagroup: vm.hagroup || '',
+        vcpu: vm.maxcpu ?? '',
+        cpu: vm.cpu !== undefined ? Math.round(vm.cpu) : '',
+        ramalloc: ramAllocGB,
+        ramused: ramUsedGB,
+        ram: vm.ram !== undefined ? Math.round(vm.ram) : '',
+        diskalloc: diskAllocGB,
+        diskused: diskUsedGB,
+        diskpct: diskPct,
+        uptime: typeof vm.uptime === 'number' ? secondsToUptime(vm.uptime) : (vm.uptime || ''),
+        ip: vm.ip || '',
+        snapshots: vm.snapshots ?? '',
+        tags: vm.tags?.join(', ') || '',
+        template: vm.template ? 'Yes' : 'No',
+      })
+    }
+
+    // Bold headers
+    ws.getRow(1).font = { bold: true }
+
+    const buffer = await wb.xlsx.writeBuffer()
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `vms-export-${new Date().toISOString().split('T')[0]}.xlsx`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [vms])
+
+  const columns: GridColDef[] = useMemo(() => {
+    // Helper pour créer un header avec icône
+    const headerWithIcon = (icon: string, label: string) => () => (
+      <Stack direction="row" spacing={0.5} alignItems="center">
+        <i className={icon} style={{ fontSize: 14, opacity: 0.7 }} />
+        <span>{label}</span>
+      </Stack>
+    )
+    
+    // Header compact pour mobile (juste l'icône)
+    const headerIconOnly = (icon: string) => () => (
+      <i className={icon} style={{ fontSize: 14, opacity: 0.7 }} />
+    )
+    
+    const cols: GridColDef[] = [
+      // ID - peut être masqué via le menu des colonnes
+      {
+        field: 'vmid',
+        headerName: 'ID',
+        width: 55,
+        maxWidth: 70,
+        renderHeader: headerWithIcon('ri-hashtag', 'ID'),
+        renderCell: (params: any) => (
+          <Typography variant='body2' sx={{ fontWeight: 600, fontSize: '0.75rem' }}>
+            {params.row.vmid}
+          </Typography>
+        )
+      } as GridColDef,
+
+      // Colonne Favoris
+      {
+        field: 'favorite',
+        headerName: '',
+        width: 28,
+        maxWidth: 28,
+        sortable: false,
+        disableColumnMenu: true,
+        renderHeader: () => (
+          <i className="ri-star-line" style={{ fontSize: 14, opacity: 0.5 }} />
+        ),
+        renderCell: (params) => {
+          const isFav = favorites?.has(params.row.id) || false
+
+          
+return (
+            <IconButton
+              size="small"
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleFavorite?.(params.row)
+              }}
+              sx={{ 
+                p: 0.25,
+                color: isFav ? '#ffc107' : 'text.disabled',
+                '&:hover': { color: '#ffc107' }
+              }}
+            >
+              <i className={isFav ? "ri-star-fill" : "ri-star-line"} style={{ fontSize: 16 }} />
+            </IconButton>
+          )
+        }
+      },
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: isMobile ? 100 : 150,
+        renderHeader: isMobile ? headerIconOnly('ri-computer-line') : headerWithIcon('ri-computer-line', t('common.name')),
+        renderCell: (params) => {
+          const vm = params.row as VmRow
+          const isMigrating = isVmMigrating(vm.connId, vm.vmid)
+          const iconClass = vm.template ? 'ri-file-copy-fill' : vm.type === 'lxc' ? 'ri-instance-fill' : 'ri-computer-fill'
+          const dotColor = vm.template ? 'transparent' : vm.status === 'running' ? '#4caf50' : vm.status === 'paused' ? '#ed6c02' : '#f44336'
+
+          return (
+            <Stack direction='row' spacing={0.75} sx={{ alignItems: 'center', width: '100%' }}>
+              <Tooltip title={`${vm.template ? 'Template' : vm.type === 'lxc' ? 'LXC' : 'VM'} - ${vm.status}${vm.lock ? ` (locked: ${vm.lock})` : ''}`}>
+                <Box sx={{ position: 'relative', display: 'inline-flex', flexShrink: 0 }}>
+                  {isMigrating ? (
+                    <Box sx={{
+                      '@keyframes pulse': { '0%, 100%': { opacity: 1 }, '50%': { opacity: 0.4 } },
+                      animation: 'pulse 1.5s ease-in-out infinite',
+                    }}>
+                      <i className={iconClass} style={{ fontSize: 18, opacity: 0.7 }} />
+                      <Box sx={{ position: 'absolute', bottom: -1, right: -2, width: 8, height: 8, borderRadius: '50%', bgcolor: '#ed6c02', border: '1.5px solid', borderColor: 'background.paper' }} />
+                    </Box>
+                  ) : (
+                    <>
+                      <i className={iconClass} style={{ fontSize: 18, opacity: vmIconOpacity(vm.status, vm.template) }} />
+                      {!vm.template && (
+                        <Box sx={{
+                          position: 'absolute', bottom: -1, right: -2,
+                          width: 8, height: 8, borderRadius: '50%',
+                          bgcolor: dotColor,
+                          border: '1.5px solid', borderColor: 'background.paper',
+                          boxShadow: vm.status === 'running' ? `0 0 4px ${dotColor}` : 'none',
+                        }} />
+                      )}
+                    </>
+                  )}
+                  {vm.lock && (
+                    <Box sx={{
+                      position: 'absolute', top: -3, left: -3,
+                      width: 12, height: 12, borderRadius: '50%',
+                      bgcolor: '#ff9800',
+                      border: '1.5px solid', borderColor: 'background.paper',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      '@keyframes lockPulseTable': {
+                        '0%, 100%': { boxShadow: '0 0 4px rgba(255, 152, 0, 0.6)' },
+                        '50%': { boxShadow: '0 0 10px rgba(255, 152, 0, 1)' },
+                      },
+                      animation: 'lockPulseTable 2s ease-in-out infinite',
+                    }}>
+                      <i className="ri-lock-fill" style={{ fontSize: 8, color: '#fff' }} />
+                    </Box>
+                  )}
+                </Box>
+              </Tooltip>
+              <Box sx={{ overflow: 'hidden', minWidth: 0, flex: 1 }}>
+                <Typography variant='body2' sx={{
+                  fontWeight: 600,
+                  fontSize: '0.75rem',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis'
+                }}>
+                  {params.row.name || `VM ${params.row.vmid}`}
+                </Typography>
+                {isMobile && (
+                  <Typography variant='caption' sx={{ opacity: 0.6, fontSize: '0.6rem' }}>
+                    #{params.row.vmid} • {params.row.type === 'lxc' ? 'LXC' : 'VM'}
+                  </Typography>
+                )}
+              </Box>
+            </Stack>
+          )
+        }
+      },
+    ]
+
+    cols.push({
+      field: 'status',
+      headerName: t('common.status'),
+      width: 100,
+      renderCell: ({ row }) => {
+        const status = ['running', 'stopped', 'paused'].includes(row.status) ? row.status : 'unknown'
+        return (
+          <Typography sx={{ fontSize: 13 }}>
+            {t(`instances.statuses.${status}`)}
+          </Typography>
+        )
+      },
+    })
+
+    // Node - toujours inclus quand expanded, filtrage responsive géré à la fin
+    if (showNode || expanded) {
+      cols.push({
+        field: 'node',
+        headerName: t('common.node'),
+        flex: 0.5,
+        minWidth: 80,
+        maxWidth: 150,
+        renderHeader: headerWithIcon('ri-server-line', t('common.node')),
+        renderCell: (params) => {
+          // #666: same NodeIcon (logo + status pastille) vocabulary as the
+          // inventory tree/flat lists. Falls back to the bare glyph when the
+          // node's status isn't known here — a pastille with no real status
+          // would default to red and lie.
+          const nodeSt = nodeStatuses?.get(`${params.row.connId}:${params.row.node}`)
+
+          return (
+          <Box
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.5,
+              cursor: onNodeClick ? 'pointer' : 'default',
+              overflow: 'hidden',
+              '&:hover': onNodeClick ? { '& .node-name': { color: 'primary.main', textDecoration: 'underline', opacity: 1 } } : {}
+            }}
+            onClick={(e) => {
+              if (onNodeClick) {
+                e.stopPropagation()
+                onNodeClick(params.row.connId, params.row.node)
+              }
+            }}
+          >
+            {nodeSt ? (
+              <NodeIcon status={nodeSt} size={14} />
+            ) : (
+              <i className='ri-server-line' aria-hidden='true' style={{ fontSize: 14, opacity: 0.7, flexShrink: 0 }} />
+            )}
+            <Typography
+              className="node-name"
+              variant='body2'
+              sx={{
+                fontSize: '0.7rem',
+                opacity: 0.8,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {params.row.node}
+            </Typography>
+          </Box>
+          )
+        }
+      })
+    }
+
+    // vDC — tenant IaaS union view only (provider/MSP see the node column,
+    // tenants see which of their vDCs hosts the guest).
+    if (showVdcColumn) {
+      cols.push({
+        field: 'vdcName',
+        headerName: 'vDC',
+        flex: 0.5,
+        minWidth: 90,
+        maxWidth: 180,
+        renderHeader: headerWithIcon('ri-cloud-line', 'vDC'),
+        renderCell: (params) => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, overflow: 'hidden' }}>
+            <i className="ri-cloud-line" style={{ fontSize: 13, opacity: 0.7, flexShrink: 0 }} />
+            <Typography variant='body2' sx={{ fontSize: '0.7rem', opacity: 0.8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {params.row.vdcName || ''}
+            </Typography>
+          </Box>
+        )
+      })
+    }
+
+    // Colonne HA - toujours inclus quand expanded et qu'il y a des VMs cluster
+    if (showNode || expanded) {
+      const hasClusterVms = vms.some(vm => vm.isCluster)
+
+      if (hasClusterVms) {
+        cols.push({
+          field: 'ha',
+          headerName: 'HA',
+          width: 85,
+          renderHeader: headerWithIcon('ri-shield-check-line', 'HA'),
+          renderCell: (params) => {
+            // Ne pas afficher pour les VMs standalone
+            if (!params.row.isCluster) {
+              return <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+            }
+            
+            const hastate = params.row.hastate
+            const hagroup = params.row.hagroup
+            
+            if (!hastate) {
+              return <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+            }
+            
+            return (
+              <Tooltip title={`State: ${hastate}${hagroup ? `, Group: ${hagroup}` : ''}`}>
+                <Chip 
+                  label={hagroup || hastate} 
+                  size='small' 
+                  variant='outlined'
+                  sx={{ height: 18, fontSize: '0.6rem', maxWidth: 60, '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' } }}
+                />
+              </Tooltip>
+            )
+          }
+        })
+      }
+    }
+
+    // Colonne mémoire allouée
+    {
+      cols.push({
+        field: 'maxmem',
+        headerName: t('common.memShort'),
+        width: 90,
+        renderHeader: headerWithIcon('ri-ram-2-line', t('common.memShort')),
+        renderCell: (params) => {
+          const maxmem = params.row.maxmem
+
+          if (!maxmem) return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          
+return (
+            <Typography variant='body2' sx={{ fontSize: '0.7rem' }}>
+              {bytesToGb(maxmem)}G
+            </Typography>
+          )
+        }
+      })
+    }
+
+    // Colonnes disk/tags
+    {
+      cols.push({
+        field: 'disk',
+        headerName: isChinese ? '磁盘' : 'Disk',
+        width: 90,
+        renderHeader: headerWithIcon('ri-hard-drive-2-line', isChinese ? '磁盘' : 'Disk'),
+        renderCell: (params) => {
+          const maxdisk = params.row.maxdisk
+
+          if (!maxdisk) return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          
+return (
+            <Typography variant='body2' sx={{ fontSize: '0.7rem' }}>
+              {bytesToGb(maxdisk)}G
+            </Typography>
+          )
+        }
+      })
+      
+      // Tags
+      cols.push({
+        field: 'tags',
+        headerName: t('common.tags'),
+        width: 120,
+        minWidth: 60,
+        renderHeader: headerWithIcon('ri-price-tag-3-line', t('common.tags')),
+        renderCell: (params) => <TagsCell tags={params.row.tags || []} getTagColor={(tag) => getTagColor(tag, params.row.connId)} shape={getShape(params.row.connId)} />
+      })
+    }
+
+    // Colonnes IP et Snapshots (si activé)
+    if (showIpSnap) {
+      cols.push(
+        {
+          field: 'ip',
+          headerName: 'IP',
+          width: 95,
+          renderHeader: headerWithIcon('ri-global-line', 'IP'),
+          renderCell: (params) => {
+            const ip = params.row.ip
+
+            if (!ip) {
+              return <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+            }
+
+            
+return (
+              <Typography variant='body2' sx={{ fontSize: '0.7rem' }}>
+                {ip}
+              </Typography>
+            )
+          }
+        },
+        {
+          field: 'snapshots',
+          headerName: 'Snap',
+          width: 50,
+          renderHeader: headerWithIcon('ri-camera-line', 'Snap'),
+          renderCell: (params) => {
+            const snaps = params.row.snapshots
+
+            if (snaps === undefined || snaps === null) {
+              return <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+            }
+
+            
+return (
+              <Chip 
+                size='small' 
+                label={snaps} 
+                color={snaps > 0 ? 'info' : 'default'}
+                sx={{ height: 18, fontSize: '0.65rem', minWidth: 24 }}
+              />
+            )
+          }
+        },
+        {
+          field: 'osInfo',
+          headerName: 'OS',
+          width: 110,
+          renderHeader: headerWithIcon('ri-computer-line', 'OS'),
+          renderCell: (params) => {
+            const osInfo = params.row.osInfo
+
+            if (!osInfo) {
+              return <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+            }
+            
+            // Icône selon le type d'OS (SVG si disponible)
+            const osSvgIcon = getOsSvgIcon(osInfo.name || '', osInfo.type)
+            const osRiIcon = osInfo.type === 'windows'
+              ? 'ri-windows-fill'
+              : 'ri-terminal-box-line'
+
+            // Nom court de l'OS
+            let shortName = osInfo.name || 'Unknown'
+
+            // Raccourcir les noms longs
+            if (shortName.length > 15) {
+              shortName = shortName.split(' ').slice(0, 2).join(' ')
+            }
+
+            return (
+              <Tooltip
+                title={
+                  <Box>
+                    <Typography variant="body2" sx={{ fontWeight: 600 }}>{osInfo.name || 'Unknown OS'}</Typography>
+                    {osInfo.version && <Typography variant="caption" sx={{ display: 'block' }}>Version: {osInfo.version}</Typography>}
+                    {osInfo.kernel && <Typography variant="caption" sx={{ display: 'block', opacity: 0.8 }}>Kernel: {osInfo.kernel}</Typography>}
+                  </Box>
+                }
+                arrow
+              >
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  {osSvgIcon
+                    ? <img src={osSvgIcon} alt="" width={14} height={14} />
+                    : <i className={osRiIcon} style={{ fontSize: 14 }} />
+                  }
+                  <Typography variant='body2' sx={{ fontSize: '0.7rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {shortName}
+                  </Typography>
+                </Box>
+              </Tooltip>
+            )
+          }
+        }
+      )
+    }
+    
+    // Colonne Trend (si activé)
+    if (showTrends) {
+      cols.push({
+        field: 'trend',
+        headerName: 'Trend (CPU/RAM)',
+        flex: 0.8,
+        minWidth: 120,
+        sortable: false,
+        renderHeader: headerWithIcon('ri-line-chart-line', 'Trend (CPU/RAM)'),
+        renderCell: (params) => {
+          const vm = params.row as VmRow
+
+          if (vm.status !== 'running') {
+            return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          }
+          
+          const data = trendsData[vm.id] || vm.trend || []
+          const isLoading = trendsLoading[vm.id]
+          
+          if (isLoading) {
+            return (
+              <Box sx={{ height: 32, width: '100%', display: 'flex', alignItems: 'center' }}>
+                <Skeleton variant='rounded' width='100%' height={20} />
+              </Box>
+            )
+          }
+          
+          if (!data || data.length === 0) {
+            return (
+              <Box sx={{ height: 32, width: '100%', display: 'flex', alignItems: 'center' }}>
+                <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+              </Box>
+            )
+          }
+          
+          // Clé unique pour forcer le re-render quand les données changent
+          const chartKey = `${vm.id}-${data.length}`
+          
+          // Calculer le domaine Y dynamiquement pour un meilleur rendu (basé sur CPU et RAM)
+          const allValues = data.flatMap((d: any) => [d.cpu || 0, d.ram || 0])
+          const maxVal = Math.max(...allValues, 10)
+          const minVal = Math.min(...allValues, 0)
+          const yMax = Math.min(100, maxVal + 10)
+          const yMin = Math.max(0, minVal - 5)
+          
+          // Couleurs
+          const cpuColor = '#e57000'  // Orange vif
+          const ramColor = '#b35500'  // Orange foncé
+          
+          return (
+            <ChartContainer key={chartKey} height={32} sx={{ position: 'relative' }}>
+              <AreaChart data={data} margin={{ top: 2, right: 2, left: 2, bottom: 2 }}>
+                <defs>
+                  <linearGradient id={`cpuGradient-${vm.id}`} x1='0' y1='0' x2='0' y2='1'>
+                    <stop offset='0%' stopColor={cpuColor} stopOpacity={0.25} />
+                    <stop offset='100%' stopColor={cpuColor} stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey='t' hide />
+                <YAxis hide domain={[yMin, yMax]} />
+                <RTooltip
+                  content={<TrendTooltip />}
+                  cursor={{ stroke: cpuColor, strokeWidth: 1, strokeDasharray: '3 3' }}
+                />
+                <Area
+                  type='monotone'
+                  dataKey='cpu'
+                  stroke={cpuColor}
+                  strokeWidth={1.5}
+                  fill={`url(#cpuGradient-${vm.id})`}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+                <Area
+                  type='monotone'
+                  dataKey='ram'
+                  stroke={ramColor}
+                  strokeWidth={1.5}
+                  fill='transparent'
+                  dot={false}
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ChartContainer>
+          )
+        }
+      })
+
+      // Colonne Trend IO/Net
+      cols.push({
+        field: 'trendIoNet',
+        headerName: 'Trend (IO/Net)',
+        flex: 0.8,
+        minWidth: 120,
+        sortable: false,
+        renderHeader: headerWithIcon('ri-exchange-line', 'Trend (IO/Net)'),
+        renderCell: (params) => {
+          const vm = params.row as VmRow
+
+          if (vm.status !== 'running') {
+            return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          }
+
+          const data = trendsData[vm.id] || vm.trend || []
+          const isLoading = trendsLoading[vm.id]
+
+          if (isLoading) {
+            return (
+              <Box sx={{ height: 32, width: '100%', display: 'flex', alignItems: 'center' }}>
+                <Skeleton variant='rounded' width='100%' height={20} />
+              </Box>
+            )
+          }
+
+          if (!data || data.length === 0) {
+            return (
+              <Box sx={{ height: 32, width: '100%', display: 'flex', alignItems: 'center' }}>
+                <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+              </Box>
+            )
+          }
+
+          const hasIoData = data.some((d: any) => (d.diskread || 0) > 0 || (d.diskwrite || 0) > 0 || (d.netin || 0) > 0 || (d.netout || 0) > 0)
+          if (!hasIoData) {
+            return (
+              <Box sx={{ height: 32, width: '100%', display: 'flex', alignItems: 'center' }}>
+                <Typography variant='caption' sx={{ opacity: 0.4 }}>—</Typography>
+              </Box>
+            )
+          }
+
+          const chartKey = `ionet-${vm.id}-${data.length}`
+          const diskColor = '#2196f3'
+          const netColor = '#4caf50'
+
+          return (
+            <ChartContainer key={chartKey} height={32} sx={{ position: 'relative' }}>
+              <AreaChart data={data} margin={{ top: 2, right: 2, left: 2, bottom: 2 }}>
+                <defs>
+                  <linearGradient id={`diskGradient-${vm.id}`} x1='0' y1='0' x2='0' y2='1'>
+                    <stop offset='0%' stopColor={diskColor} stopOpacity={0.2} />
+                    <stop offset='100%' stopColor={diskColor} stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey='t' hide />
+                <YAxis hide />
+                <RTooltip
+                  content={<IoNetTooltip />}
+                  cursor={{ stroke: diskColor, strokeWidth: 1, strokeDasharray: '3 3' }}
+                />
+                <Area type='monotone' dataKey='diskread' stroke={diskColor} strokeWidth={1.5} fill={`url(#diskGradient-${vm.id})`} dot={false} isAnimationActive={false} />
+                <Area type='monotone' dataKey='diskwrite' stroke='#1565c0' strokeWidth={1.5} fill='transparent' dot={false} isAnimationActive={false} />
+                <Area type='monotone' dataKey='netin' stroke={netColor} strokeWidth={1.5} fill='transparent' dot={false} isAnimationActive={false} />
+                <Area type='monotone' dataKey='netout' stroke='#2e7d32' strokeWidth={1.5} fill='transparent' dot={false} isAnimationActive={false} />
+              </AreaChart>
+            </ChartContainer>
+          )
+        }
+      })
+    }
+
+    // Uptime
+    {
+      cols.push({
+        field: 'uptime',
+        headerName: isChinese ? '运行时长' : 'Uptime',
+        width: 110,
+        renderHeader: headerWithIcon('ri-time-line', isChinese ? '运行时长' : 'Uptime'),
+        renderCell: (params) => {
+          if (params.row.status !== 'running') {
+            return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          }
+
+          
+return (
+            <Typography variant='body2' sx={{ fontSize: '0.7rem' }}>
+              {secondsToUptime(params.row.uptime)}
+            </Typography>
+          )
+        }
+      })
+    }
+
+    // CPU et RAM
+    cols.push(
+      {
+        field: 'cpu',
+        headerName: 'CPU',
+        width: 95,
+        minWidth: 80,
+        renderHeader: headerWithIcon('ri-cpu-line', 'CPU'),
+        renderCell: (params) => {
+          const cpu = params.row.cpu
+
+          if (cpu === undefined || params.row.status !== 'running') {
+            return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          }
+
+          return <MetricBar value={cpu} metric='cpu' />
+        }
+      },
+      {
+        field: 'ram',
+        headerName: 'RAM',
+        width: 95,
+        minWidth: 80,
+        renderHeader: headerWithIcon('ri-ram-line', 'RAM'),
+        renderCell: (params) => {
+          const ram = params.row.ram
+
+          if (ram === undefined || params.row.status !== 'running') {
+            return <Typography variant='caption' sx={{ opacity: 0.5 }}>—</Typography>
+          }
+
+          return <MetricBar value={ram} metric='memory' />
+        }
+      }
+    )
+
+    // Colonne Actions - toujours visible, compacte
+    if (showActions && onVmAction) {
+      cols.push({
+        field: 'actions',
+        headerName: 'Actions',
+        width: isMobile ? 75 : 170,
+        minWidth: isMobile ? 75 : 130,
+        sortable: false,
+        disableColumnMenu: true,
+        renderHeader: headerIconOnly('ri-flashlight-line'),
+        renderCell: (params) => {
+          const vm = params.row as VmRow
+          const isRunning = vm.status === 'running'
+          const isStopped = vm.status === 'stopped'
+          const isPaused = vm.status === 'paused'
+          
+          // Pour les templates, afficher icône Deploy + Migration si cluster
+          if (vm.template) {
+            return (
+              <Stack direction='row' spacing={0.25} sx={{ alignItems: 'center' }}>
+                {/* Deploy (Clone) */}
+                <Tooltip title={t('vmActions.deployFromTemplate')}>
+                  <IconButton 
+                    size='small'
+                    onClick={(e) => { 
+                      e.stopPropagation()
+                      onVmAction(vm, 'clone') 
+                    }}
+                    sx={{ 
+                      color: 'primary.main',
+                      p: 0.5,
+                      '&:hover': { bgcolor: 'primary.main', color: 'primary.contrastText' }
+                    }}
+                  >
+                    <i className='ri-file-copy-2-line' style={{ fontSize: 16 }} />
+                  </IconButton>
+                </Tooltip>
+                
+                {/* Migrate - toujours disponible (cross-cluster pour standalone) */}
+                {effectiveOnMigrate && (
+                  <Tooltip title={t('vmActions.migrate')}>
+                    <IconButton
+                      size='small'
+                      onClick={(e) => { e.stopPropagation(); effectiveOnMigrate(vm) }}
+                      sx={{
+                        color: 'text.secondary',
+                        p: 0.5,
+                        '&:hover': { bgcolor: 'secondary.main', color: 'white' }
+                      }}
+                    >
+                      <i className='ri-arrow-left-right-line' style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Stack>
+            )
+          }
+          
+          // Sur mobile, afficher seulement Start/Stop
+          if (isMobile) {
+            return (
+              <Stack direction='row' spacing={0.25} sx={{ alignItems: 'center' }}>
+                <Tooltip title={isRunning ? t('vmActions.stop') : isPaused ? t('vmActions.resume') : t('vmActions.start')}>
+                  <span>
+                    <IconButton
+                      size='small'
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onVmAction(vm, isRunning ? 'shutdown' : isPaused ? 'resume' : 'start')
+                      }}
+                      sx={{ 
+                        color: isRunning ? 'warning.main' : 'success.main',
+                        p: 0.5,
+                      }}
+                    >
+                      <i className={isRunning ? 'ri-shut-down-line' : 'ri-play-fill'} style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title="Console">
+                  <span>
+                    <IconButton 
+                      size='small'
+                      disabled={!isRunning}
+                      onClick={(e) => { e.stopPropagation(); onVmAction(vm, 'console') }}
+                      sx={{ 
+                        color: isRunning ? 'text.secondary' : 'action.disabled',
+                        p: 0.5,
+                      }}
+                    >
+                      <i className='ri-terminal-box-line' style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              </Stack>
+            )
+          }
+          
+          return (
+            <Stack direction='row' spacing={0.25} sx={{ alignItems: 'center' }}>
+              {/* Start - visible si stopped ou paused (resume si paused) */}
+              <Tooltip title={isPaused ? t('vmActions.resume') : t('vmActions.start')}>
+                <span>
+                  <IconButton
+                    size='small'
+                    disabled={isRunning}
+                    onClick={(e) => { e.stopPropagation(); onVmAction(vm, isPaused ? 'resume' : 'start') }}
+                    sx={{ 
+                      color: (isStopped || isPaused) ? 'success.main' : 'action.disabled',
+                      p: 0.5,
+                      '&:hover': { bgcolor: 'success.main', color: 'white' }
+                    }}
+                  >
+                    <i className='ri-play-fill' style={{ fontSize: 16 }} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              
+              {/* Shutdown - visible si running */}
+              <Tooltip title={t('vmActions.shutdown')}>
+                <span>
+                  <IconButton 
+                    size='small'
+                    disabled={!isRunning}
+                    onClick={(e) => { e.stopPropagation(); onVmAction(vm, 'shutdown') }}
+                    sx={{ 
+                      color: isRunning ? 'warning.main' : 'action.disabled',
+                      p: 0.5,
+                      '&:hover': { bgcolor: 'warning.main', color: 'white' }
+                    }}
+                  >
+                    <i className='ri-shut-down-line' style={{ fontSize: 16 }} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              
+              {/* Stop - visible si running - masqué sur tablette */}
+              {!isTablet && (
+                <Tooltip title={t('vmActions.forceStop')}>
+                  <span>
+                    <IconButton 
+                      size='small'
+                      disabled={!isRunning}
+                      onClick={(e) => { e.stopPropagation(); onVmAction(vm, 'stop') }}
+                      sx={{ 
+                        color: isRunning ? 'error.main' : 'action.disabled',
+                        p: 0.5,
+                        '&:hover': { bgcolor: 'error.main', color: 'white' }
+                      }}
+                    >
+                      <i className='ri-stop-fill' style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
+              
+              {/* Pause - visible si running - masqué sur tablette */}
+              {!isTablet && (
+                <Tooltip title={isPaused ? t('vmActions.resume') : t('vmActions.pause')}>
+                  <span>
+                    <IconButton
+                      size='small'
+                      disabled={isStopped}
+                      onClick={(e) => { e.stopPropagation(); onVmAction(vm, isPaused ? 'resume' : 'pause') }}
+                      sx={{ 
+                        color: (isRunning || isPaused) ? 'info.main' : 'action.disabled',
+                        p: 0.5,
+                        '&:hover': { bgcolor: 'info.main', color: 'white' }
+                      }}
+                    >
+                      <i className={isPaused ? 'ri-play-fill' : 'ri-pause-fill'} style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
+              
+              {/* Console - visible si running */}
+              <Tooltip title="Console">
+                <span>
+                  <IconButton 
+                    size='small'
+                    disabled={!isRunning}
+                    onClick={(e) => { e.stopPropagation(); onVmAction(vm, 'console') }}
+                    sx={{ 
+                      color: isRunning ? 'text.secondary' : 'action.disabled',
+                      p: 0.5,
+                      '&:hover': { bgcolor: 'action.hover' }
+                    }}
+                  >
+                    <i className='ri-terminal-box-line' style={{ fontSize: 16 }} />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              
+              {/* Migrate - toujours disponible (cross-cluster pour standalone) */}
+              {effectiveOnMigrate && (
+                <Tooltip title={t('vmActions.migrate')}>
+                  <IconButton
+                    size='small'
+                    onClick={(e) => { e.stopPropagation(); effectiveOnMigrate(vm) }}
+                    sx={{
+                      color: 'text.secondary',
+                      p: 0.5,
+                      '&:hover': { bgcolor: 'secondary.main', color: 'white' }
+                    }}
+                  >
+                    <i className='ri-arrow-left-right-line' style={{ fontSize: 16 }} />
+                  </IconButton>
+                </Tooltip>
+              )}
+              
+              {/* Details */}
+              <Tooltip title={t('vmActions.details')}>
+                <IconButton 
+                  size='small'
+                  onClick={(e) => { e.stopPropagation(); onVmAction(vm, 'details') }}
+                  sx={{ 
+                    color: 'text.secondary',
+                    p: 0.5,
+                    '&:hover': { bgcolor: 'primary.main', color: 'primary.contrastText' }
+                  }}
+                >
+                  <i className='ri-eye-line' style={{ fontSize: 16 }} />
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          )
+        }
+      })
+    }
+
+    // Filtrer les colonnes en combinant :
+    // 1. Les contraintes responsive (certaines colonnes ne doivent pas apparaître sur mobile/tablette)
+    // 2. Les préférences utilisateur (menu de sélection des colonnes)
+    const responsiveHidden: Record<string, boolean> = {
+      vmid: isMobile,      // ID masqué sur mobile
+      type: isTablet,      // Type masqué sur tablette et mobile
+      ha: isTablet,        // HA masqué sur tablette et mobile  
+      maxmem: isTablet,    // Mémoire masquée sur tablette
+      disk: isTablet,      // Disque masqué sur tablette
+      tags: isSmallDesktop, // Tags masqués sur petits desktops
+      ip: isSmallDesktop,  // IP masquée sur petits desktops
+      snapshots: isSmallDesktop, // Snapshots masqués sur petits desktops
+      osInfo: isSmallDesktop, // OS masqué sur petits desktops
+      uptime: isTablet,    // Uptime masqué sur tablette
+      trend: !isLargeDesktop, // Trend seulement sur grands écrans
+      trendIoNet: !isLargeDesktop, // IO/Net trend seulement sur grands écrans
+      node: isMobile,      // Node masqué sur mobile
+      vdcName: isMobile,   // vDC masqué sur mobile
+    }
+    
+    return cols.filter(col => {
+      // Si l'utilisateur a explicitement masqué la colonne
+      if (visibleColumns[col.field] === false) return false
+
+      // Si la contrainte responsive masque la colonne
+      if (responsiveHidden[col.field]) return false
+
+return true
+    }).map(col => {
+      const saved = columnWidths[col.field]
+      if (!saved) return col
+      // Strip flex so the saved width actually takes effect. With flex set,
+      // MUI re-runs flex layout on every columns-prop change and ignores width.
+      return { ...col, width: saved, flex: undefined }
+    })
+  }, [isCompact, expanded, showNode, nodeStatuses, showTrends, showActions, showIpSnap, onVmAction, onMigrate, canMigrate, onNodeClick, primaryColor, trendsData, trendsLoading, vms, isMobile, isTablet, isSmallDesktop, isLargeDesktop, favorites, onToggleFavorite, visibleColumns, columnWidths, showVdcColumn, isChinese, t])
+
+  return (
+    <Box sx={{
+      width: '100%',
+      height: maxHeight === 'auto' ? 'auto' : maxHeight,
+      display: 'flex',
+      flexDirection: 'column',
+      minHeight: maxHeight === 'auto' ? 0 : 400,
+      flex: typeof maxHeight === 'string' && maxHeight !== 'auto' ? 1 : undefined,
+      overflow: 'hidden',
+    }}>
+      {/* Toolbar avec toggle densité et bouton IP/Snap */}
+      {(showDensityToggle || (showIpSnap && onLoadIpSnap) || vms.length > 0) && (
+        <Box sx={{ 
+          display: 'flex', 
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 1,
+          p: 1, 
+          borderBottom: '1px solid',
+          borderColor: 'divider',
+          flexShrink: 0
+        }}>
+          {/* Bouton charger détails (à gauche) */}
+          {onLoadIpSnap && !showIpSnap ? (
+            <Box
+              onClick={ipSnapLoading ? undefined : onLoadIpSnap}
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 0.5,
+                px: 1.5,
+                py: 0.5,
+                borderRadius: 1,
+                cursor: ipSnapLoading ? 'default' : 'pointer',
+                fontSize: '0.75rem',
+                color: ipSnapLoading ? 'text.disabled' : 'primary.main',
+                bgcolor: 'action.hover',
+                '&:hover': { bgcolor: ipSnapLoading ? 'action.hover' : 'action.selected' }
+              }}
+            >
+              {ipSnapLoading ? (
+                <>
+                  <CircularProgress size={12} />
+                  <span>{t('common.loading')}</span>
+                </>
+              ) : (
+                <>
+                  <i className='ri-download-cloud-line' style={{ fontSize: 14 }} />
+                  <span>{t('common.loadDetails')}</span>
+                </>
+              )}
+            </Box>
+          ) : <Box />}
+          
+          {/* Zone droite avec Export et Densité */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            {/* Bouton Export Excel */}
+            <Tooltip title={t('common.export')}>
+              <Box
+                onClick={handleExportExcel}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.5,
+                  px: 1,
+                  py: 0.5,
+                  borderRadius: 1,
+                  cursor: 'pointer',
+                  fontSize: '0.75rem',
+                  color: 'text.secondary',
+                  '&:hover': { bgcolor: 'action.hover' }
+                }}
+              >
+                <i className='ri-file-excel-2-line' style={{ fontSize: 14 }} />
+              </Box>
+            </Tooltip>
+            
+            {/* Bouton sélection colonnes */}
+            <Tooltip title={t('common.configuration')}>
+              <Box
+                onClick={(e) => setColumnsMenuAnchor(e.currentTarget)}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.5,
+                  px: 1,
+                  py: 0.5,
+                  borderRadius: 1,
+                  cursor: 'pointer',
+                  fontSize: '0.75rem',
+                  color: 'text.secondary',
+                  '&:hover': { bgcolor: 'action.hover' }
+                }}
+              >
+                <i className='ri-layout-column-line' style={{ fontSize: 14 }} />
+              </Box>
+            </Tooltip>
+            
+            {/* Menu sélection colonnes */}
+            <Menu
+              anchorEl={columnsMenuAnchor}
+              open={Boolean(columnsMenuAnchor)}
+              onClose={() => setColumnsMenuAnchor(null)}
+              anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+              transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+              PaperProps={{
+                sx: { maxHeight: 400, minWidth: 180 }
+              }}
+            >
+              <Typography variant="caption" sx={{ px: 2, py: 1, display: 'block', fontWeight: 600, color: 'text.secondary' }}>
+                {t('vms.visibleColumns')}
+              </Typography>
+              {[
+                { field: 'vmid', label: '#ID' },
+                { field: 'favorite', label: t('vms.favorites') },
+                { field: 'name', label: t('common.name') },
+                { field: 'node', label: t('common.node') },
+                { field: 'ha', label: 'HA' },
+                { field: 'cpu', label: 'CPU' },
+                { field: 'ram', label: 'RAM' },
+                { field: 'maxmem', label: t('common.memory') },
+                { field: 'disk', label: t('vms.disk') },
+                { field: 'tags', label: t('common.tags') },
+                { field: 'ip', label: 'IP' },
+                { field: 'snapshots', label: t('vms.snapshots') },
+                { field: 'osInfo', label: 'OS' },
+                { field: 'uptime', label: t('vms.uptime') },
+                { field: 'trend', label: t('vms.trend') + ' (CPU/RAM)' },
+                { field: 'trendIoNet', label: 'Trend (IO/Net)' },
+                { field: 'actions', label: t('common.actions') },
+              ].map(({ field, label }) => (
+                <MenuItem 
+                  key={field} 
+                  dense
+                  onClick={() => setVisibleColumns(prev => ({ ...prev, [field]: !prev[field] }))}
+                  sx={{ py: 0.5 }}
+                >
+                  <Checkbox 
+                    checked={visibleColumns[field] !== false} 
+                    size="small"
+                    sx={{ p: 0.5, mr: 1 }}
+                  />
+                  <Typography variant="body2">{label}</Typography>
+                </MenuItem>
+              ))}
+            </Menu>
+            
+            {/* Toggle densité */}
+            {showDensityToggle && (
+              <Box
+                onClick={() => setIsCompact(!isCompact)}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.5,
+                  px: 1,
+                  py: 0.5,
+                  borderRadius: 1,
+                  cursor: 'pointer',
+                  fontSize: '0.75rem',
+                  color: 'text.secondary',
+                  '&:hover': { bgcolor: 'action.hover' }
+                }}
+              >
+                <i className={isCompact ? 'ri-list-check' : 'ri-list-check-2'} style={{ fontSize: 14 }} />
+                {isCompact ? 'Compact' : 'Normal'}
+              </Box>
+            )}
+          </Box>
+        </Box>
+      )}
+      
+      <DataGrid
+        rows={vms}
+        columns={columns}
+        loading={loading}
+        checkboxSelection={selectable}
+        rowSelectionModel={selectable ? rowSelectionModel : undefined}
+        onRowSelectionModelChange={selectable && onRowSelectionModelChange
+          ? (model) => {
+              if (model.type === 'exclude') {
+                onRowSelectionModelChange({
+                  type: 'include',
+                  ids: new Set(visibleVms.map((vm) => vm.id)),
+                })
+                return
+              }
+              onRowSelectionModelChange(model)
+            }
+          : undefined}
+        density={isCompact ? 'compact' : 'standard'}
+        disableRowSelectionOnClick
+        onRowClick={onVmClick ? (params) => {
+          const vm = params.row as VmRow
+
+
+          // Bloquer le clic si la VM est en migration
+          if (isVmMigrating(vm.connId, vm.vmid)) return
+          onVmClick(vm)
+        } : undefined}
+        pageSizeOptions={pageSizeOptions}
+        paginationModel={autoPageSize ? undefined : paginationModel}
+        onPaginationModelChange={(model) => {
+          setPaginationModel(model)
+          if (selectable && onRowSelectionModelChange) {
+            onRowSelectionModelChange({ type: 'include', ids: new Set() })
+          }
+        }}
+        autoPageSize={autoPageSize}
+        autoHeight={maxHeight === 'auto'}
+        onColumnWidthChange={handleColumnWidthChange}
+        disableColumnMenu
+        getRowClassName={(params) => {
+          const vm = params.row as VmRow
+          const isMigrating = isVmMigrating(vm.connId, vm.vmid)
+          const isHighlighted = highlightedId && params.row.id === highlightedId
+
+          
+return [
+            isMigrating ? 'migrating-row' : '',
+            isHighlighted ? 'highlighted-row' : ''
+          ].filter(Boolean).join(' ')
+        }}
+        initialState={{
+          columns: {
+            columnVisibilityModel: {},
+          },
+        }}
+        slotProps={{
+          row: {
+            onContextMenu: (event: React.MouseEvent) => {
+              event.preventDefault()
+              const rowId = (event.currentTarget as HTMLElement).getAttribute('data-id')
+              const vm = vms.find(v => v.id === rowId)
+
+              if (vm) {
+                // Bloquer le menu contextuel si la VM est en migration
+                if (isVmMigrating(vm.connId, vm.vmid)) return
+                handleContextMenu(event, vm)
+              }
+            },
+          },
+        }}
+        sx={{
+          border: 'none',
+          flex: maxHeight === 'auto' ? 'none' : 1,
+          minHeight: 0,
+          width: '100%',
+
+          '& .MuiDataGrid-cell, & .MuiDataGrid-cell .MuiTypography-root, & .MuiDataGrid-columnHeader': {
+            fontSize: 13,
+            fontVariantNumeric: 'tabular-nums',
+          },
+
+          // Style pour les VMs en migration
+          '& .migrating-row': {
+            opacity: 0.5,
+            cursor: 'not-allowed',
+            '&:hover': {
+              bgcolor: 'transparent !important',
+            },
+          },
+
+          // Permettre le scroll horizontal quand nécessaire
+          '& .MuiDataGrid-main': {
+            overflow: 'auto',
+          },
+          '& .MuiDataGrid-virtualScroller': {
+            overflowX: 'auto',
+          },
+
+          // Supprimer l'espace vide à droite des colonnes
+          '& .MuiDataGrid-columnHeadersInner': {
+            width: '100%',
+          },
+          '& .MuiDataGrid-virtualScrollerRenderZone': {
+            width: '100%',
+          },
+          '& .MuiDataGrid-row': {
+            width: '100%',
+            cursor: onVmClick ? 'pointer' : 'default',
+            minHeight: isCompact ? 'var(--nebula-table-row-height-compact, 36px) !important' : 'var(--nebula-table-row-height, 52px) !important',
+            maxHeight: isCompact ? 'var(--nebula-table-row-height-compact, 36px) !important' : 'var(--nebula-table-row-height, 52px) !important',
+            '&:hover': {
+              bgcolor: `${primaryColor}14`,
+            }
+          },
+          '& .MuiDataGrid-columnHeaders': {
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            bgcolor: 'action.hover',
+            minHeight: isCompact ? 'var(--nebula-table-header-height, 40px) !important' : 'var(--nebula-table-header-height, 56px) !important',
+            maxHeight: isCompact ? 'var(--nebula-table-header-height, 40px) !important' : 'var(--nebula-table-header-height, 56px) !important',
+          },
+          '& .MuiDataGrid-columnHeaderTitle': {
+            fontWeight: 600,
+          },
+          '& .MuiDataGrid-cell': {
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            py: isCompact ? 0.25 : 0.75,
+            display: 'flex',
+            alignItems: 'center',
+            overflow: 'hidden',
+          },
+          '& .MuiDataGrid-row.highlighted-row': {
+            bgcolor: `${primaryColor}22`,
+            animation: 'highlightPulse 2s ease-in-out',
+            '&:hover': {
+              bgcolor: `${primaryColor}33`,
+            }
+          },
+          '@keyframes highlightPulse': {
+            '0%': { bgcolor: `${primaryColor}44` },
+            '50%': { bgcolor: `${primaryColor}22` },
+            '100%': { bgcolor: `${primaryColor}22` },
+          },
+          '& .MuiDataGrid-footerContainer': {
+            borderTop: '1px solid',
+            borderColor: 'divider',
+            minHeight: '40px !important',
+            maxHeight: '40px !important',
+            overflow: 'hidden',
+            '& .MuiTablePagination-root': {
+              overflow: 'hidden',
+            },
+            '& .MuiTablePagination-toolbar': {
+              minHeight: '40px !important',
+              overflow: 'hidden',
+              px: 1,
+            },
+          },
+
+          // Scrollbar plus discrète
+          '& .MuiDataGrid-scrollbar--horizontal': {
+            height: '8px',
+          },
+        }}
+        localeText={{
+          ...(isChinese ? zhCN.components.MuiDataGrid.defaultProps.localeText : {}),
+          noRowsLabel: t('common.noData'),
+        }}
+      />
+      
+      {/* Menu contextuel (clic droit) */}
+      <Menu
+        open={contextMenu !== null}
+        onClose={handleCloseContextMenu}
+        anchorReference="anchorPosition"
+        anchorPosition={
+          contextMenu !== null
+            ? { top: contextMenu.mouseY, left: contextMenu.mouseX }
+            : undefined
+        }
+      >
+        {/* Header du menu */}
+        <Box sx={{ px: 2, py: 1, borderBottom: '1px solid', borderColor: 'divider' }}>
+          <Typography variant="subtitle2" fontWeight={600}>
+            {contextMenu?.vm.name}
+          </Typography>
+          <Typography variant="caption" sx={{ opacity: 0.6 }}>
+            {contextMenu?.vm.template ? 'TEMPLATE' : contextMenu?.vm.type?.toUpperCase()} • #{contextMenu?.vm.vmid}
+          </Typography>
+        </Box>
+
+        {/* Actions pour VM normale */}
+        {!contextMenu?.vm.template && [
+          <MenuItem
+            key="start"
+            onClick={() => handleContextAction(contextMenu?.vm.status === 'paused' ? 'resume' : 'start')}
+            disabled={contextMenu?.vm.status === 'running'}
+          >
+            <ListItemIcon>
+              <PlayArrowIcon fontSize="small" sx={{ color: 'success.main' }} />
+            </ListItemIcon>
+            <ListItemText>{contextMenu?.vm.status === 'paused' ? t('vmActions.resume') : t('audit.actions.start')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="shutdown"
+            onClick={() => handleContextAction('shutdown')}
+            disabled={contextMenu?.vm.status !== 'running'}
+          >
+            <ListItemIcon>
+              <PowerSettingsNewIcon fontSize="small" sx={{ color: 'warning.main' }} />
+            </ListItemIcon>
+            <ListItemText>Shutdown</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="stop"
+            onClick={() => handleContextAction('stop')}
+            disabled={contextMenu?.vm.status !== 'running'}
+          >
+            <ListItemIcon>
+              <StopIcon fontSize="small" sx={{ color: 'error.main' }} />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.stop')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="suspend"
+            onClick={() => handleContextAction('suspend')}
+            disabled={contextMenu?.vm.status !== 'running'}
+          >
+            <ListItemIcon>
+              <PauseIcon fontSize="small" sx={{ color: 'info.main' }} />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.suspend')}</ListItemText>
+          </MenuItem>,
+
+          <MenuItem
+            key="reboot"
+            onClick={() => handleContextAction('reboot')}
+            disabled={contextMenu?.vm.status !== 'running'}
+          >
+            <ListItemIcon>
+              <RestartAltIcon fontSize="small" sx={{ color: 'primary.main' }} />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.restart')}</ListItemText>
+          </MenuItem>,
+
+          <Divider key="divider1" />,
+
+          <MenuItem 
+            key="console"
+            onClick={() => {
+              if (contextMenu?.vm) {
+                const { connId, node, type, vmid } = contextMenu.vm
+                const url = `/novnc/console.html?connId=${encodeURIComponent(connId)}&type=${encodeURIComponent(type)}&node=${encodeURIComponent(node)}&vmid=${encodeURIComponent(vmid)}`
+
+                window.open(url, `console-${vmid}`, 'width=1024,height=768,menubar=no,toolbar=no,location=no,status=no')
+              }
+
+              handleCloseContextMenu()
+            }}
+          >
+            <ListItemIcon>
+              <TerminalIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>Console</ListItemText>
+          </MenuItem>,
+
+          <Divider key="divider2" />,
+
+          effectiveOnMigrate && (
+            <MenuItem key="migrate" onClick={handleContextMigrate}>
+              <ListItemIcon>
+                <MoveUpIcon fontSize="small" />
+              </ListItemIcon>
+              <ListItemText>{t('audit.actions.migrate')}</ListItemText>
+            </MenuItem>
+          ),
+
+          <MenuItem
+            key="clone"
+            onClick={() => {
+              if (contextMenu?.vm) {
+                onVmAction(contextMenu.vm, 'clone')
+              }
+
+              handleCloseContextMenu()
+            }}
+          >
+            <ListItemIcon>
+              <ContentCopyIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.clone')}</ListItemText>
+          </MenuItem>
+        ]}
+
+        {/* Actions pour Template */}
+        {contextMenu?.vm.template && (
+          <MenuItem
+            onClick={() => {
+              if (contextMenu?.vm) {
+                onVmAction(contextMenu.vm, 'clone')
+              }
+
+              handleCloseContextMenu()
+            }}
+          >
+            <ListItemIcon>
+              <ContentCopyIcon fontSize="small" sx={{ color: 'primary.main' }} />
+            </ListItemIcon>
+            <ListItemText>{t('audit.actions.clone')}</ListItemText>
+          </MenuItem>
+        )}
+      </Menu>
+    </Box>
+  )
+}
+
+export default React.memo(VmsTable)

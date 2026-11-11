@@ -1,0 +1,153 @@
+{
+  "name": "Nebula",
+  "color": {
+    "brand": {
+      "blue": "#3B82F6",
+      "cyan": "#06B6D4",
+      "violet": "#8B5CF6"
+    },
+    "action": {
+      "primary": "#2563EB",
+      "primaryHover": "#2B66E0",
+      "primaryActive": "#1D4ED8",
+      "onPrimary": "#F5F9FF",
+      "danger": "#B91C1C"
+    },
+    "dark": {
+      "bg": {
+        "canvas": "#060D1B",
+        "navigation": "#081222",
+        "surface": "#0B1628",
+        "elevated": "#101F35",
+        "input": "#0D192B",
+        "hover": "#14253F",
+        "selected": "#132A4A"
+      },
+      "text": {
+        "primary": "#EAF2FF",
+        "secondary": "#B6C6DC",
+        "muted": "#9AAFC9",
+        "disabled": "#7489A5"
+      },
+      "border": {
+        "subtle": "#1E3554",
+        "control": "#526F92",
+        "focus": "#7DD3FC"
+      },
+      "link": "#60A5FA",
+      "status": {
+        "success": { "foreground": "#4ADE80", "background": "#102B26" },
+        "info": { "foreground": "#60A5FA", "background": "#132A4A" },
+        "warning": { "foreground": "#FBBF24", "background": "#342918" },
+        "error": { "foreground": "#F87171", "background": "#351E29" },
+        "neutral": { "foreground": "#B6C6DC", "background": "#1B2A3E" }
+      }
+    },
+    "light": {
+      "bg": {
+        "canvas": "#F4F7FB",
+        "navigation": "#FFFFFF",
+        "surface": "#FFFFFF",
+        "elevated": "#FFFFFF",
+        "input": "#F8FAFC",
+        "hover": "#EEF4FF",
+        "selected": "#E7F0FF"
+      },
+      "text": {
+        "primary": "#13213A",
+        "secondary": "#405471",
+        "muted": "#5B6D88",
+        "disabled": "#8695AA"
+      },
+      "border": {
+        "subtle": "#DBE4F0",
+        "control": "#7589A5",
+        "focus": "#2563EB"
+      },
+      "link": "#1D4ED8",
+      "status": {
+        "success": { "foreground": "#166534", "background": "#DCFCE7" },
+        "info": { "foreground": "#1D4ED8", "background": "#DBEAFE" },
+        "warning": { "foreground": "#92400E", "background": "#FEF3C7" },
+        "error": { "foreground": "#B91C1C", "background": "#FEE2E2" },
+        "neutral": { "foreground": "#475569", "background": "#E2E8F0" }
+      }
+    }
+  },
+  "typography": {
+    "fontFamily": {
+      "body": "Inter, \"Noto Sans SC\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif",
+      "monospace": "ui-monospace, SFMono-Regular, Consolas, monospace"
+    },
+    "fontSize": {
+      "pageTitle": 28,
+      "objectTitle": 24,
+      "panelTitle": 18,
+      "sectionTitle": 16,
+      "metric": 32,
+      "body": 14,
+      "table": 13,
+      "caption": 12
+    },
+    "lineHeight": {
+      "pageTitle": 36,
+      "objectTitle": 32,
+      "panelTitle": 26,
+      "sectionTitle": 24,
+      "metric": 40,
+      "body": 22,
+      "table": 20,
+      "caption": 18
+    },
+    "fontWeight": { "regular": 400, "medium": 500, "semibold": 600 }
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "2xl": 32, "3xl": 40, "4xl": 48 },
+  "radius": { "tag": 4, "control": 6, "panel": 10, "dialog": 12 },
+  "layout": {
+    "headerHeight": 56,
+    "navigationWidth": 224,
+    "navigationCollapsedWidth": 64,
+    "navigationItemHeight": 40,
+    "contentPadding": 24,
+    "contentPaddingNarrow": 16,
+    "contentPaddingMobile": 12,
+    "resourceTreeWidth": 240,
+    "resourceTreeWidthNarrow": 220,
+    "resourceTreeMinWidth": 200,
+    "resourceTreeMaxWidth": 320,
+    "objectTabsHeight": 44,
+    "controlHeight": 36,
+    "controlHeightCompact": 32,
+    "tableHeaderHeight": 40,
+    "tableRowHeight": 44,
+    "tableRowHeightCompact": 36,
+    "taskDockHeight": 36,
+    "taskDockExpandedHeight": 260,
+    "taskDockMaxHeight": "45vh",
+    "wizardWidth": 960,
+    "wizardStepsWidth": 176,
+    "drawerWidth": 520
+  },
+  "gradient": {
+    "primary": "linear-gradient(135deg, #2563eb 0%, #3b82f6 62%, #6857e8 100%)",
+    "primaryHover": "linear-gradient(135deg, #2b66e0 0%, #4b8cf7 62%, #7967ed 100%)",
+    "navigationActive": "linear-gradient(90deg, #2563eb75, #3b82f633 58%, #8b5cf61a)"
+  },
+  "motion": {
+    "duration": { "interaction": 120, "menu": 160, "panel": 200, "page": 240, "metric": 300 },
+    "maxTranslate": 12,
+    "easing": "cubic-bezier(0.2, 0, 0, 1)"
+  },
+  "shadow": {
+    "dark": {
+      "panel": "0 0 0 1px rgba(59, 130, 246, 0.05), 0 8px 24px rgba(0, 0, 0, 0.28)",
+      "elevated": "0 24px 64px rgba(0, 0, 0, 0.48)",
+      "action": "0 0 16px rgba(59, 130, 246, 0.18)"
+    },
+    "light": {
+      "panel": "0 4px 16px rgba(15, 23, 42, 0.06)",
+      "elevated": "0 18px 42px rgba(15, 23, 42, 0.14)",
+      "action": "0 0 16px rgba(37, 99, 235, 0.12)"
+    }
+  }
+}

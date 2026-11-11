@@ -1,0 +1,184 @@
+import { useState, useEffect, useCallback } from 'react'
+
+async function fetchJson(url: string, init?: RequestInit) {
+  const r = await fetch(url, init)
+  const text = await r.text()
+  let json: any = null
+
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch {
+    // Response is not JSON — use raw text as error message
+  }
+
+  if (!r.ok) {
+    let msg = json?.error || text || `HTTP ${r.status}`
+    if (json?.details?.fieldErrors) {
+      const fields = Object.entries(json.details.fieldErrors)
+        .filter(([, v]) => (v as string[])?.length)
+        .map(([k, v]) => `${k}: ${(v as string[]).join(', ')}`)
+      if (fields.length) msg += ' — ' + fields.join('; ')
+    }
+    throw new Error(msg)
+  }
+
+  return json
+}
+
+export function useConnectionsManagement() {
+  // UNISPHERE Connections
+  const [unisphereConnections, setUnisphereConnections] = useState<any[]>([])
+  const [unisphereLoading, setUnisphereLoading] = useState(true)
+  const [unisphereError, setUnisphereError] = useState<string | null>(null)
+
+  // PBS Connections
+  const [pbsConnections, setPbsConnections] = useState<any[]>([])
+  const [pbsLoading, setPbsLoading] = useState(true)
+  const [pbsError, setPbsError] = useState<string | null>(null)
+
+  // VMware Connections
+  const [vmwareConnections, setVmwareConnections] = useState<any[]>([])
+  const [vmwareLoading, setVmwareLoading] = useState(true)
+  const [vmwareError, setVmwareError] = useState<string | null>(null)
+
+  // XCP-ng Connections
+  const [xcpngConnections, setXcpngConnections] = useState<any[]>([])
+  const [xcpngLoading, setXcpngLoading] = useState(true)
+  const [xcpngError, setXcpngError] = useState<string | null>(null)
+
+  // Nutanix Connections
+  const [nutanixConnections, setNutanixConnections] = useState<any[]>([])
+  const [nutanixLoading, setNutanixLoading] = useState(true)
+  const [nutanixError, setNutanixError] = useState<string | null>(null)
+
+  // Hyper-V Connections
+  const [hypervConnections, setHypervConnections] = useState<any[]>([])
+  const [hypervLoading, setHypervLoading] = useState(true)
+  const [hypervError, setHypervError] = useState<string | null>(null)
+
+  const loadUnisphereConnections = useCallback(async () => {
+    setUnisphereLoading(true)
+    setUnisphereError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=unisphere')
+      setUnisphereConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setUnisphereError(e?.message || String(e))
+      setUnisphereConnections([])
+    } finally {
+      setUnisphereLoading(false)
+    }
+  }, [])
+
+  const loadPbsConnections = useCallback(async () => {
+    setPbsLoading(true)
+    setPbsError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=pbs')
+      setPbsConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setPbsError(e?.message || String(e))
+      setPbsConnections([])
+    } finally {
+      setPbsLoading(false)
+    }
+  }, [])
+
+  const loadVmwareConnections = useCallback(async () => {
+    setVmwareLoading(true)
+    setVmwareError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=vmware')
+      setVmwareConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setVmwareError(e?.message || String(e))
+      setVmwareConnections([])
+    } finally {
+      setVmwareLoading(false)
+    }
+  }, [])
+
+  const loadXcpngConnections = useCallback(async () => {
+    setXcpngLoading(true)
+    setXcpngError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=xcpng')
+      setXcpngConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setXcpngError(e?.message || String(e))
+      setXcpngConnections([])
+    } finally {
+      setXcpngLoading(false)
+    }
+  }, [])
+
+  const loadNutanixConnections = useCallback(async () => {
+    setNutanixLoading(true)
+    setNutanixError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=nutanix')
+      setNutanixConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setNutanixError(e?.message || String(e))
+      setNutanixConnections([])
+    } finally {
+      setNutanixLoading(false)
+    }
+  }, [])
+
+  const loadHypervConnections = useCallback(async () => {
+    setHypervLoading(true)
+    setHypervError(null)
+
+    try {
+      const json = await fetchJson('/api/v1/connections?type=hyperv')
+      setHypervConnections(Array.isArray(json?.data) ? json.data : [])
+    } catch (e: any) {
+      setHypervError(e?.message || String(e))
+      setHypervConnections([])
+    } finally {
+      setHypervLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadUnisphereConnections()
+    loadPbsConnections()
+    loadVmwareConnections()
+    loadXcpngConnections()
+    loadNutanixConnections()
+    loadHypervConnections()
+  }, [loadUnisphereConnections, loadPbsConnections, loadVmwareConnections, loadXcpngConnections, loadNutanixConnections, loadHypervConnections])
+
+  return {
+    unisphereConnections,
+    pbsConnections,
+    vmwareConnections,
+    xcpngConnections,
+    nutanixConnections,
+    hypervConnections,
+    unisphereLoading,
+    pbsLoading,
+    vmwareLoading,
+    xcpngLoading,
+    nutanixLoading,
+    hypervLoading,
+    unisphereError,
+    pbsError,
+    vmwareError,
+    xcpngError,
+    nutanixError,
+    hypervError,
+    loadUnisphereConnections,
+    loadPbsConnections,
+    loadVmwareConnections,
+    loadXcpngConnections,
+    loadNutanixConnections,
+    loadHypervConnections,
+  }
+}
