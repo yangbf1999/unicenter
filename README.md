@@ -18,13 +18,8 @@ English | [简体中文](README.zh-CN.md)
 <p align="center">
   <img src="https://img.shields.io/badge/eSage-8.x%20%7C%209.x-E57000" alt="eSage 8.x or 9.x">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="AGPL-3.0"></a>
-  <img src="https://img.shields.io/badge/CodeQL-pending-lightgrey" alt="CodeQL pending">
-  <img src="https://img.shields.io/badge/Security%20Scan-pending-lightgrey" alt="Security Scan pending">
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/SonarCloud-pending-lightgrey" alt="SonarCloud pending">
-</p>
 
 UniCenter brings multiple eSage clusters into one web console. It provides inventory and topology views, guest consoles, backup management, user and role management, and audit information. This repository contains the **Community Edition** source code.
 
@@ -36,7 +31,6 @@ UniCenter brings multiple eSage clusters into one web console. It provides inven
 | Public source repository | [github.com/yangbf1999/unicenter](https://github.com/yangbf1999/unicenter) |
 | UniSphere ISO | Community platform companion, downloaded from the official release address |
 | Prebuilt image | `ghcr.io/yangbf1999/unicenter-frontend` |
-| SonarCloud project key | Pending configuration |
 | `unicenter` | npm package name in `frontend/package.json`; the package is private and is not published to npm |
 | `/opt/unicenter` | Installation directory used by the installer |
 
@@ -157,7 +151,7 @@ The repository logo files are `docs/logo.png` and `docs/logo-dark.png`. The appl
 
 ## Security
 
-Automated checks include the CodeQL, Trivy, and Dependabot workflows in this repository. The security reporting channel will be completed before public release; do not disclose vulnerabilities through public Issues. See [SECURITY.md](SECURITY.md) for the handling scope.
+Automated checks currently include the Lint/ESLint workflow. The security reporting channel will be completed before public release; do not disclose vulnerabilities through public Issues. See [SECURITY.md](SECURITY.md) for the handling scope.
 
 ## License
 

@@ -18,13 +18,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/eSage-8.x%20%7C%209.x-E57000" alt="eSage 8.x 或 9.x">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="AGPL-3.0"></a>
-  <img src="https://img.shields.io/badge/CodeQL-待配置-lightgrey" alt="CodeQL 待配置">
-  <img src="https://img.shields.io/badge/Security%20Scan-待配置-lightgrey" alt="Security Scan 待配置">
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/SonarCloud-待配置-lightgrey" alt="SonarCloud 待配置">
-</p>
 
 UniCenter 把多个 eSage 集群放进同一个 Web 控制台，用来查看库存与拓扑、打开客户机控制台、查看备份，并管理用户、角色和审计。本仓库公开的是 **Community Edition** 源码。
 
@@ -36,7 +31,6 @@ UniCenter 把多个 eSage 集群放进同一个 Web 控制台，用来查看库�
 | 公开代码仓库 | [github.com/yangbf1999/unicenter](https://github.com/yangbf1999/unicenter) |
 | UniSphere ISO | 随 UniCenter 社区版发布，官方地址确认后补充 |
 | 预构建镜像地址 | `ghcr.io/yangbf1999/unicenter-frontend` |
-| SonarCloud project key | 待配置 |
 | `unicenter` | `frontend/package.json` 的 npm 包名。该包标记为 `private`，不发布到 npm |
 | `/opt/unicenter` | 安装脚本使用的安装目录 |
 
@@ -159,7 +153,7 @@ Logo 文件是 `docs/logo.png` 和 `docs/logo-dark.png`，应用图标是 `front
 
 ## 安全
 
-自动化检查包括本仓库中的 CodeQL、Trivy 和 Dependabot 工作流。安全报告入口将在公开发布前补充；不要通过公开 Issue 披露漏洞。处理范围见 [SECURITY.md](SECURITY.md)。
+当前自动化检查包括 Lint/ESLint 工作流。安全报告入口将在公开发布前补充；不要通过公开 Issue 披露漏洞。处理范围见 [SECURITY.md](SECURITY.md)。
 
 ## 许可证
 
